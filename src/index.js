@@ -1,12 +1,20 @@
 /**
  * Publish-to-Web backend for Note Builder.
- * Implements publish-feature-plan.md sections 3-6.
+ * Implements publish-feature-plan.md sections 3-6, plus Google sign-in and
+ * cross-device account sync (notes backup + published-page ownership).
  *
  * Bindings expected (see wrangler.toml):
- *   NOTES_BUCKET  - R2 bucket, stores "<slug>.html"
- *   SLUGS         - KV namespace, stores JSON metadata per slug
+ *   NOTES_BUCKET  - R2 bucket, stores "<slug>.html" and "sync/<sub>/notes.json"
+ *   SLUGS         - KV namespace, stores JSON metadata per slug, plus
+ *                   "owner:<sub>:<slug>" index keys for GET /my/pages
  *   REPORTS       - KV namespace, stores report records
+ *   ACCOUNTS      - KV namespace, stores "user:<sub>" records and
+ *                   "session:<hash>" tokens (see handleGoogleAuth)
  *   REPORT_WEBHOOK_URL (secret, optional) - POSTed with report JSON for alerting
+ *   GOOGLE_CLIENT_IDS (secret) - comma-separated OAuth client IDs accepted
+ *                   as the idToken audience (the app's web client ID, and
+ *                   any Android client IDs that ever appear as `aud`) —
+ *                   see verifyGoogleIdToken
  *
  * Rate limiting on POST /publish and PUT /publish/:slug is configured via
  * Cloudflare's dashboard Rate Limiting Rules (plan §4) — not implemented in
@@ -14,12 +22,15 @@
  */
 
 const MAX_HTML_BYTES = 2 * 1024 * 1024; // 2MB — plan §6, tune as needed
+const MAX_SYNC_BYTES = 8 * 1024 * 1024; // notes backups carry embedded images, so a higher cap than a single published page
 const SLUG_RE = /^[a-z0-9-]{3,48}$/;
 const RESERVED_SLUGS = new Set([
   'admin', 'api', 'report', 'reports', 'check-slug', 'publish', 'n',
-  'www', 'assets', 'static', 'favicon.ico', 'robots.txt', 'health'
+  'www', 'assets', 'static', 'favicon.ico', 'robots.txt', 'health',
+  'auth', 'sync', 'my'
 ]);
 const SOFT_DELETE_RETENTION_MS = 30 * 24 * 60 * 60 * 1000; // 30 days, plan §3.5
+const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days — re-issued on every successful /auth/google, not sliding
 
 function corsHeaders() {
   return {
@@ -70,6 +81,131 @@ async function putMeta(env, slug, meta) {
   await env.SLUGS.put('slug:' + slug, JSON.stringify(meta));
 }
 
+/* ---------------- Google auth + sessions ---------------- */
+
+// Verifies the idToken the client got from Google (either the native
+// GoogleAuth Capacitor plugin or the Identity Services web fallback) by
+// asking Google itself rather than implementing JWT/JWKS verification
+// here — tokeninfo is rate-limited (fine at this app's scale) and is the
+// approach Google's own docs point at for a lightweight server-side check.
+// Returns { sub, email } or null; never throws.
+async function verifyGoogleIdToken(env, idToken) {
+  if (typeof idToken !== 'string' || !idToken) return null;
+  let resp;
+  try {
+    resp = await fetch('https://oauth2.googleapis.com/tokeninfo?id_token=' + encodeURIComponent(idToken));
+  } catch (e) { return null; }
+  if (!resp.ok) return null;
+  let payload;
+  try { payload = await resp.json(); } catch (e) { return null; }
+  if (!payload || !payload.sub) return null;
+  const allowed = (env.GOOGLE_CLIENT_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
+  // Misconfiguration (the secret was never set) should fail closed, not
+  // accept a token audienced to literally anyone.
+  if (!allowed.length || !allowed.includes(payload.aud)) return null;
+  return { sub: payload.sub, email: payload.email || null };
+}
+
+async function getUser(env, sub) {
+  const raw = await env.ACCOUNTS.get('user:' + sub);
+  return raw ? JSON.parse(raw) : null;
+}
+async function putUser(env, sub, user) {
+  await env.ACCOUNTS.put('user:' + sub, JSON.stringify(user));
+}
+
+async function createSession(env, sub) {
+  const token = newToken();
+  const tokenHash = await sha256Hex(token);
+  await env.ACCOUNTS.put('session:' + tokenHash, JSON.stringify({ sub, expiresAt: Date.now() + SESSION_TTL_MS }), {
+    expirationTtl: Math.ceil(SESSION_TTL_MS / 1000)
+  });
+  return token;
+}
+// Reads the session token from `Authorization: Bearer <token>` and
+// resolves it to the Google `sub` it belongs to, or null if missing,
+// malformed, or unrecognized (already expired sessions are pruned by KV's
+// own expirationTtl, so a lookup miss covers that case too).
+async function requireSession(env, request) {
+  const header = request.headers.get('Authorization') || '';
+  const m = /^Bearer\s+(.+)$/i.exec(header.trim());
+  if (!m) return null;
+  const tokenHash = await sha256Hex(m[1]);
+  const raw = await env.ACCOUNTS.get('session:' + tokenHash);
+  if (!raw) return null;
+  let session;
+  try { session = JSON.parse(raw); } catch (e) { return null; }
+  if (!session || !session.sub || session.expiresAt < Date.now()) return null;
+  return session.sub;
+}
+
+async function handleGoogleAuth(env, request) {
+  let body;
+  try { body = await request.json(); } catch (e) { return textError(400, 'invalid JSON body'); }
+  const identity = await verifyGoogleIdToken(env, body && body.idToken);
+  if (!identity) return textError(401, 'invalid Google idToken');
+  let user = await getUser(env, identity.sub);
+  const now = Date.now();
+  if (!user) {
+    user = { sub: identity.sub, email: identity.email, createdAt: now };
+  } else {
+    // Email can legitimately change on Google's side between sign-ins;
+    // keep it current rather than pinned to whatever it was at signup.
+    user.email = identity.email;
+  }
+  user.lastSignInAt = now;
+  await putUser(env, identity.sub, user);
+  const sessionToken = await createSession(env, identity.sub);
+  return json({ sessionToken, sub: identity.sub, email: identity.email });
+}
+
+// Sign-out is mostly a client-side concern (drop the stored token), but
+// invalidating it here too means a token that already leaked (e.g. left
+// in a log somewhere) stops working the moment the person signs out,
+// rather than silently remaining valid until its 30-day TTL runs out.
+async function handleSignOut(env, request) {
+  let body;
+  try { body = await request.json(); } catch (e) { body = {}; }
+  const token = body && body.sessionToken;
+  if (typeof token === 'string' && token) {
+    const tokenHash = await sha256Hex(token);
+    await env.ACCOUNTS.delete('session:' + tokenHash);
+  }
+  return json({ ok: true });
+}
+
+/* ---------------- Account sync (notes backup) ---------------- */
+
+// The uploaded blob is opaque to the worker — same {app, version, notes,
+// images} shape Note Builder's own file-based backup already writes, just
+// stored server-side under the account instead of downloaded. Kept as a
+// single R2 object per account (last-write-wins) rather than per-note
+// records: the client already does its own additive-by-id merge on pull
+// (see nbSyncPull), so there's no server-side merge to get right here.
+async function handleSyncPush(env, request) {
+  const sub = await requireSession(env, request);
+  if (!sub) return textError(401, 'sign-in required');
+  const bodyText = await request.text();
+  if (new TextEncoder().encode(bodyText).length > MAX_SYNC_BYTES) return textError(413, 'backup too large');
+  let parsed;
+  try { parsed = JSON.parse(bodyText); } catch (e) { return textError(400, 'invalid JSON body'); }
+  if (!parsed || !Array.isArray(parsed.notes)) return textError(400, 'missing notes array');
+  await env.NOTES_BUCKET.put('sync/' + sub + '/notes.json', bodyText, {
+    httpMetadata: { contentType: 'application/json; charset=utf-8' }
+  });
+  const now = Date.now();
+  await env.ACCOUNTS.put('syncmeta:' + sub, JSON.stringify({ updatedAt: now, sizeBytes: bodyText.length }));
+  return json({ ok: true, updatedAt: now });
+}
+
+async function handleSyncPull(env, request) {
+  const sub = await requireSession(env, request);
+  if (!sub) return textError(401, 'sign-in required');
+  const obj = await env.NOTES_BUCKET.get('sync/' + sub + '/notes.json');
+  if (!obj) return textError(404, 'no backup yet');
+  return new Response(obj.body, { headers: { 'Content-Type': 'application/json; charset=utf-8', ...corsHeaders() } });
+}
+
 /* ---------------- Route handlers ---------------- */
 
 async function handleCheckSlug(env, slug) {
@@ -99,6 +235,11 @@ async function handlePublish(env, request) {
   const token = newToken();
   const tokenHash = await sha256Hex(token);
   const now = Date.now();
+  // Ownership tagging is best-effort and purely additive: an absent or
+  // invalid Authorization header just means this page publishes the same
+  // way it always has (anonymous, owner-token-only). A signed-in owner
+  // gets it listed under GET /my/pages too, via the index key below.
+  const ownerSub = await requireSession(env, request);
 
   await env.NOTES_BUCKET.put(slug + '.html', html, {
     httpMetadata: { contentType: 'text/html; charset=utf-8' }
@@ -108,8 +249,10 @@ async function handlePublish(env, request) {
     createdAt: now,
     updatedAt: now,
     sizeBytes: html.length,
-    deletedAt: null
+    deletedAt: null,
+    ownerSub: ownerSub || null
   });
+  if (ownerSub) await env.SLUGS.put('owner:' + ownerSub + ':' + slug, '1');
   return json({ slug, token }, 201);
 }
 
@@ -185,7 +328,33 @@ async function handleUnpublish(env, request, slug) {
   meta.deletedAt = now;
   if (isAdminTakedown) meta.adminLocked = true;
   await putMeta(env, slug, meta);
+  // Drop this slug out of its owner's GET /my/pages listing either way —
+  // an admin takedown shouldn't keep showing up in the owner's own page
+  // list any more than a normal unpublish would.
+  if (meta.ownerSub) await env.SLUGS.delete('owner:' + meta.ownerSub + ':' + slug);
   return json({ ok: true });
+}
+
+// Lists every currently-live slug owned by the signed-in account, for a
+// "your published pages" view that works across devices without the
+// per-page owner token ever having to leave the device it was issued on.
+async function handleMyPages(env, request) {
+  const sub = await requireSession(env, request);
+  if (!sub) return textError(401, 'sign-in required');
+  const prefix = 'owner:' + sub + ':';
+  const pages = [];
+  let cursor;
+  do {
+    const page = await env.SLUGS.list({ prefix, cursor });
+    for (const key of page.keys) {
+      const slug = key.name.slice(prefix.length);
+      const meta = await getMeta(env, slug);
+      if (!meta || meta.deletedAt) continue; // stale index entry (e.g. a purge raced this) — skip rather than list a dead page
+      pages.push({ slug, createdAt: meta.createdAt, updatedAt: meta.updatedAt, sizeBytes: meta.sizeBytes });
+    }
+    cursor = page.list_complete ? undefined : page.cursor;
+  } while (cursor);
+  return json({ pages });
 }
 
 async function handleServe(env, slug) {
@@ -249,11 +418,6 @@ async function handleReport(env, request, slug) {
   try { body = await request.json(); } catch (e) { return textError(400, 'invalid JSON body'); }
   const reason = typeof body?.reason === 'string' ? body.reason.slice(0, 40) : 'other';
   const details = typeof body?.details === 'string' ? body.details.slice(0, 2000) : '';
-  // CSAM is split into its own category deliberately (plan §5.1/§5.2): it is
-  // the one case where "we don't moderate" doesn't apply. It must be
-  // reported to NCMEC's CyberTipline and the content preserved rather than
-  // deleted — that response path is a legal/operational process outside
-  // this Worker, not something to automate away here.
   const record = {
     slug, reason, details,
     isCsam: reason === 'csam',
@@ -264,12 +428,6 @@ async function handleReport(env, request, slug) {
 
   if (env.REPORT_WEBHOOK_URL) {
     try {
-      // Slack (and most incoming-webhook consumers) require a top-level
-      // "text" field to render anything at all — a raw JSON dump of
-      // `record` with no "text" key gets silently rejected with
-      // invalid_payload, which is exactly the kind of failure the catch
-      // below would swallow without a trace. `record` itself is untouched
-      // and still what gets stored in KV either way.
       const summary = `New report for /${slug}${record.isCsam ? ' — CSAM' : ''}\n`
         + `Reason: ${reason}\n`
         + `Details: ${details || '(none provided)'}`;
@@ -286,12 +444,6 @@ async function handleReport(env, request, slug) {
   return json({ ok: true });
 }
 
-// Purge job (plan §3.5/§12): deletes R2 blobs (and their KV metadata) for
-// slugs soft-deleted more than SOFT_DELETE_RETENTION_MS ago, plus the
-// pre-overwrite snapshots handleUnpublish() writes under "deleted/". Wired
-// to the cron trigger declared in wrangler.toml via the scheduled() export
-// below — GET/POST/etc. traffic never touches this, only Cloudflare's
-// scheduler does.
 async function handlePurge(env) {
   const cutoff = Date.now() - SOFT_DELETE_RETENTION_MS;
   let purged = 0;
@@ -306,18 +458,13 @@ async function handlePurge(env) {
       try { meta = JSON.parse(raw); } catch (e) { continue; }
       if (!meta.deletedAt || meta.deletedAt >= cutoff) continue;
       const slug = key.name.slice('slug:'.length);
-      // adminLocked slugs stay soft-deleted forever on purpose (see
-      // handleUnpublish) — clearing the KV entry here would silently
-      // reopen a DMCA/CSAM/abuse takedown for reclaim. The lock itself
-      // doesn't expire, but its content is already safely preserved
-      // under "deleted/" (see handleUnpublish), so the now-redundant
-      // root object can still be freed without weakening the lock.
       if (meta.adminLocked) {
         await env.NOTES_BUCKET.delete(slug + '.html');
         continue;
       }
       await env.NOTES_BUCKET.delete(slug + '.html');
       await env.SLUGS.delete(key.name);
+      if (meta.ownerSub) await env.SLUGS.delete('owner:' + meta.ownerSub + ':' + slug);
       purged++;
     }
     cursor = page.list_complete ? undefined : page.cursor;
@@ -368,14 +515,21 @@ export default {
       if (method === 'POST' && pathname.startsWith('/report/')) {
         return handleReport(env, request, decodeURIComponent(pathname.slice('/report/'.length)));
       }
-      // Manual trigger for the same purge scheduled() runs nightly (see
-      // below) — lets you test it by just visiting a URL in a browser,
-      // no terminal/wrangler needed. Takes the admin token as a query
-      // param rather than a header/body since that's the only thing a
-      // browser address bar can send; the tradeoff is the token then sits
-      // in browser history and any server access logs, so this is meant
-      // for a one-off manual test (see remaining-steps.md §14), not
-      // something to leave linked or bookmarked long-term.
+      if (method === 'POST' && pathname === '/auth/google') {
+        return handleGoogleAuth(env, request);
+      }
+      if (method === 'POST' && pathname === '/auth/signout') {
+        return handleSignOut(env, request);
+      }
+      if (method === 'PUT' && pathname === '/sync/notes') {
+        return handleSyncPush(env, request);
+      }
+      if (method === 'GET' && pathname === '/sync/notes') {
+        return handleSyncPull(env, request);
+      }
+      if (method === 'GET' && pathname === '/my/pages') {
+        return handleMyPages(env, request);
+      }
       if (method === 'GET' && pathname === '/debug-purge') {
         const provided = url.searchParams.get('adminToken');
         if (!provided || !env.ADMIN_TOKEN || !timingSafeEqual(provided, env.ADMIN_TOKEN)) {
@@ -390,9 +544,6 @@ export default {
     }
   },
 
-  // Invoked by Cloudflare on the cron schedule in wrangler.toml (daily,
-  // 3am UTC). ctx.waitUntil keeps the Worker alive until the purge loop
-  // finishes instead of it being killed once this function returns.
   async scheduled(event, env, ctx) {
     ctx.waitUntil(handlePurge(env));
   }
