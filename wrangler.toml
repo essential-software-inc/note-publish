@@ -2,6 +2,22 @@ name = "note-publish"
 main = "src/index.js"
 compatibility_date = "2026-09-01"
 
+[[kv_namespaces]]
+binding = "ACCOUNTS"
+id = "c1191cb259ad4fbbb10750965994008a"
+
+[[kv_namespaces]]
+binding = "REPORTS"
+id = "eff8ddd6244448e9999d6bd3baef9a9e"
+
+[[kv_namespaces]]
+binding = "SLUGS"
+id = "9d838f50fca64e769f5924c7c044f017"
+
+[[r2_buckets]]
+binding = "NOTES_BUCKET"
+bucket_name = "note-publish-html"
+
 [observability]
 enabled = true
 
