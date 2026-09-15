@@ -123,10 +123,12 @@ async function createSession(env, sub) {
   return token;
 }
 // Reads the session token from `Authorization: Bearer <token>` and
-// resolves it to the Google `sub` it belongs to, or null if missing,
-// malformed, or unrecognized (already expired sessions are pruned by KV's
-// own expirationTtl, so a lookup miss covers that case too).
-async function requireSession(env, request) {
+// resolves it to the Google `sub` it belongs to, plus the token's own
+// hash (needed by handleDeleteAccount to revoke this specific session).
+// Returns null if missing, malformed, or unrecognized (already expired
+// sessions are pruned by KV's own expirationTtl, so a lookup miss covers
+// that case too).
+async function requireSessionInfo(env, request) {
   const header = request.headers.get('Authorization') || '';
   const m = /^Bearer\s+(.+)$/i.exec(header.trim());
   if (!m) return null;
@@ -136,7 +138,11 @@ async function requireSession(env, request) {
   let session;
   try { session = JSON.parse(raw); } catch (e) { return null; }
   if (!session || !session.sub || session.expiresAt < Date.now()) return null;
-  return session.sub;
+  return { sub: session.sub, tokenHash };
+}
+async function requireSession(env, request) {
+  const info = await requireSessionInfo(env, request);
+  return info ? info.sub : null;
 }
 
 async function handleGoogleAuth(env, request) {
@@ -418,6 +424,11 @@ async function handleReport(env, request, slug) {
   try { body = await request.json(); } catch (e) { return textError(400, 'invalid JSON body'); }
   const reason = typeof body?.reason === 'string' ? body.reason.slice(0, 40) : 'other';
   const details = typeof body?.details === 'string' ? body.details.slice(0, 2000) : '';
+  // CSAM is split into its own category deliberately (plan §5.1/§5.2): it is
+  // the one case where "we don't moderate" doesn't apply. It must be
+  // reported to NCMEC's CyberTipline and the content preserved rather than
+  // deleted — that response path is a legal/operational process outside
+  // this Worker, not something to automate away here.
   const record = {
     slug, reason, details,
     isCsam: reason === 'csam',
@@ -428,6 +439,12 @@ async function handleReport(env, request, slug) {
 
   if (env.REPORT_WEBHOOK_URL) {
     try {
+      // Slack (and most incoming-webhook consumers) require a top-level
+      // "text" field to render anything at all — a raw JSON dump of
+      // `record` with no "text" key gets silently rejected with
+      // invalid_payload, which is exactly the kind of failure the catch
+      // below would swallow without a trace. `record` itself is untouched
+      // and still what gets stored in KV either way.
       const summary = `New report for /${slug}${record.isCsam ? ' — CSAM' : ''}\n`
         + `Reason: ${reason}\n`
         + `Details: ${details || '(none provided)'}`;
@@ -444,6 +461,12 @@ async function handleReport(env, request, slug) {
   return json({ ok: true });
 }
 
+// Purge job (plan §3.5/§12): deletes R2 blobs (and their KV metadata) for
+// slugs soft-deleted more than SOFT_DELETE_RETENTION_MS ago, plus the
+// pre-overwrite snapshots handleUnpublish() writes under "deleted/". Wired
+// to the cron trigger declared in wrangler.toml via the scheduled() export
+// below — GET/POST/etc. traffic never touches this, only Cloudflare's
+// scheduler does.
 async function handlePurge(env) {
   const cutoff = Date.now() - SOFT_DELETE_RETENTION_MS;
   let purged = 0;
@@ -458,6 +481,12 @@ async function handlePurge(env) {
       try { meta = JSON.parse(raw); } catch (e) { continue; }
       if (!meta.deletedAt || meta.deletedAt >= cutoff) continue;
       const slug = key.name.slice('slug:'.length);
+      // adminLocked slugs stay soft-deleted forever on purpose (see
+      // handleUnpublish) — clearing the KV entry here would silently
+      // reopen a DMCA/CSAM/abuse takedown for reclaim. The lock itself
+      // doesn't expire, but its content is already safely preserved
+      // under "deleted/" (see handleUnpublish), so the now-redundant
+      // root object can still be freed without weakening the lock.
       if (meta.adminLocked) {
         await env.NOTES_BUCKET.delete(slug + '.html');
         continue;
@@ -484,6 +513,50 @@ async function handlePurge(env) {
   } while (r2Cursor);
 
   return purged;
+}
+
+// Deletes the signed-in account and everything tied to it (plan: account
+// deletion). Reuses handleUnpublish's soft-delete + 30-day retention
+// snapshot for every page this account owns, rather than a separate
+// deletion path for those — same reasoning applies (a pending report
+// shouldn't lose its evidence just because the owner deleted their
+// account). Only revokes *this* session; other signed-in devices fall
+// off naturally via their own 30-day session TTL once the account record
+// backing them is gone.
+async function handleDeleteAccount(env, request) {
+  const info = await requireSessionInfo(env, request);
+  if (!info) return textError(401, 'sign-in required');
+  const { sub, tokenHash } = info;
+
+  const prefix = 'owner:' + sub + ':';
+  let cursor;
+  do {
+    const page = await env.SLUGS.list({ prefix, cursor });
+    for (const key of page.keys) {
+      const slug = key.name.slice(prefix.length);
+      const meta = await getMeta(env, slug);
+      if (meta && !meta.deletedAt) {
+        const now = Date.now();
+        const liveObj = await env.NOTES_BUCKET.get(slug + '.html');
+        if (liveObj) {
+          await env.NOTES_BUCKET.put(`deleted/${slug}/${now}.html`, liveObj.body, {
+            httpMetadata: { contentType: 'text/html; charset=utf-8' }
+          });
+        }
+        meta.deletedAt = now;
+        await putMeta(env, slug, meta);
+      }
+      await env.SLUGS.delete(key.name);
+    }
+    cursor = page.list_complete ? undefined : page.cursor;
+  } while (cursor);
+
+  await env.ACCOUNTS.delete('user:' + sub);
+  await env.ACCOUNTS.delete('syncmeta:' + sub);
+  await env.ACCOUNTS.delete('session:' + tokenHash);
+  await env.NOTES_BUCKET.delete('sync/' + sub + '/notes.json');
+
+  return json({ ok: true });
 }
 
 /* ---------------- Router ---------------- */
@@ -521,6 +594,9 @@ export default {
       if (method === 'POST' && pathname === '/auth/signout') {
         return handleSignOut(env, request);
       }
+      if (method === 'DELETE' && pathname === '/account') {
+        return handleDeleteAccount(env, request);
+      }
       if (method === 'PUT' && pathname === '/sync/notes') {
         return handleSyncPush(env, request);
       }
@@ -530,6 +606,14 @@ export default {
       if (method === 'GET' && pathname === '/my/pages') {
         return handleMyPages(env, request);
       }
+      // Manual trigger for the same purge scheduled() runs nightly (see
+      // below) — lets you test it by just visiting a URL in a browser,
+      // no terminal/wrangler needed. Takes the admin token as a query
+      // param rather than a header/body since that's the only thing a
+      // browser address bar can send; the tradeoff is the token then sits
+      // in browser history and any server access logs, so this is meant
+      // for a one-off manual test (see remaining-steps.md §14), not
+      // something to leave linked or bookmarked long-term.
       if (method === 'GET' && pathname === '/debug-purge') {
         const provided = url.searchParams.get('adminToken');
         if (!provided || !env.ADMIN_TOKEN || !timingSafeEqual(provided, env.ADMIN_TOKEN)) {
@@ -544,6 +628,9 @@ export default {
     }
   },
 
+  // Invoked by Cloudflare on the cron schedule in wrangler.toml (daily,
+  // 3am UTC). ctx.waitUntil keeps the Worker alive until the purge loop
+  // finishes instead of it being killed once this function returns.
   async scheduled(event, env, ctx) {
     ctx.waitUntil(handlePurge(env));
   }
