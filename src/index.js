@@ -152,17 +152,24 @@ async function handleGoogleAuth(env, request) {
   if (!identity) return textError(401, 'invalid Google idToken');
   let user = await getUser(env, identity.sub);
   const now = Date.now();
+  let deletionCancelled = false;
   if (!user) {
     user = { sub: identity.sub, email: identity.email, createdAt: now };
   } else {
     // Email can legitimately change on Google's side between sign-ins;
     // keep it current rather than pinned to whatever it was at signup.
     user.email = identity.email;
+    // Signing back in during the 30-day grace period (see
+    // handleDeleteAccount) cancels the scheduled deletion.
+    if (user.pendingDeletionAt) {
+      delete user.pendingDeletionAt;
+      deletionCancelled = true;
+    }
   }
   user.lastSignInAt = now;
   await putUser(env, identity.sub, user);
   const sessionToken = await createSession(env, identity.sub);
-  return json({ sessionToken, sub: identity.sub, email: identity.email });
+  return json({ sessionToken, sub: identity.sub, email: identity.email, deletionCancelled });
 }
 
 // Sign-out is mostly a client-side concern (drop the stored token), but
@@ -512,22 +519,61 @@ async function handlePurge(env) {
     r2Cursor = page.truncated ? page.cursor : undefined;
   } while (r2Cursor);
 
+  // Accounts scheduled for deletion (see handleDeleteAccount) whose
+  // 30-day grace period has elapsed without the owner signing back in —
+  // purge them the same way handleDeleteAccount used to do immediately.
+  let acctCursor;
+  do {
+    const page = await env.ACCOUNTS.list({ prefix: 'user:', cursor: acctCursor });
+    for (const key of page.keys) {
+      const raw = await env.ACCOUNTS.get(key.name);
+      if (!raw) continue;
+      let user;
+      try { user = JSON.parse(raw); } catch (e) { continue; }
+      if (!user.pendingDeletionAt || user.pendingDeletionAt >= cutoff) continue;
+      const sub = key.name.slice('user:'.length);
+      await purgeAccountData(env, sub);
+      purged++;
+    }
+    acctCursor = page.list_complete ? undefined : page.cursor;
+  } while (acctCursor);
+
   return purged;
 }
 
-// Deletes the signed-in account and everything tied to it (plan: account
-// deletion). Reuses handleUnpublish's soft-delete + 30-day retention
-// snapshot for every page this account owns, rather than a separate
-// deletion path for those — same reasoning applies (a pending report
-// shouldn't lose its evidence just because the owner deleted their
-// account). Only revokes *this* session; other signed-in devices fall
-// off naturally via their own 30-day session TTL once the account record
-// backing them is gone.
+// Schedules the signed-in account for deletion after a 30-day grace
+// period (SOFT_DELETE_RETENTION_MS, same window handleUnpublish's page
+// soft-delete uses) rather than deleting anything immediately — signing
+// back in with the same Google account during that window cancels it
+// (see handleGoogleAuth). The actual purge happens in purgeAccountData,
+// invoked by the cron-triggered handlePurge once the grace period
+// elapses. Only revokes *this* session, so the device signs out right
+// away; other signed-in devices fall off naturally via their own 30-day
+// session TTL if the deletion isn't cancelled in time.
 async function handleDeleteAccount(env, request) {
   const info = await requireSessionInfo(env, request);
   if (!info) return textError(401, 'sign-in required');
   const { sub, tokenHash } = info;
 
+  const user = await getUser(env, sub);
+  const pendingDeletionAt = Date.now();
+  if (user) {
+    user.pendingDeletionAt = pendingDeletionAt;
+    await putUser(env, sub, user);
+  }
+  await env.ACCOUNTS.delete('session:' + tokenHash);
+
+  return json({ ok: true, pendingDeletionAt });
+}
+
+// Permanently removes an account and everything tied to it. Reuses
+// handleUnpublish's soft-delete + 30-day retention snapshot for every
+// page the account owns, rather than a separate deletion path for those
+// — same reasoning applies (a pending report shouldn't lose its evidence
+// just because the owner's account is gone). Called only from the purge
+// job below, once an account's grace period (see handleDeleteAccount)
+// has elapsed.
+async function purgeAccountData(env, sub) {
   const prefix = 'owner:' + sub + ':';
   let cursor;
   do {
@@ -553,10 +599,7 @@ async function handleDeleteAccount(env, request) {
 
   await env.ACCOUNTS.delete('user:' + sub);
   await env.ACCOUNTS.delete('syncmeta:' + sub);
-  await env.ACCOUNTS.delete('session:' + tokenHash);
   await env.NOTES_BUCKET.delete('sync/' + sub + '/notes.json');
-
-  return json({ ok: true });
 }
 
 /* ---------------- Router ---------------- */
