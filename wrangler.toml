@@ -18,6 +18,9 @@ id = "9d838f50fca64e769f5924c7c044f017"
 binding = "NOTES_BUCKET"
 bucket_name = "note-publish-html"
 
+[triggers]
+crons = ["0 3 * * *"]
+
 [observability]
 enabled = true
 
