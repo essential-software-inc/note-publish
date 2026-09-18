@@ -15,6 +15,15 @@
  *                   as the idToken audience (the app's web client ID, and
  *                   any Android client IDs that ever appear as `aud`) —
  *                   see verifyGoogleIdToken
+ *   ADS_DB        - D1 database, Publish-as-Ad only: round-robin cursor +
+ *                   view-credit ledger (see migrations/0001_ads.sql). Page
+ *                   HTML/slugs/tokens for ads still live in SLUGS/NOTES_BUCKET
+ *                   above — an ad IS a published page, just also listed here.
+ *   REVENUECAT_WEBHOOK_SECRET (secret) - must match the "Authorization Header
+ *                   value" configured on the RevenueCat project's webhook
+ *                   (Project settings → Integrations → Webhooks) — see
+ *                   handleRevenueCatWebhook. Without this set the webhook
+ *                   endpoint refuses everything (fail closed).
  *
  * Rate limiting on POST /publish and PUT /publish/:slug is configured via
  * Cloudflare's dashboard Rate Limiting Rules (plan §4) — not implemented in
@@ -602,6 +611,335 @@ async function purgeAccountData(env, sub) {
   await env.NOTES_BUCKET.delete('sync/' + sub + '/notes.json');
 }
 
+/* ---------------- Publish as Ad ---------------- */
+
+// Verbatim required text — must appear exactly once, unmodified, visible.
+// Kept as one constant so the publish-time check and the re-check on every
+// edit (handleAdUpdate) can never drift apart.
+const AD_ATTRIBUTION_TEXT = "All third-party trademarks, service marks, logos, and brand names appearing in advertisements or on this platform are the property of their respective owners.";
+// Matches upload.wikimedia.org, commons.wikimedia.org, and every
+// language subdomain of wikipedia.org (en., fr., de., ...), plus the bare
+// domains themselves — anything actually hosted under Wikipedia or
+// Wikimedia. Suffix-matched rather than an enumerated Set so no language
+// edition has to be special-cased in here.
+const AD_ALLOWED_IMAGE_HOST_SUFFIXES = ['.wikimedia.org', '.wikipedia.org'];
+const AD_ALLOWED_IMAGE_HOST_EXACT = new Set(['wikimedia.org', 'wikipedia.org']);
+function isAllowedAdImageHost(host) {
+  if (AD_ALLOWED_IMAGE_HOST_EXACT.has(host)) return true;
+  return AD_ALLOWED_IMAGE_HOST_SUFFIXES.some(suffix => host.endsWith(suffix));
+}
+const AD_MAX_IMAGES = 2;
+
+// Server-side re-check of the eligibility rules — the client can (and
+// should) block the "Publish as Ad" tab from submitting when these fail,
+// but that's a UX convenience only; nothing here trusts the client's own
+// judgment about its own note. Runs on both initial ad registration
+// (handleAdPublish) and every subsequent edit (handleAdUpdate), since an
+// owner could edit an already-running ad back out of compliance.
+//
+// Uses HTMLRewriter (Workers-native streaming HTML parsing — no DOMParser
+// available in this runtime) to walk `.blk` blocks and collect just the
+// two things the rules care about: text-block contents and image srcs.
+async function validateAdEligibility(html) {
+  const textBlockContents = [];
+  const imageSrcs = [];
+  let currentTextBuf = null; // accumulates text inside the block currently being walked
+
+  const rewriter = new HTMLRewriter()
+    .on('.blk[data-type="text"]', {
+      element() { currentTextBuf = { text: '' }; textBlockContents.push(currentTextBuf); },
+    })
+    .on('.blk[data-type="text"] *', {
+      text(t) { if (currentTextBuf) currentTextBuf.text += t.text; }
+    })
+    .on('.blk-img img', {
+      element(el) { imageSrcs.push(el.getAttribute('src') || ''); }
+    });
+
+  // HTMLRewriter only does work as the response body is *read* — transform()
+  // itself is lazy, so .text() below is what actually drives the walk and
+  // populates the arrays above via the handlers' side effects.
+  await rewriter.transform(new Response(html)).text();
+
+  // Rule: no added text/captions, blank lines and the attribution line
+  // are the only allowed non-empty text blocks.
+  const nonBlankBlocks = textBlockContents
+    .map(b => b.text.replace(/\s+/g, ' ').trim())
+    .filter(t => t.length > 0);
+  const attributionOccurrences = nonBlankBlocks.filter(t => t === AD_ATTRIBUTION_TEXT).length;
+  const strayText = nonBlankBlocks.filter(t => t !== AD_ATTRIBUTION_TEXT);
+  if (attributionOccurrences === 0) return { ok: false, reason: 'missing-attribution' };
+  if (attributionOccurrences > 1) return { ok: false, reason: 'duplicate-attribution' };
+  if (strayText.length > 0) return { ok: false, reason: 'added-text' };
+
+  // Rule: attribution block itself must not be shrunk or hidden. Best-effort
+  // on the surrounding markup — checks the block and its style attribute for
+  // the obvious ways to make text present-but-invisible. Not a full computed-
+  // style engine (none available here), but catches the direct cases.
+  const attrBlockMatch = html.match(/<[^>]*data-type="text"[^>]*>(?:(?!<\/div>)[\s\S])*?All third-party trademarks[\s\S]*?<\/div>/);
+  if (attrBlockMatch) {
+    const chunk = attrBlockMatch[0];
+    const hiddenPattern = /(display\s*:\s*none|visibility\s*:\s*hidden|opacity\s*:\s*0(?:\.0*)?\s*[;"']|font-size\s*:\s*[0-9](?:px)?\s*[;"'])/i;
+    if (hiddenPattern.test(chunk)) return { ok: false, reason: 'attribution-hidden-or-shrunk' };
+  }
+
+  // Rule: at most 2 image components.
+  if (imageSrcs.length > AD_MAX_IMAGES) return { ok: false, reason: 'too-many-images' };
+
+  // Rule: no device-uploaded images (data: URIs), and any image present
+  // must be hotlinked from Wikipedia/Wikimedia.
+  for (const src of imageSrcs) {
+    if (!src) continue; // an empty/placeholder image slot isn't "containing" an image
+    if (/^data:/i.test(src)) return { ok: false, reason: 'device-image' };
+    let host;
+    try { host = new URL(src).hostname.toLowerCase(); } catch (e) { return { ok: false, reason: 'invalid-image-src' }; }
+    if (!isAllowedAdImageHost(host)) return { ok: false, reason: 'non-wikimedia-image' };
+  }
+
+  return { ok: true };
+}
+
+/* ---- D1 helpers ---- */
+
+async function getCreditBalance(env, sub) {
+  const row = await env.ADS_DB.prepare(
+    'SELECT COALESCE(SUM(delta), 0) AS balance FROM view_credits_ledger WHERE owner_sub = ?'
+  ).bind(sub).first();
+  return row ? row.balance : 0;
+}
+
+/* ---- RevenueCat webhook: credits the ledger off a verified purchase ---- */
+
+// product_id (as configured in Play Console/RevenueCat, section 3 of the
+// setup guide) -> views granted. Add a row here for every view-package
+// product created. Kept server-side and not trusted from the client at all.
+const AD_VIEW_PACKAGES = {
+  'nb_ad_views_1000': 1000,
+  'nb_ad_views_5000': 5000,
+  'nb_ad_views_20000': 20000,
+  'nb_ad_views_100000': 100000,
+  'nb_ad_views_1000000': 1000000,
+};
+
+async function handleRevenueCatWebhook(env, request) {
+  const auth = request.headers.get('Authorization') || '';
+  if (!env.REVENUECAT_WEBHOOK_SECRET || !timingSafeEqual(auth, env.REVENUECAT_WEBHOOK_SECRET)) {
+    return textError(401, 'invalid webhook auth');
+  }
+  let body;
+  try { body = await request.json(); } catch (e) { return textError(400, 'invalid JSON body'); }
+  const event = body && body.event;
+  if (!event || !event.id) return textError(400, 'missing event');
+
+  // Only NON_RENEWING_PURCHASE (RevenueCat's type for a consumable one-time
+  // product bought again) and INITIAL_PURCHASE (the very first buy) ever
+  // grant views — every other event type (renewal/cancel/refund/etc. don't
+  // apply to a consumable, but arrive on the same webhook) is ignored.
+  // TRANSFER/REFUND aren't handled here — a refunded view-package still
+  // leaves already-credited views spendable; add a 'refund' ledger row here
+  // if that needs tightening later.
+  if (event.type !== 'NON_RENEWING_PURCHASE' && event.type !== 'INITIAL_PURCHASE') {
+    return json({ ok: true, ignored: event.type });
+  }
+  const views = AD_VIEW_PACKAGES[event.product_id];
+  if (!views) return json({ ok: true, ignored: 'unrecognized-product:' + event.product_id });
+
+  // app_user_id must be the app's Google `sub` for this to land in the
+  // right person's balance — set on the client via
+  // Purchases.configure({ appUserID: sub }) after Google sign-in, not left
+  // as RevenueCat's own anonymous ID. Flagging this because it's an easy
+  // thing to have missed when the SDK was first wired up for the Pro
+  // unlock, where the app-user-id didn't matter as much.
+  const sub = event.app_user_id;
+  if (!sub) return textError(400, 'missing app_user_id');
+
+  // OR IGNORE on rc_event_id: RevenueCat retries webhook delivery on
+  // non-2xx and can occasionally redeliver even after a 200 was returned —
+  // this makes crediting idempotent regardless of why the retry happened.
+  await env.ADS_DB.prepare(
+    'INSERT OR IGNORE INTO view_credits_ledger (owner_sub, delta, reason, rc_event_id, created_at) VALUES (?, ?, ?, ?, ?)'
+  ).bind(sub, views, 'purchase', String(event.id), Date.now()).run();
+
+  return json({ ok: true });
+}
+
+/* ---- Ad handlers ---- */
+
+// Registers an already-published page (published the normal way, via
+// POST /publish — same slug, same owner token) as a running ad. Doesn't
+// touch R2/SLUGS at all; only reads the page back to re-validate eligibility
+// server-side, then writes the D1 side.
+async function handleAdPublish(env, request) {
+  const sub = await requireSession(env, request);
+  if (!sub) return textError(401, 'sign-in required');
+  let body;
+  try { body = await request.json(); } catch (e) { return textError(400, 'invalid JSON body'); }
+  const { slug, token, views } = body || {};
+  if (!validSlug(slug)) return textError(400, 'invalid slug');
+  if (!Number.isInteger(views) || views <= 0) return textError(400, 'invalid views');
+
+  const meta = await getMeta(env, slug);
+  if (!meta || meta.deletedAt) return textError(404, 'slug not published');
+  if (meta.ownerSub !== sub) return textError(403, 'not the owner of this page');
+  if (typeof token !== 'string' || !token || !timingSafeEqual(await sha256Hex(token), meta.tokenHash)) {
+    return textError(403, 'invalid token');
+  }
+
+  const existingAd = await env.ADS_DB.prepare('SELECT slug FROM ads WHERE slug = ?').bind(slug).first();
+  if (existingAd) return textError(409, 'already registered as an ad — use PUT to edit or top up separately');
+
+  const obj = await env.NOTES_BUCKET.get(slug + '.html');
+  if (!obj) return textError(404, 'page content missing');
+  const html = await obj.text();
+  const eligibility = await validateAdEligibility(html);
+  if (!eligibility.ok) return textError(422, 'not eligible: ' + eligibility.reason);
+
+  const balance = await getCreditBalance(env, sub);
+  if (balance < views) return textError(402, 'insufficient view credits');
+
+  const now = Date.now();
+  // Single batch = one D1 transaction: assign the next rotation slot,
+  // debit the ledger, and insert the ad row together, so a failure partway
+  // can't leave the ledger debited with no ad to show for it (or vice versa).
+  const seqRow = await env.ADS_DB.prepare(
+    'UPDATE ad_rotation_seq SET next_value = next_value + 1 WHERE id = 1 RETURNING next_value - 1 AS assigned'
+  ).first();
+  const rotationOrder = seqRow.assigned;
+  await env.ADS_DB.batch([
+    env.ADS_DB.prepare(
+      'INSERT INTO ads (slug, owner_sub, views_total, views_used, rotation_order, status, created_at, updated_at) VALUES (?, ?, ?, 0, ?, ?, ?, ?)'
+    ).bind(slug, sub, views, rotationOrder, 'active', now, now),
+    env.ADS_DB.prepare(
+      'INSERT INTO view_credits_ledger (owner_sub, delta, reason, slug, created_at) VALUES (?, ?, ?, ?, ?)'
+    ).bind(sub, -views, 'allocate', slug, now),
+  ]);
+
+  return json({ ok: true, slug, viewsTotal: views }, 201);
+}
+
+// Re-validates and swaps the page content for an already-running ad — the
+// "Save Changes" action in the Publish as Ad tab. Reuses the same page
+// write handleUpdate does; an ad that fails re-validation is rejected
+// outright (nothing is written, the ad keeps running on its prior content)
+// rather than silently pulled from rotation, so a bad edit can't quietly
+// kill a campaign without the owner knowing why.
+async function handleAdUpdate(env, request, slug) {
+  if (!validSlug(slug)) return textError(400, 'invalid slug');
+  let body;
+  try { body = await request.json(); } catch (e) { return textError(400, 'invalid JSON body'); }
+  const { html, token } = body || {};
+  if (typeof html !== 'string' || !html) return textError(400, 'missing html');
+  if (typeof token !== 'string' || !token) return textError(401, 'missing token');
+  if (new TextEncoder().encode(html).length > MAX_HTML_BYTES) return textError(413, 'page too large');
+
+  const meta = await getMeta(env, slug);
+  if (!meta || meta.deletedAt) return textError(404, 'not found');
+  if (!timingSafeEqual(await sha256Hex(token), meta.tokenHash)) return textError(403, 'invalid token');
+
+  const ad = await env.ADS_DB.prepare('SELECT slug FROM ads WHERE slug = ?').bind(slug).first();
+  if (!ad) return textError(404, 'not registered as an ad');
+
+  const eligibility = await validateAdEligibility(html);
+  if (!eligibility.ok) return textError(422, 'not eligible: ' + eligibility.reason);
+
+  await env.NOTES_BUCKET.put(slug + '.html', html, { httpMetadata: { contentType: 'text/html; charset=utf-8' } });
+  meta.updatedAt = Date.now();
+  meta.sizeBytes = html.length;
+  await putMeta(env, slug, meta);
+  await env.ADS_DB.prepare('UPDATE ads SET updated_at = ? WHERE slug = ?').bind(Date.now(), slug).run();
+  return json({ ok: true });
+}
+
+// Pulls an ad out of rotation and forfeits whatever views it had left (per
+// spec — no ledger refund). Deliberately doesn't touch the underlying
+// published page at all; unpublishing the page itself is still the
+// existing DELETE /publish/:slug, a separate action in the Publish to Web
+// tab. The two are independent: an owner can stop an ad while leaving the
+// page live, or vice versa.
+async function handleAdUnpublish(env, request, slug) {
+  const sub = await requireSession(env, request);
+  if (!sub) return textError(401, 'sign-in required');
+  if (!validSlug(slug)) return textError(400, 'invalid slug');
+  const ad = await env.ADS_DB.prepare('SELECT owner_sub, status FROM ads WHERE slug = ?').bind(slug).first();
+  if (!ad) return textError(404, 'not found');
+  if (ad.owner_sub !== sub) return textError(403, 'not the owner of this ad');
+  if (ad.status === 'unpublished') return json({ ok: true }); // already done, idempotent
+  await env.ADS_DB.prepare('UPDATE ads SET status = ?, updated_at = ? WHERE slug = ?')
+    .bind('unpublished', Date.now(), slug).run();
+  return json({ ok: true });
+}
+
+// GET /ads/mine — the Publish as Ad tab's "views so far" display, plus
+// remaining credit balance for buying more.
+async function handleMyAds(env, request) {
+  const sub = await requireSession(env, request);
+  if (!sub) return textError(401, 'sign-in required');
+  const { results } = await env.ADS_DB.prepare(
+    'SELECT slug, views_total, views_used, status, created_at, updated_at FROM ads WHERE owner_sub = ? ORDER BY created_at DESC'
+  ).bind(sub).all();
+  const balance = await getCreditBalance(env, sub);
+  return json({ ads: results || [], creditBalance: balance });
+}
+
+// GET /ads/next — called from the Create screen instead of always loading
+// the pristine template. Public (no session needed — any device browsing
+// Create can be handed the next ad in rotation), returns null when nothing
+// is active so the client falls back to the pristine template exactly as
+// it does today.
+async function handleAdNext(env, request) {
+  const activeCount = await env.ADS_DB.prepare("SELECT COUNT(*) AS n FROM ads WHERE status = 'active'").first();
+  if (!activeCount || activeCount.n === 0) return json({ ad: null });
+
+  // One statement, one implicit D1 transaction: advance the cursor to the
+  // next active ad past its current position, wrapping to the first active
+  // ad if the cursor's past the end — or leaving it unmoved (fallback to
+  // its own current value) in the never-expected case both subqueries miss.
+  // This is what makes concurrent Create taps each get a distinct ad
+  // instead of racing onto the same one.
+  const cursorRow = await env.ADS_DB.prepare(`
+    UPDATE ad_rotation_cursor
+    SET position = COALESCE(
+      (SELECT rotation_order FROM ads WHERE status = 'active' AND rotation_order > ad_rotation_cursor.position ORDER BY rotation_order ASC LIMIT 1),
+      (SELECT rotation_order FROM ads WHERE status = 'active' ORDER BY rotation_order ASC LIMIT 1),
+      ad_rotation_cursor.position
+    )
+    WHERE id = 1
+    RETURNING position
+  `).first();
+
+  const ad = await env.ADS_DB.prepare(
+    "SELECT slug FROM ads WHERE status = 'active' AND rotation_order = ?"
+  ).bind(cursorRow.position).first();
+  if (!ad) return json({ ad: null }); // lost a race against an unpublish between the two queries above — next tap retries
+
+  const obj = await env.NOTES_BUCKET.get(ad.slug + '.html');
+  if (!obj) return json({ ad: null });
+  return json({ ad: { slug: ad.slug, html: await obj.text() } });
+}
+
+// POST /ads/:slug/view — the edit-time decrement: called once the person
+// actually starts editing the ad-template handed to them by GET /ads/next
+// (not merely on seeing it), per the agreed "edit-time is truer" tracking.
+// The UPDATE's own WHERE clause (status='active' AND views_used < views_total)
+// makes the increment-and-cap-check atomic and self-limiting — no separate
+// read-then-write race window where two simultaneous edits could both
+// slip in under the cap.
+async function handleAdView(env, request, slug) {
+  if (!validSlug(slug)) return textError(400, 'invalid slug');
+  const row = await env.ADS_DB.prepare(`
+    UPDATE ads
+    SET views_used = views_used + 1,
+        updated_at = ?,
+        status = CASE WHEN views_used + 1 >= views_total THEN 'exhausted' ELSE status END
+    WHERE slug = ? AND status = 'active' AND views_used < views_total
+    RETURNING views_used, views_total, status
+  `).bind(Date.now(), slug).first();
+  // Not finding a row to update (already exhausted/unpublished/unknown
+  // slug, or a race with another view landing the exact same moment) isn't
+  // an error worth surfacing to the editor — the view simply isn't counted.
+  return json({ ok: true, counted: !!row, ...(row || {}) });
+}
+
 /* ---------------- Router ---------------- */
 
 export default {
@@ -648,6 +986,27 @@ export default {
       }
       if (method === 'GET' && pathname === '/my/pages') {
         return handleMyPages(env, request);
+      }
+      if (method === 'POST' && pathname === '/ads/publish') {
+        return handleAdPublish(env, request);
+      }
+      if (method === 'GET' && pathname === '/ads/next') {
+        return handleAdNext(env, request);
+      }
+      if (method === 'GET' && pathname === '/ads/mine') {
+        return handleMyAds(env, request);
+      }
+      if (method === 'PUT' && pathname.startsWith('/ads/')) {
+        return handleAdUpdate(env, request, decodeURIComponent(pathname.slice('/ads/'.length)));
+      }
+      if (method === 'POST' && pathname.startsWith('/ads/') && pathname.endsWith('/view')) {
+        return handleAdView(env, request, decodeURIComponent(pathname.slice('/ads/'.length, -'/view'.length)));
+      }
+      if (method === 'DELETE' && pathname.startsWith('/ads/')) {
+        return handleAdUnpublish(env, request, decodeURIComponent(pathname.slice('/ads/'.length)));
+      }
+      if (method === 'POST' && pathname === '/webhooks/revenuecat') {
+        return handleRevenueCatWebhook(env, request);
       }
       // Manual trigger for the same purge scheduled() runs nightly (see
       // below) — lets you test it by just visiting a URL in a browser,
