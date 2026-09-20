@@ -396,7 +396,7 @@ async function handleServe(env, slug) {
     "script-src 'unsafe-inline'",
     "style-src 'unsafe-inline'",
     "img-src * data: blob:",
-    "frame-src https://www.youtube.com https://www.instagram.com",
+    "frame-src https://www.youtube.com https://www.instagram.com https://player.vimeo.com https://open.spotify.com https://w.soundcloud.com",
     "connect-src 'self'",
     "object-src 'none'",
     "base-uri 'none'"
@@ -629,6 +629,23 @@ function isAllowedAdImageHost(host) {
   return AD_ALLOWED_IMAGE_HOST_SUFFIXES.some(suffix => host.endsWith(suffix));
 }
 const AD_MAX_IMAGES = 2;
+// Video/social embed src is generated entirely by our own client code
+// (youTubeEmbedUrl/vimeoEmbedUrl/parseSocialUrl + _socialEmbedSpec), which
+// only ever produces these exact hosts — so an exact match is intentional,
+// not a suffix match like the image host list. Anything else means the
+// block's src was set some other way (e.g. a direct API call bypassing the
+// editor UI's parsers), which is exactly what this exists to catch: an ad
+// is auto-shown to every user who taps Create, not opt-in like a link.
+const AD_ALLOWED_EMBED_HOSTS = new Set([
+  'www.youtube.com',    // youTubeEmbedUrl()
+  'player.vimeo.com',   // vimeoEmbedUrl()
+  'www.instagram.com',  // _socialEmbedSpec('instagram')
+  'open.spotify.com',   // _socialEmbedSpec('spotify')
+  'w.soundcloud.com'    // _socialEmbedSpec('soundcloud')
+]);
+function isAllowedAdEmbedHost(host) {
+  return AD_ALLOWED_EMBED_HOSTS.has(host);
+}
 
 // Server-side re-check of the eligibility rules — the client can (and
 // should) block the "Publish as Ad" tab from submitting when these fail,
@@ -643,7 +660,10 @@ const AD_MAX_IMAGES = 2;
 async function validateAdEligibility(html) {
   const textBlockContents = [];
   const imageSrcs = [];
+  const embedSrcs = [];
+  const captionContents = [];
   let currentTextBuf = null; // accumulates text inside the block currently being walked
+  let currentCapBuf = null; // same, for the image/video/social caption currently being walked
 
   const rewriter = new HTMLRewriter()
     .on('.blk[data-type="text"]', {
@@ -654,6 +674,21 @@ async function validateAdEligibility(html) {
     })
     .on('.blk-img img', {
       element(el) { imageSrcs.push(el.getAttribute('src') || ''); }
+    })
+    .on('.blk-video-frame iframe, .blk-social-embed iframe', {
+      element(el) { embedSrcs.push(el.getAttribute('src') || ''); }
+    })
+    // Captions on image/video/social blocks. Text can sit directly in the
+    // figcaption or inside inline formatting elements, so both are covered.
+    .on('.blk-caption figcaption', {
+      element(el) {
+        currentCapBuf = { text: '', placeholder: el.getAttribute('data-placeholder') === 'true' };
+        captionContents.push(currentCapBuf);
+      },
+      text(t) { if (currentCapBuf) currentCapBuf.text += t.text; }
+    })
+    .on('.blk-caption figcaption *', {
+      text(t) { if (currentCapBuf) currentCapBuf.text += t.text; }
     });
 
   // HTMLRewriter only does work as the response body is *read* — transform()
@@ -671,6 +706,17 @@ async function validateAdEligibility(html) {
   if (attributionOccurrences === 0) return { ok: false, reason: 'missing-attribution' };
   if (attributionOccurrences > 1) return { ok: false, reason: 'duplicate-attribution' };
   if (strayText.length > 0) return { ok: false, reason: 'added-text' };
+
+  // Rule: same for captions — blank lines only, no caption text.
+  // data-placeholder="true" is the reliable "never actually edited" signal
+  // (cleared on input, not on blur — see the client-side fix). The literal-
+  // "Caption" match is kept only as a fallback for notes saved before that
+  // fix, where the attribute could already be stripped despite no edit.
+  const strayCaptions = captionContents
+    .filter(b => !b.placeholder)
+    .map(b => b.text.replace(/\s+/g, ' ').trim())
+    .filter(t => t.length > 0 && t !== 'Caption');
+  if (strayCaptions.length > 0) return { ok: false, reason: 'added-caption' };
 
   // Rule: attribution block itself must not be shrunk or hidden. Best-effort
   // on the surrounding markup — checks the block and its style attribute for
@@ -694,6 +740,26 @@ async function validateAdEligibility(html) {
     let host;
     try { host = new URL(src).hostname.toLowerCase(); } catch (e) { return { ok: false, reason: 'invalid-image-src' }; }
     if (!isAllowedAdImageHost(host)) return { ok: false, reason: 'non-wikimedia-image' };
+  }
+
+  // Rule: any video/social embed must be one our own editor generates —
+  // see AD_ALLOWED_EMBED_HOSTS above for why this is exact-match and why
+  // it exists at all (this is the only server-side check on embed src;
+  // nothing else in this function looks at video/social blocks). Also
+  // caps each platform at one embed — each of the 5 allowed hosts maps to
+  // exactly one platform, so counting by host IS counting by platform.
+  const embedHostCounts = new Map();
+  for (const src of embedSrcs) {
+    if (!src) continue; // an empty/placeholder embed slot isn't "containing" an embed
+    let u;
+    try { u = new URL(src); } catch (e) { return { ok: false, reason: 'invalid-embed-src' }; }
+    if (u.protocol !== 'https:') return { ok: false, reason: 'invalid-embed-src' };
+    const host = u.hostname.toLowerCase();
+    if (!isAllowedAdEmbedHost(host)) return { ok: false, reason: 'non-allowed-embed' };
+    embedHostCounts.set(host, (embedHostCounts.get(host) || 0) + 1);
+  }
+  if (Array.from(embedHostCounts.values()).some(c => c > 1)) {
+    return { ok: false, reason: 'duplicate-platform-embed' };
   }
 
   return { ok: true };
