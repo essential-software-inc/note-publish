@@ -396,7 +396,7 @@ async function handleServe(env, slug) {
     "script-src 'unsafe-inline'",
     "style-src 'unsafe-inline'",
     "img-src * data: blob:",
-    "frame-src https://www.youtube.com https://www.instagram.com https://player.vimeo.com https://open.spotify.com https://w.soundcloud.com",
+    "frame-src https://www.youtube.com https://www.instagram.com https://open.spotify.com",
     "connect-src 'self'",
     "object-src 'none'",
     "base-uri 'none'"
@@ -630,7 +630,7 @@ function isAllowedAdImageHost(host) {
 }
 const AD_MAX_IMAGES = 2;
 // Video/social embed src is generated entirely by our own client code
-// (youTubeEmbedUrl/vimeoEmbedUrl/parseSocialUrl + _socialEmbedSpec), which
+// (youTubeEmbedUrl/parseSocialUrl + _socialEmbedSpec), which
 // only ever produces these exact hosts — so an exact match is intentional,
 // not a suffix match like the image host list. Anything else means the
 // block's src was set some other way (e.g. a direct API call bypassing the
@@ -638,10 +638,8 @@ const AD_MAX_IMAGES = 2;
 // is auto-shown to every user who taps Create, not opt-in like a link.
 const AD_ALLOWED_EMBED_HOSTS = new Set([
   'www.youtube.com',    // youTubeEmbedUrl()
-  'player.vimeo.com',   // vimeoEmbedUrl()
   'www.instagram.com',  // _socialEmbedSpec('instagram')
-  'open.spotify.com',   // _socialEmbedSpec('spotify')
-  'w.soundcloud.com'    // _socialEmbedSpec('soundcloud')
+  'open.spotify.com'    // _socialEmbedSpec('spotify')
 ]);
 function isAllowedAdEmbedHost(host) {
   return AD_ALLOWED_EMBED_HOSTS.has(host);
@@ -675,7 +673,7 @@ async function validateAdEligibility(html) {
     .on('.blk-img img', {
       element(el) { imageSrcs.push(el.getAttribute('src') || ''); }
     })
-    .on('.blk-video-frame iframe, .blk-social-embed iframe', {
+    .on('.blk-media-frame iframe, .blk-social-embed iframe', {
       element(el) { embedSrcs.push(el.getAttribute('src') || ''); }
     })
     // Captions on image/video/social blocks. Text can sit directly in the
