@@ -23,11 +23,11 @@ bucket_name = "note-publish-html"
 # transactions) can't guarantee. Everything else (page HTML, slugs, owner
 # tokens, accounts) stays in KV/R2 exactly as it already was.
 # Create with: wrangler d1 create note-publish-ads
-# Apply schema: wrangler d1 execute note-publish-ads --file=migrations/0001_ads.sql
+# Apply schema: wrangler d1 execute note-publish-ads --remote --file=migrations/0001_ads.sql
 [[d1_databases]]
 binding = "ADS_DB"
 database_name = "note-publish-ads"
-database_id = "REPLACE_WITH_D1_DATABASE_ID"
+database_id = "1926459f-558e-4bd5-9a9f-bef271775dc8"
 
 [triggers]
 crons = ["0 3 * * *"]
