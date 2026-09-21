@@ -782,7 +782,6 @@ const AD_VIEW_PACKAGES = {
   'nb_ad_views_5000': 5000,
   'nb_ad_views_20000': 20000,
   'nb_ad_views_100000': 100000,
-  'nb_ad_views_1000000': 1000000,
 };
 
 async function handleRevenueCatWebhook(env, request) {
