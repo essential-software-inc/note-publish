@@ -794,14 +794,13 @@ async function handleRevenueCatWebhook(env, request) {
   const event = body && body.event;
   if (!event || !event.id) return textError(400, 'missing event');
 
-  // Only NON_RENEWING_PURCHASE (RevenueCat's type for a consumable one-time
-  // product bought again) and INITIAL_PURCHASE (the very first buy) ever
-  // grant views — every other event type (renewal/cancel/refund/etc. don't
-  // apply to a consumable, but arrive on the same webhook) is ignored.
-  // TRANSFER/REFUND aren't handled here — a refunded view-package still
-  // leaves already-credited views spendable; add a 'refund' ledger row here
-  // if that needs tightening later.
-  if (event.type !== 'NON_RENEWING_PURCHASE' && event.type !== 'INITIAL_PURCHASE') {
+  // NON_RENEWING_PURCHASE (RevenueCat's type for a consumable one-time
+  // product bought again) and INITIAL_PURCHASE (the very first buy) grant
+  // views. A refunded consumable arrives as CANCELLATION with cancel_reason
+  // CUSTOMER_SUPPORT and claws those views back below. Every other event
+  // type is ignored.
+  const isRefund = event.type === 'CANCELLATION' && event.cancel_reason === 'CUSTOMER_SUPPORT';
+  if (!isRefund && event.type !== 'NON_RENEWING_PURCHASE' && event.type !== 'INITIAL_PURCHASE') {
     return json({ ok: true, ignored: event.type });
   }
   const views = AD_VIEW_PACKAGES[event.product_id];
@@ -815,6 +814,26 @@ async function handleRevenueCatWebhook(env, request) {
   // unlock, where the app-user-id didn't matter as much.
   const sub = event.app_user_id;
   if (!sub) return textError(400, 'missing app_user_id');
+
+  if (isRefund) {
+    // Negative ledger row for the refunded package. Keyed on the store
+    // transaction (falling back to the event id) so a repeated or
+    // redelivered CANCELLATION can't debit the same purchase twice.
+    // The balance is allowed to go negative — handleAdPublish refuses to
+    // spend from a balance that doesn't cover the request, so a negative one
+    // blocks new ads — and any ads the account still has running are pulled
+    // from rotation, since their views were paid for by a purchase that no
+    // longer stands.
+    await env.ADS_DB.prepare(
+      'INSERT OR IGNORE INTO view_credits_ledger (owner_sub, delta, reason, rc_event_id, created_at) VALUES (?, ?, ?, ?, ?)'
+    ).bind(sub, -views, 'refund', 'refund:' + String(event.transaction_id || event.id), Date.now()).run();
+    if ((await getCreditBalance(env, sub)) < 0) {
+      await env.ADS_DB.prepare(
+        "UPDATE ads SET status = 'unpublished', updated_at = ? WHERE owner_sub = ? AND status = 'active'"
+      ).bind(Date.now(), sub).run();
+    }
+    return json({ ok: true, refunded: views });
+  }
 
   // OR IGNORE on rc_event_id: RevenueCat retries webhook delivery on
   // non-2xx and can occasionally redeliver even after a 200 was returned —
@@ -861,21 +880,31 @@ async function handleAdPublish(env, request) {
   if (balance < views) return textError(402, 'insufficient view credits');
 
   const now = Date.now();
-  // Single batch = one D1 transaction: assign the next rotation slot,
-  // debit the ledger, and insert the ad row together, so a failure partway
-  // can't leave the ledger debited with no ad to show for it (or vice versa).
+  // The balance check above is only a fast path — it and the debit below
+  // aren't atomic, so two simultaneous publishes could both pass it and
+  // overdraw the ledger. The batch (one D1 transaction) re-checks the balance
+  // inside itself: the ad row is inserted only if the balance still covers
+  // `views`, and the debit only if that ad row landed, so a failure or race
+  // can't leave the ledger debited with no ad (or an ad with no debit).
+  // The rotation slot is claimed separately beforehand; losing the race
+  // just leaves an unused number, which the ordering already tolerates.
   const seqRow = await env.ADS_DB.prepare(
     'UPDATE ad_rotation_seq SET next_value = next_value + 1 WHERE id = 1 RETURNING next_value - 1 AS assigned'
   ).first();
   const rotationOrder = seqRow.assigned;
-  await env.ADS_DB.batch([
+  const results = await env.ADS_DB.batch([
     env.ADS_DB.prepare(
-      'INSERT INTO ads (slug, owner_sub, views_total, views_used, rotation_order, status, created_at, updated_at) VALUES (?, ?, ?, 0, ?, ?, ?, ?)'
-    ).bind(slug, sub, views, rotationOrder, 'active', now, now),
+      `INSERT INTO ads (slug, owner_sub, views_total, views_used, rotation_order, status, created_at, updated_at)
+       SELECT ?, ?, ?, 0, ?, 'active', ?, ?
+       WHERE (SELECT COALESCE(SUM(delta), 0) FROM view_credits_ledger WHERE owner_sub = ?) >= ?`
+    ).bind(slug, sub, views, rotationOrder, now, now, sub, views),
     env.ADS_DB.prepare(
-      'INSERT INTO view_credits_ledger (owner_sub, delta, reason, slug, created_at) VALUES (?, ?, ?, ?, ?)'
-    ).bind(sub, -views, 'allocate', slug, now),
+      `INSERT INTO view_credits_ledger (owner_sub, delta, reason, slug, created_at)
+       SELECT ?, ?, 'allocate', ?, ?
+       WHERE EXISTS (SELECT 1 FROM ads WHERE slug = ? AND owner_sub = ? AND created_at = ?)`
+    ).bind(sub, -views, slug, now, slug, sub, now),
   ]);
+  if (!results[0].meta.changes) return textError(402, 'insufficient view credits');
 
   return json({ ok: true, slug, viewsTotal: views }, 201);
 }
