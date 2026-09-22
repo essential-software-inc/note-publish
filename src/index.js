@@ -19,6 +19,10 @@
  *                   view-credit ledger (see migrations/0001_ads.sql). Page
  *                   HTML/slugs/tokens for ads still live in SLUGS/NOTES_BUCKET
  *                   above — an ad IS a published page, just also listed here.
+ *                   Also holds ad_viewers (see migrations/0002_ad_viewers.sql),
+ *                   a reporting-only unique-viewer dedup table — it never
+ *                   gates spend or the views_used/views_total counters below,
+ *                   which are unrelated and unchanged by it.
  *   REVENUECAT_WEBHOOK_SECRET (secret) - must match the "Authorization Header
  *                   value" configured on the RevenueCat project's webhook
  *                   (Project settings → Integrations → Webhooks) — see
@@ -40,6 +44,7 @@ const RESERVED_SLUGS = new Set([
 ]);
 const SOFT_DELETE_RETENTION_MS = 30 * 24 * 60 * 60 * 1000; // 30 days, plan §3.5
 const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days — re-issued on every successful /auth/google, not sliding
+const MAX_VIEWER_ID_LEN = 200; // client sends a UUID-ish string; generous cap against abuse, not a format check
 
 function corsHeaders() {
   return {
@@ -962,12 +967,17 @@ async function handleAdUnpublish(env, request, slug) {
 }
 
 // GET /ads/mine — the Publish as Ad tab's "views so far" display, plus
-// remaining credit balance for buying more.
+// remaining credit balance for buying more. unique_viewers is a reporting-
+// only figure from the ad_viewers dedup table (see handleAdView) — it never
+// factors into views_used/views_total or spend, which are unrelated
+// impression counters computed straight off the ads row.
 async function handleMyAds(env, request) {
   const sub = await requireSession(env, request);
   if (!sub) return textError(401, 'sign-in required');
   const { results } = await env.ADS_DB.prepare(
-    'SELECT slug, views_total, views_used, status, created_at, updated_at FROM ads WHERE owner_sub = ? ORDER BY created_at DESC'
+    `SELECT a.slug, a.views_total, a.views_used, a.status, a.created_at, a.updated_at,
+            (SELECT COUNT(*) FROM ad_viewers v WHERE v.slug = a.slug) AS unique_viewers
+     FROM ads a WHERE a.owner_sub = ? ORDER BY a.created_at DESC`
   ).bind(sub).all();
   const balance = await getCreditBalance(env, sub);
   return json({ ads: results || [], creditBalance: balance });
@@ -1016,8 +1026,23 @@ async function handleAdNext(env, request) {
 // makes the increment-and-cap-check atomic and self-limiting — no separate
 // read-then-write race window where two simultaneous edits could both
 // slip in under the cap.
+//
+// Separately (and NOT gating the above in any way) records a best-effort
+// unique-viewer signal for reporting: the client sends an anonymous,
+// per-device id (see _nbDeviceId in the app) as `viewerId`, and an
+// INSERT OR IGNORE against ad_viewers's (slug, viewer_id) primary key
+// dedupes repeat views from the same device. This is a reporting figure
+// only — it does not gate the view/spend counters above, doesn't require
+// sign-in, and is a heuristic (same person on two devices counts twice;
+// a reinstall counts as a new viewer) rather than a strong identity check.
+// A missing/old-client request (no viewerId, or no body at all) still
+// counts the impression as before; it's just left out of the unique count.
 async function handleAdView(env, request, slug) {
   if (!validSlug(slug)) return textError(400, 'invalid slug');
+  let body;
+  try { body = await request.json(); } catch (e) { body = {}; }
+  const viewerId = typeof body?.viewerId === 'string' ? body.viewerId.slice(0, MAX_VIEWER_ID_LEN) : null;
+
   const row = await env.ADS_DB.prepare(`
     UPDATE ads
     SET views_used = views_used + 1,
@@ -1026,6 +1051,17 @@ async function handleAdView(env, request, slug) {
     WHERE slug = ? AND status = 'active' AND views_used < views_total
     RETURNING views_used, views_total, status
   `).bind(Date.now(), slug).first();
+
+  if (row && viewerId) {
+    // Best-effort: never let a failure here affect the response — the
+    // impression above already landed regardless of what happens next.
+    try {
+      await env.ADS_DB.prepare(
+        'INSERT OR IGNORE INTO ad_viewers (slug, viewer_id, first_seen_at) VALUES (?, ?, ?)'
+      ).bind(slug, viewerId, Date.now()).run();
+    } catch (e) { /* reporting-only; swallow */ }
+  }
+
   // Not finding a row to update (already exhausted/unpublished/unknown
   // slug, or a race with another view landing the exact same moment) isn't
   // an error worth surfacing to the editor — the view simply isn't counted.
