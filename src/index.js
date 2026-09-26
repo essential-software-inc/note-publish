@@ -4,7 +4,11 @@
  * cross-device account sync (notes backup + published-page ownership).
  *
  * Bindings expected (see wrangler.toml):
- *   NOTES_BUCKET  - R2 bucket, stores "<slug>.html" and "sync/<sub>/notes.json"
+ *   NOTES_BUCKET  - R2 bucket, stores "<slug>.html", "sync/<sub>/notes.json",
+ *                   and "story-images/<slug>" (ring-avatar blobs for the
+ *                   Stories feature — see storeStoryImage/handleServeStoryImage
+ *                   and storeStoryCardImages/handleServeStoryCardImage for
+ *                   the ring avatar vs. Subscribed-feed card thumbnails)
  *   SLUGS         - KV namespace, stores JSON metadata per slug, plus
  *                   "owner:<sub>:<slug>" index keys for GET /my/pages
  *   REPORTS       - KV namespace, stores report records
@@ -15,14 +19,18 @@
  *                   as the idToken audience (the app's web client ID, and
  *                   any Android client IDs that ever appear as `aud`) —
  *                   see verifyGoogleIdToken
- *   ADS_DB        - D1 database, Publish-as-Ad only: round-robin cursor +
- *                   view-credit ledger (see migrations/0001_ads.sql). Page
- *                   HTML/slugs/tokens for ads still live in SLUGS/NOTES_BUCKET
- *                   above — an ad IS a published page, just also listed here.
- *                   Also holds ad_viewers (see migrations/0002_ad_viewers.sql),
- *                   a reporting-only unique-viewer dedup table — it never
- *                   gates spend or the views_used/views_total counters below,
- *                   which are unrelated and unchanged by it.
+ *   ADS_DB        - D1 database. Originally ads-only (round-robin cursor +
+ *                   view-credit ledger, see migrations/0001_ads.sql; also
+ *                   ad_viewers, a reporting-only unique-viewer dedup table,
+ *                   see migrations/0002_ad_viewers.sql — it never gates
+ *                   spend or the views_used/views_total counters, which are
+ *                   unrelated and unchanged by it). Also holds stories,
+ *                   subscriptions, and story_seen (migrations/0003_stories.sql)
+ *                   for the Stories feature — same rationale as the ads
+ *                   tables: feed/ring queries need real joins that KV can't
+ *                   do. Page HTML/slugs/tokens stay in SLUGS/NOTES_BUCKET as
+ *                   before — a story or an ad IS a published page, just also
+ *                   indexed here for the queries that need it.
  *   REVENUECAT_WEBHOOK_SECRET (secret) - must match the "Authorization Header
  *                   value" configured on the RevenueCat project's webhook
  *                   (Project settings → Integrations → Webhooks) — see
@@ -30,12 +38,29 @@
  *                   endpoint refuses everything (fail closed).
  *
  * Rate limiting on POST /publish and PUT /publish/:slug is configured via
- * Cloudflare's dashboard Rate Limiting Rules (plan §4) — not implemented in
- * code. GET /@:slug and /check-slug/:slug are intentionally left open.
+ * Cloudflare's dashboard Rate Limiting Rules (plan §4) as the primary
+ * defense, PLUS an in-code per-IP backstop (checkPublishRateLimit) so the
+ * two endpoints that write to R2/D1 are never left unthrottled if the
+ * dashboard rule is missing, misconfigured, or reset. GET /@:slug and
+ * /check-slug/:slug are intentionally left open (read-only, cheap).
  */
 
 const MAX_HTML_BYTES = 2 * 1024 * 1024; // 2MB — plan §6, tune as needed
 const MAX_SYNC_BYTES = 8 * 1024 * 1024; // notes backups carry embedded images, so a higher cap than a single published page
+// Per-account cap on simultaneously-live published pages. At MAX_HTML_BYTES
+// each this bounds one account's worst-case R2 footprint to ~1GB; well
+// above any legitimate usage pattern, but closes off unbounded growth from
+// a compromised/scripted account. Anonymous (no ownerSub) publishes aren't
+// covered by this cap since there's no account to count against — they're
+// covered by the IP-based checkPublishRateLimit below instead.
+const MAX_PAGES_PER_ACCOUNT = 500;
+// Backstop rate limit for POST /publish and PUT /publish/:slug (see header
+// comment). Same best-effort fixed-window approach as
+// checkReportRateLimit — not perfectly accurate under sustained abuse, but
+// enough to stop a naive scripted loop from running up R2 PUTs/storage
+// before the dashboard rule (or an operator) catches it.
+const PUBLISH_RATE_LIMIT_MAX = 20;
+const PUBLISH_RATE_LIMIT_WINDOW_S = 60;
 const SLUG_RE = /^[a-z0-9-]{3,48}$/;
 const RESERVED_SLUGS = new Set([
   'admin', 'api', 'report', 'reports', 'check-slug', 'publish', 'n',
@@ -126,6 +151,36 @@ async function getUser(env, sub) {
 }
 async function putUser(env, sub, user) {
   await env.ACCOUNTS.put('user:' + sub, JSON.stringify(user));
+}
+
+const PROFILE_NAME_MAX = 15;
+
+// Cosmetic-only display name (plan: Stories feature) set from the Log Out
+// confirm dialog. Not unique, not the real identity — email stays that.
+// Shown only on Subscribed-feed note cards, before the title.
+async function handleSetProfileName(env, request) {
+  const sub = await requireSession(env, request);
+  if (!sub) return textError(401, 'sign-in required');
+  let body;
+  try { body = await request.json(); } catch (e) { return textError(400, 'invalid JSON body'); }
+  let { name } = body || {};
+  if (typeof name !== 'string') return textError(400, 'missing name');
+  name = name.trim().slice(0, PROFILE_NAME_MAX);
+  const user = (await getUser(env, sub)) || {};
+  user.profileName = name || null;
+  await putUser(env, sub, user);
+  return json({ ok: true, profileName: user.profileName });
+}
+
+// GET /account/profile-name — reads back the signed-in account's own
+// cosmetic display name (the Log Out dialog previously only ever cached
+// its last local write; this is what lets a second device, or a
+// reinstall, pick up a name set elsewhere instead of showing blank).
+async function handleGetProfileName(env, request) {
+  const sub = await requireSession(env, request);
+  if (!sub) return textError(401, 'sign-in required');
+  const user = await getUser(env, sub);
+  return json({ ok: true, profileName: (user && user.profileName) || null });
 }
 
 async function createSession(env, sub) {
@@ -246,10 +301,34 @@ async function handleCheckSlug(env, slug) {
   return json({ available: !takenAndLive, reason: (meta && meta.adminLocked) ? 'disabled' : undefined });
 }
 
+// Shared backstop limiter for the two storage-writing publish routes (see
+// header comment + PUBLISH_RATE_LIMIT_* above). Keyed by IP rather than
+// account so it also throttles anonymous publishes, which have no ownerSub
+// for MAX_PAGES_PER_ACCOUNT to apply to.
+async function checkPublishRateLimit(env, request) {
+  const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
+  const key = 'ratelimit:publish:' + ip;
+  const raw = await env.REPORTS.get(key);
+  const count = raw ? parseInt(raw, 10) || 0 : 0;
+  if (count >= PUBLISH_RATE_LIMIT_MAX) return false;
+  await env.REPORTS.put(key, String(count + 1), { expirationTtl: PUBLISH_RATE_LIMIT_WINDOW_S });
+  return true;
+}
+
+// Counts (a cap-bounded number of) an owner's currently-live pages via the
+// existing "owner:<sub>:<slug>" index, so this is a single bounded KV.list
+// call — not a full per-account scan — regardless of how large the account
+// ever gets. Returns true once MAX_PAGES_PER_ACCOUNT is reached or exceeded.
+async function ownerAtPageCap(env, ownerSub) {
+  const page = await env.SLUGS.list({ prefix: 'owner:' + ownerSub + ':', limit: MAX_PAGES_PER_ACCOUNT });
+  return page.keys.length >= MAX_PAGES_PER_ACCOUNT;
+}
+
 async function handlePublish(env, request) {
+  if (!(await checkPublishRateLimit(env, request))) return textError(429, 'too many publishes, slow down');
   let body;
   try { body = await request.json(); } catch (e) { return textError(400, 'invalid JSON body'); }
-  const { slug, html } = body || {};
+  const { slug, html, title, showInStories } = body || {};
   if (!validSlug(slug)) return textError(400, 'invalid or reserved slug');
   if (typeof html !== 'string' || !html) return textError(400, 'missing html');
   if (new TextEncoder().encode(html).length > MAX_HTML_BYTES) {
@@ -259,6 +338,15 @@ async function handlePublish(env, request) {
   if (existing && existing.adminLocked) return textError(403, 'slug permanently disabled');
   if (existing && !existing.deletedAt) return textError(409, 'slug already taken');
 
+  // Ownership tagging normally happens further down (after the token is
+  // minted), but the page-count cap only means anything for an owned
+  // account, so it's checked here, before any writes, against the same
+  // requireSession call that path already does.
+  const capOwnerSub = await requireSession(env, request);
+  if (capOwnerSub && (await ownerAtPageCap(env, capOwnerSub))) {
+    return textError(403, `page limit reached (max ${MAX_PAGES_PER_ACCOUNT} live pages per account) — unpublish something first`);
+  }
+
   const token = newToken();
   const tokenHash = await sha256Hex(token);
   const now = Date.now();
@@ -266,7 +354,13 @@ async function handlePublish(env, request) {
   // invalid Authorization header just means this page publishes the same
   // way it always has (anonymous, owner-token-only). A signed-in owner
   // gets it listed under GET /my/pages too, via the index key below.
-  const ownerSub = await requireSession(env, request);
+  // (Same session already resolved above for the page-count cap check.)
+  const ownerSub = capOwnerSub;
+  // Stories requires a signed-in owner (subscriptions/feed are per-account)
+  // — an anonymous publish silently ignores the toggle rather than 401ing,
+  // since publish itself stays anonymous-friendly.
+  const wantsStory = !!showInStories && !!ownerSub;
+  const storyTitle = (typeof title === 'string' ? title.trim() : '').slice(0, 200) || 'Untitled note';
 
   await env.NOTES_BUCKET.put(slug + '.html', html, {
     httpMetadata: { contentType: 'text/html; charset=utf-8' }
@@ -277,17 +371,27 @@ async function handlePublish(env, request) {
     updatedAt: now,
     sizeBytes: html.length,
     deletedAt: null,
-    ownerSub: ownerSub || null
+    ownerSub: ownerSub || null,
+    showInStories: wantsStory,
+    title: storyTitle
   });
   if (ownerSub) await env.SLUGS.put('owner:' + ownerSub + ':' + slug, '1');
+  if (wantsStory) {
+    const imageUrl = await storeStoryImage(env, slug, html);
+    const imageUrls = await storeStoryCardImages(env, slug, html);
+    await env.ADS_DB.prepare(
+      'INSERT OR REPLACE INTO stories (slug, author_sub, title, created_at, image_url, image_urls) VALUES (?, ?, ?, ?, ?, ?)'
+    ).bind(slug, ownerSub, storyTitle, now, imageUrl, imageUrls).run();
+  }
   return json({ slug, token }, 201);
 }
 
 async function handleUpdate(env, request, slug) {
+  if (!(await checkPublishRateLimit(env, request))) return textError(429, 'too many publishes, slow down');
   if (!validSlug(slug)) return textError(400, 'invalid slug');
   let body;
   try { body = await request.json(); } catch (e) { return textError(400, 'invalid JSON body'); }
-  const { html, token } = body || {};
+  const { html, token, title, showInStories } = body || {};
   if (typeof html !== 'string' || !html) return textError(400, 'missing html');
   if (typeof token !== 'string' || !token) return textError(401, 'missing token');
   if (new TextEncoder().encode(html).length > MAX_HTML_BYTES) {
@@ -303,6 +407,42 @@ async function handleUpdate(env, request, slug) {
   });
   meta.updatedAt = Date.now();
   meta.sizeBytes = html.length;
+  if (typeof title === 'string' && title.trim()) meta.title = title.trim().slice(0, 200);
+
+  // showInStories is only togglable here for an owned page — an anonymous
+  // publish (meta.ownerSub null) has no account to attribute a story row
+  // to, so the toggle is a no-op for it regardless of what's sent.
+  if (typeof showInStories === 'boolean' && meta.ownerSub) {
+    const was = !!meta.showInStories;
+    const wants = showInStories;
+    if (wants && !was) {
+      const imageUrl = await storeStoryImage(env, slug, html);
+      const imageUrls = await storeStoryCardImages(env, slug, html);
+      await env.ADS_DB.prepare(
+        'INSERT OR REPLACE INTO stories (slug, author_sub, title, created_at, image_url, image_urls) VALUES (?, ?, ?, ?, ?, ?)'
+      ).bind(slug, meta.ownerSub, meta.title || 'Untitled note', meta.updatedAt, imageUrl, imageUrls).run();
+    } else if (!wants && was) {
+      await deleteStoryImage(env, slug);
+      await deleteStoryCardImages(env, slug);
+      await env.ADS_DB.batch([
+        env.ADS_DB.prepare('DELETE FROM stories WHERE slug = ?').bind(slug),
+        env.ADS_DB.prepare('DELETE FROM story_seen WHERE slug = ?').bind(slug)
+      ]);
+    } else if (wants && was) {
+      // Title and/or the note's images may have changed this same call —
+      // keep the story row's denormalized copies in sync without touching
+      // created_at (that would reorder it in the strip/feed, which an
+      // edit shouldn't). storeStoryImage/storeStoryCardImages also clear/
+      // replace the R2 blobs as needed (removed image, shrunk image,
+      // swapped for a remote URL, etc).
+      const imageUrl = await storeStoryImage(env, slug, html);
+      const imageUrls = await storeStoryCardImages(env, slug, html);
+      await env.ADS_DB.prepare('UPDATE stories SET title = ?, image_url = ?, image_urls = ? WHERE slug = ?')
+        .bind(meta.title || 'Untitled note', imageUrl, imageUrls, slug).run();
+    }
+    meta.showInStories = wants;
+  }
+
   await putMeta(env, slug, meta);
   return json({ ok: true });
 }
@@ -359,6 +499,17 @@ async function handleUnpublish(env, request, slug) {
   // an admin takedown shouldn't keep showing up in the owner's own page
   // list any more than a normal unpublish would.
   if (meta.ownerSub) await env.SLUGS.delete('owner:' + meta.ownerSub + ':' + slug);
+  // A story stops being a story the moment its page is gone — it doesn't
+  // wait for handlePurge's 30-day hard-delete pass, that's KV/R2 cleanup
+  // for already-dead entries, not the thing that makes a story live.
+  if (meta.showInStories) {
+    await deleteStoryImage(env, slug);
+    await deleteStoryCardImages(env, slug);
+    await env.ADS_DB.batch([
+      env.ADS_DB.prepare('DELETE FROM stories WHERE slug = ?').bind(slug),
+      env.ADS_DB.prepare('DELETE FROM story_seen WHERE slug = ?').bind(slug)
+    ]);
+  }
   return json({ ok: true });
 }
 
@@ -382,6 +533,478 @@ async function handleMyPages(env, request) {
     cursor = page.list_complete ? undefined : page.cursor;
   } while (cursor);
   return json({ pages });
+}
+
+/* ---------------- Stories ---------------- */
+
+const STORIES_STRIP_LIMIT = 12;
+// Signed-in candidate pool for the discovery strip is wider than what's
+// shown (see handleStoriesStrip's per-viewer shuffle) so that different
+// viewers, drawing from the same pool, land on genuinely different
+// subsets/orders rather than everyone just re-deriving the same top 12.
+const STORIES_STRIP_CANDIDATE_LIMIT = 60;
+// A story only appears in the discovery strip or the Subscribed feed for
+// this long after being posted — Instagram-style ephemerality. The
+// published page itself is untouched; this only affects the Stories
+// listings (see handleStoriesStrip / handleSubscriptionsFeed). Also
+// doubles as the rotation period for the per-viewer shuffle seed below,
+// so a viewer's particular slice of the pool changes on the same cadence
+// the pool itself does.
+const STORIES_LOOKBACK_MS = 24 * 60 * 60 * 1000;
+
+// Non-cryptographic string hash (FNV-1a) + mulberry32 PRNG, used only to
+// seed a per-viewer shuffle of the discovery-strip candidate pool — not
+// security-sensitive, just needs to be cheap and deterministic for a
+// given (sub, day-bucket) pair so the same viewer sees a stable order
+// within one STORIES_LOOKBACK_MS window and a different one the next.
+function _storiesHashSeed(str) {
+  let h = 2166136261;
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+}
+function _storiesMulberry32(seed) {
+  let t = seed >>> 0;
+  return function () {
+    t += 0x6D2B79F5;
+    let r = Math.imul(t ^ (t >>> 15), 1 | t);
+    r ^= r + Math.imul(r ^ (r >>> 7), 61 | r);
+    return ((r ^ (r >>> 14)) >>> 0) / 4294967296;
+  };
+}
+// Deterministic Fisher-Yates shuffle: same seedStr always yields the same
+// order, different seedStr (different viewer, or same viewer next
+// STORIES_LOOKBACK_MS window) yields a different one.
+function _storiesSeededShuffle(arr, seedStr) {
+  const rng = _storiesMulberry32(_storiesHashSeed(seedStr));
+  const a = arr.slice();
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(rng() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+// Ring avatar preview: skip storing an image bigger than this, whether
+// it ends up in R2 (decoded data: URI bytes) or, for an already-remote
+// src, the URL string itself. 300KB comfortably covers a compressed
+// device photo; anything bigger just falls back to the title-text avatar
+// client-side. (Previously this bounded the base64 string written
+// straight into the D1 image_url column; see storeStoryImage.)
+const STORY_IMAGE_MAX_BYTES = 300 * 1024;
+
+// Pulls the note's raw first image src for the story-ring avatar preview,
+// reusing the same '.blk-img img' HTMLRewriter selector validateAdEligibility
+// already walks below. Returns null if there's no image. Callers decide
+// what to do with a data: URI vs. an already-remote URL (see
+// storeStoryImage) and where the size cutoff applies.
+async function extractFirstImageSrc(html) {
+  let first = null;
+  const rewriter = new HTMLRewriter().on('.blk-img img', {
+    element(el) {
+      if (first === null) {
+        const src = el.getAttribute('src') || '';
+        if (src) first = src;
+      }
+    }
+  });
+  await rewriter.transform(new Response(html)).text();
+  return first;
+}
+
+// Same idea as extractFirstImageSrc but collects up to `max` image srcs
+// in document order, for the Subscribed-feed card preview (up to 3
+// thumbnails, same as a normal note card — see storeStoryCardImages).
+async function extractImageSrcs(html, max) {
+  const found = [];
+  const rewriter = new HTMLRewriter().on('.blk-img img', {
+    element(el) {
+      if (found.length >= max) return;
+      const src = el.getAttribute('src') || '';
+      if (src) found.push(src);
+    }
+  });
+  await rewriter.transform(new Response(html)).text();
+  return found;
+}
+
+// R2 key for one of a story's up-to-3 card-preview images (distinct from
+// storyImageKey's single ring-avatar blob — the ring shows just the
+// first image, the Subscribed-feed card shows up to three, same as any
+// other note card's thumbnail row).
+function storyCardImageKey(slug, index) {
+  return `story-card-images/${slug}/${index}`;
+}
+
+// Mirrors storeStoryImage but for up to 3 images instead of 1. Returns a
+// JSON string for the stories.image_urls column: an array (possibly
+// empty) of entries, each either STORY_IMAGE_R2_MARKER (blob at
+// storyCardImageKey(slug, i)) or a plain remote URL — same per-entry
+// convention as the single-image column. Always clears any stale blobs
+// for indexes beyond what's stored now, so a note that loses images (or
+// shrinks from 3 to 1) doesn't leave orphaned R2 objects behind.
+async function storeStoryCardImages(env, slug, html) {
+  const srcs = await extractImageSrcs(html, 3);
+  const entries = [];
+  for (let i = 0; i < 3; i++) {
+    if (i >= srcs.length) {
+      await env.NOTES_BUCKET.delete(storyCardImageKey(slug, i));
+      continue;
+    }
+    const src = srcs[i];
+    const m = /^data:([^;,]*)(;base64)?,(.*)$/s.exec(src);
+    if (!m) {
+      await env.NOTES_BUCKET.delete(storyCardImageKey(slug, i));
+      if (new TextEncoder().encode(src).length <= STORY_IMAGE_MAX_BYTES) entries.push(src);
+      continue;
+    }
+    const contentType = m[1] || 'application/octet-stream';
+    const isBase64 = !!m[2];
+    let bytes;
+    try {
+      if (isBase64) {
+        const binary = atob(m[3]);
+        bytes = new Uint8Array(binary.length);
+        for (let j = 0; j < binary.length; j++) bytes[j] = binary.charCodeAt(j);
+      } else {
+        bytes = new TextEncoder().encode(decodeURIComponent(m[3]));
+      }
+    } catch (e) {
+      await env.NOTES_BUCKET.delete(storyCardImageKey(slug, i));
+      continue; // malformed data URI — treat like "no image" for this slot
+    }
+    if (bytes.byteLength > STORY_IMAGE_MAX_BYTES) {
+      await env.NOTES_BUCKET.delete(storyCardImageKey(slug, i));
+      continue;
+    }
+    await env.NOTES_BUCKET.put(storyCardImageKey(slug, i), bytes, { httpMetadata: { contentType } });
+    entries.push(STORY_IMAGE_R2_MARKER);
+  }
+  return JSON.stringify(entries);
+}
+
+// Cleans up all of a story's card-preview blobs (up to 3), mirroring
+// deleteStoryImage — called from the same places that call it (story
+// toggled off, unpublished, purged, or simply re-stored on an edit).
+async function deleteStoryCardImages(env, slug) {
+  await Promise.all([0, 1, 2].map(i => env.NOTES_BUCKET.delete(storyCardImageKey(slug, i))));
+}
+
+// GET /stories/card-image/:slug/:index — serves one of the up-to-3
+// R2-stored card-preview blobs. Same public/no-auth/short-cache shape as
+// handleServeStoryImage; a missing slot (never had that many images, or
+// fewer now) 404s, which the client's onerror thumbnail handling already
+// tolerates.
+async function handleServeStoryCardImage(env, slug, indexStr) {
+  if (!validSlug(slug)) return textError(404, 'not found');
+  const index = Number(indexStr);
+  if (!Number.isInteger(index) || index < 0 || index > 2) return textError(404, 'not found');
+  const obj = await env.NOTES_BUCKET.get(storyCardImageKey(slug, index));
+  if (!obj) return textError(404, 'not found');
+  return new Response(obj.body, {
+    headers: {
+      'Content-Type': (obj.httpMetadata && obj.httpMetadata.contentType) || 'application/octet-stream',
+      'Cache-Control': 'public, max-age=300',
+      ...corsHeaders()
+    }
+  });
+}
+
+// Expands a stories.image_urls JSON column value into absolute URLs,
+// using the same STORY_IMAGE_R2_MARKER convention as the single-image
+// column. Tolerates a null/empty/malformed column (rows written before
+// this column existed) by returning [].
+function expandStoryImageUrls(origin, slug, imageUrlsJson) {
+  let entries;
+  try { entries = JSON.parse(imageUrlsJson || '[]'); } catch (e) { entries = []; }
+  if (!Array.isArray(entries)) return [];
+  return entries.map((entry, i) => entry === STORY_IMAGE_R2_MARKER
+    ? `${origin}/stories/card-image/${encodeURIComponent(slug)}/${i}`
+    : entry
+  ).filter(Boolean);
+}
+
+// R2 key for a story's ring-avatar image blob. One object per slug
+// (overwritten on republish/edit), so no separate cleanup bookkeeping is
+// needed beyond deleting this key when the story stops existing.
+function storyImageKey(slug) {
+  return `story-images/${slug}`;
+}
+
+// Sentinel stored in the D1 stories.image_url column when the avatar image
+// lives in R2 (see storyImageKey) rather than being a plain remote URL.
+// handleStoriesStrip expands this into an absolute /stories/image/<slug>
+// URL at read time, using the request's own origin.
+const STORY_IMAGE_R2_MARKER = 'r2';
+
+// Extracts the note's first image for the story-ring avatar and, if it's
+// an inline data: URI, decodes and stores the raw bytes in R2 (see
+// storyImageKey) instead of writing the (often large) base64 string into
+// D1 — D1 image_url previously held the data URI directly, which bloated
+// row size and every /stories response. Returns the value to store in the
+// stories.image_url column: STORY_IMAGE_R2_MARKER when an image was
+// written to R2, a plain URL when the note's first image is already a
+// remote (non-data:) src, or null when there's no usable image (no image,
+// unparseable data URI, or over STORY_IMAGE_MAX_BYTES once decoded) — the
+// client falls back to a title-text avatar in all null cases. Always
+// clears any stale R2 object for this slug first so a shrunk/removed
+// image, or a switch from a data: URI to a remote URL, doesn't leave an
+// orphaned blob behind.
+async function storeStoryImage(env, slug, html) {
+  const src = await extractFirstImageSrc(html);
+  await env.NOTES_BUCKET.delete(storyImageKey(slug));
+  if (!src) return null;
+
+  const m = /^data:([^;,]*)(;base64)?,(.*)$/s.exec(src);
+  if (!m) {
+    // Already a remote URL (or some other non-data src) — nothing to
+    // move to R2; store it as before, still capped against abuse.
+    if (new TextEncoder().encode(src).length > STORY_IMAGE_MAX_BYTES) return null;
+    return src;
+  }
+
+  const contentType = m[1] || 'application/octet-stream';
+  const isBase64 = !!m[2];
+  let bytes;
+  try {
+    if (isBase64) {
+      const binary = atob(m[3]);
+      bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    } else {
+      bytes = new TextEncoder().encode(decodeURIComponent(m[3]));
+    }
+  } catch (e) {
+    return null; // malformed data URI — treat like "no image"
+  }
+  if (bytes.byteLength > STORY_IMAGE_MAX_BYTES) return null;
+
+  await env.NOTES_BUCKET.put(storyImageKey(slug), bytes, {
+    httpMetadata: { contentType }
+  });
+  return STORY_IMAGE_R2_MARKER;
+}
+
+// Cleans up a story's R2 avatar blob (if any) whenever its stories row
+// goes away — toggled off, unpublished, or purged. A no-op delete on a
+// slug that never had an image (or already had it cleared by
+// storeStoryImage) is harmless.
+async function deleteStoryImage(env, slug) {
+  await env.NOTES_BUCKET.delete(storyImageKey(slug));
+}
+
+// GET /stories/image/:slug — serves the R2-stored ring-avatar blob for a
+// story whose image_url is STORY_IMAGE_R2_MARKER. Public, like the strip
+// itself; a slug with no stored image (already unpublished, toggled off,
+// or never had one) 404s, which the client's onerror avatar fallback
+// already handles for the <img> tag.
+async function handleServeStoryImage(env, slug) {
+  if (!validSlug(slug)) return textError(404, 'not found');
+  const obj = await env.NOTES_BUCKET.get(storyImageKey(slug));
+  if (!obj) return textError(404, 'not found');
+  return new Response(obj.body, {
+    headers: {
+      'Content-Type': (obj.httpMetadata && obj.httpMetadata.contentType) || 'application/octet-stream',
+      // Short cache: the same key can be overwritten by a later edit, so
+      // this isn't content-addressed/immutable like the note HTML snapshots.
+      'Cache-Control': 'public, max-age=300',
+      ...corsHeaders()
+    }
+  });
+}
+
+// GET /stories — the horizontal strip on the Notes screen. This is a
+// *discovery* surface, not a feed of people you already follow: a story
+// only qualifies for STORIES_LOOKBACK_MS (24h) after it's posted, and
+// any author the signed-in caller already subscribes to is excluded
+// (those show as note cards in the Subscribed category instead — see
+// handleSubscriptionsFeed).
+//
+// Different signed-in viewers see different slices of that pool, not
+// just the same newest-12: pull a wider recent candidate window, then
+// deterministically shuffle it per viewer (seeded by their sub + which
+// STORIES_LOOKBACK_MS window we're in, so it's stable for a given viewer
+// through the window and reshuffles once the window rolls over) before
+// taking the top STORIES_STRIP_LIMIT. Anonymous callers have no identity
+// to vary by, so they get the flat newest-first list within the same 24h
+// window — same as before.
+async function handleStoriesStrip(env, request) {
+  const sub = await requireSession(env, request);
+  const now = Date.now();
+  const cutoff = now - STORIES_LOOKBACK_MS;
+
+  let followedAuthors = [];
+  if (sub) {
+    const followRows = await env.ADS_DB.prepare(
+      'SELECT author_sub FROM subscriptions WHERE subscriber_sub = ?'
+    ).bind(sub).all();
+    followedAuthors = followRows.results.map(r => r.author_sub);
+  }
+
+  let query = 'SELECT slug, author_sub, title, created_at, image_url FROM stories WHERE created_at >= ?';
+  const params = [cutoff];
+  if (followedAuthors.length) {
+    query += ` AND author_sub NOT IN (${followedAuthors.map(() => '?').join(',')})`;
+    params.push(...followedAuthors);
+  }
+  query += ' ORDER BY created_at DESC LIMIT ?';
+  params.push(sub ? STORIES_STRIP_CANDIDATE_LIMIT : STORIES_STRIP_LIMIT);
+
+  const { results } = await env.ADS_DB.prepare(query).bind(...params).all();
+
+  let ranked = results;
+  if (sub && results.length > STORIES_STRIP_LIMIT) {
+    const windowBucket = Math.floor(now / STORIES_LOOKBACK_MS);
+    ranked = _storiesSeededShuffle(results, sub + ':' + windowBucket);
+  }
+  ranked = ranked.slice(0, STORIES_STRIP_LIMIT);
+
+  let seenSlugs = new Set();
+  if (sub && ranked.length) {
+    const placeholders = ranked.map(() => '?').join(',');
+    const seenRows = await env.ADS_DB.prepare(
+      `SELECT slug FROM story_seen WHERE subscriber_sub = ? AND slug IN (${placeholders})`
+    ).bind(sub, ...ranked.map(r => r.slug)).all();
+    seenSlugs = new Set(seenRows.results.map(r => r.slug));
+  }
+
+  // image_url is either STORY_IMAGE_R2_MARKER (image lives in R2, served
+  // via GET /stories/image/:slug — see storeStoryImage/handleServeStoryImage),
+  // a plain remote URL (passed through as-is), or null.
+  const origin = new URL(request.url).origin;
+  return json({
+    stories: ranked.map(r => ({
+      slug: r.slug,
+      title: r.title,
+      authorSub: r.author_sub,
+      createdAt: r.created_at,
+      seen: seenSlugs.has(r.slug),
+      imageUrl: r.image_url === STORY_IMAGE_R2_MARKER
+        ? `${origin}/stories/image/${encodeURIComponent(r.slug)}`
+        : (r.image_url || null)
+    }))
+  });
+}
+
+// POST /stories/:slug/seen — marks a story opened by the signed-in
+// viewer, so its ring greys out across every device on this account
+// (plan: ring state is server-synced, not per-device local state).
+// Silently no-ops for a slug that isn't actually a live story (already
+// unpublished, toggled off, or never existed) rather than 404ing — the
+// client fires this right after opening whatever the strip handed it,
+// and a race with the author turning the story off a moment later isn't
+// worth surfacing as an error.
+async function handleMarkStorySeen(env, request, slug) {
+  const sub = await requireSession(env, request);
+  if (!sub) return textError(401, 'sign-in required');
+  if (!validSlug(slug)) return textError(400, 'invalid slug');
+  await env.ADS_DB.prepare(
+    'INSERT OR REPLACE INTO story_seen (subscriber_sub, slug, seen_at) VALUES (?, ?, ?)'
+  ).bind(sub, slug, Date.now()).run();
+  return json({ ok: true });
+}
+
+// POST /subscriptions/:authorSub — follow an author. authorSub is that
+// account's Google `sub`, taken from a story's authorSub field (the
+// client never has to know or expose email/identity beyond that).
+async function handleSubscribe(env, request, authorSub) {
+  const sub = await requireSession(env, request);
+  if (!sub) return textError(401, 'sign-in required');
+  if (!authorSub) return textError(400, 'missing author');
+  if (authorSub === sub) return textError(400, "can't subscribe to yourself");
+  await env.ADS_DB.prepare(
+    'INSERT OR IGNORE INTO subscriptions (subscriber_sub, author_sub, created_at) VALUES (?, ?, ?)'
+  ).bind(sub, authorSub, Date.now()).run();
+  return json({ ok: true });
+}
+
+async function handleUnsubscribe(env, request, authorSub) {
+  const sub = await requireSession(env, request);
+  if (!sub) return textError(401, 'sign-in required');
+  await env.ADS_DB.prepare(
+    'DELETE FROM subscriptions WHERE subscriber_sub = ? AND author_sub = ?'
+  ).bind(sub, authorSub).run();
+  return json({ ok: true });
+}
+
+const SUBSCRIPTIONS_FEED_PAGE_SIZE = 20;
+
+// GET /subscriptions/feed — the "Subscribed" category: a regular social
+// feed, not a Stories surface. No 24h expiry (that ephemerality is
+// specific to the discovery strip/ring — see handleStoriesStrip). Two
+// things that make this behave like an actual feed rather than a dump
+// of everything:
+//
+// - Per-author floor at subscribe time (s.created_at >= sub.created_at
+//   in the JOIN below): following someone surfaces what they post from
+//   that point on, not their whole back catalog — same as following an
+//   account anywhere else. Unsubscribing and re-subscribing later resets
+//   this floor to the new subscribe time, same reasoning.
+// - Keyset pagination via an opaque `cursor` query param (this endpoint's
+//   own past output, not something the client constructs): first call
+//   omits it; each response's `nextCursor` is passed back to fetch the
+//   next older page, `null` means there's nothing more. This is keyset
+//   (created_at+slug), not an offset — the client isn't tracking a page
+//   number, it's tracking "the last thing I've already loaded", so a new
+//   post arriving between page loads doesn't shift already-seen items
+//   into a later page or duplicate them into an earlier one.
+async function handleSubscriptionsFeed(env, request) {
+  const sub = await requireSession(env, request);
+  if (!sub) return textError(401, 'sign-in required');
+
+  const url = new URL(request.url);
+  const cursorParam = url.searchParams.get('cursor');
+  let cursorCreatedAt = null, cursorSlug = null;
+  if (cursorParam) {
+    const i = cursorParam.lastIndexOf(':');
+    if (i > 0) {
+      const at = Number(cursorParam.slice(0, i));
+      if (Number.isFinite(at)) { cursorCreatedAt = at; cursorSlug = cursorParam.slice(i + 1); }
+    }
+  }
+
+  let query = `SELECT s.slug, s.author_sub, s.title, s.created_at, s.image_urls, seen.slug IS NOT NULL AS seen
+     FROM stories s
+     JOIN subscriptions sub ON sub.author_sub = s.author_sub AND sub.subscriber_sub = ? AND s.created_at >= sub.created_at
+     LEFT JOIN story_seen seen ON seen.slug = s.slug AND seen.subscriber_sub = ?`;
+  const params = [sub, sub];
+  if (cursorCreatedAt !== null) {
+    query += ' WHERE (s.created_at < ? OR (s.created_at = ? AND s.slug < ?))';
+    params.push(cursorCreatedAt, cursorCreatedAt, cursorSlug);
+  }
+  query += ' ORDER BY s.created_at DESC, s.slug DESC LIMIT ?';
+  params.push(SUBSCRIPTIONS_FEED_PAGE_SIZE);
+
+  const { results } = await env.ADS_DB.prepare(query).bind(...params).all();
+
+  // One ACCOUNTS lookup per distinct author, not per story — a prolific
+  // subscribed author shouldn't cost a KV read per note. Fine at this
+  // app's scale (same tradeoff handleMyPages already makes doing a KV
+  // get per slug).
+  const authorSubs = [...new Set(results.map(r => r.author_sub))];
+  const nameBySub = {};
+  for (const authorSub of authorSubs) {
+    const user = await getUser(env, authorSub);
+    nameBySub[authorSub] = (user && user.profileName) || null;
+  }
+
+  const origin = new URL(request.url).origin;
+  const last = results[results.length - 1];
+  return json({
+    stories: results.map(r => ({
+      slug: r.slug,
+      title: r.title,
+      authorSub: r.author_sub,
+      authorProfileName: nameBySub[r.author_sub],
+      createdAt: r.created_at,
+      seen: !!r.seen,
+      images: expandStoryImageUrls(origin, r.slug, r.image_urls)
+    })),
+    // A short page means we've hit the end; only hand back a cursor when
+    // there might be more to page to.
+    nextCursor: (last && results.length === SUBSCRIPTIONS_FEED_PAGE_SIZE) ? `${last.created_at}:${last.slug}` : null
+  });
 }
 
 async function handleServe(env, slug) {
@@ -605,6 +1228,14 @@ async function purgeAccountData(env, sub) {
         }
         meta.deletedAt = now;
         await putMeta(env, slug, meta);
+        if (meta.showInStories) {
+          await deleteStoryImage(env, slug);
+          await deleteStoryCardImages(env, slug);
+          await env.ADS_DB.batch([
+            env.ADS_DB.prepare('DELETE FROM stories WHERE slug = ?').bind(slug),
+            env.ADS_DB.prepare('DELETE FROM story_seen WHERE slug = ?').bind(slug)
+          ]);
+        }
       }
       await env.SLUGS.delete(key.name);
     }
@@ -614,6 +1245,13 @@ async function purgeAccountData(env, sub) {
   await env.ACCOUNTS.delete('user:' + sub);
   await env.ACCOUNTS.delete('syncmeta:' + sub);
   await env.NOTES_BUCKET.delete('sync/' + sub + '/notes.json');
+  // Subscriptions run both directions — as a follower and as someone
+  // others followed — and story_seen rows are meaningless without the
+  // account that saw them, so all three go with the account.
+  await env.ADS_DB.batch([
+    env.ADS_DB.prepare('DELETE FROM subscriptions WHERE subscriber_sub = ? OR author_sub = ?').bind(sub, sub),
+    env.ADS_DB.prepare('DELETE FROM story_seen WHERE subscriber_sub = ?').bind(sub)
+  ]);
 }
 
 /* ---------------- Publish as Ad ---------------- */
@@ -1114,6 +1752,34 @@ export default {
       }
       if (method === 'GET' && pathname === '/my/pages') {
         return handleMyPages(env, request);
+      }
+      if (method === 'POST' && pathname === '/account/profile-name') {
+        return handleSetProfileName(env, request);
+      }
+      if (method === 'GET' && pathname === '/account/profile-name') {
+        return handleGetProfileName(env, request);
+      }
+      if (method === 'GET' && pathname === '/stories') {
+        return handleStoriesStrip(env, request);
+      }
+      if (method === 'GET' && pathname.startsWith('/stories/image/')) {
+        return handleServeStoryImage(env, decodeURIComponent(pathname.slice('/stories/image/'.length)));
+      }
+      if (method === 'GET' && pathname.startsWith('/stories/card-image/')) {
+        const rest = pathname.slice('/stories/card-image/'.length).split('/');
+        return handleServeStoryCardImage(env, decodeURIComponent(rest[0] || ''), rest[1] || '');
+      }
+      if (method === 'POST' && pathname.startsWith('/stories/') && pathname.endsWith('/seen')) {
+        return handleMarkStorySeen(env, request, decodeURIComponent(pathname.slice('/stories/'.length, -'/seen'.length)));
+      }
+      if (method === 'GET' && pathname === '/subscriptions/feed') {
+        return handleSubscriptionsFeed(env, request);
+      }
+      if (method === 'POST' && pathname.startsWith('/subscriptions/')) {
+        return handleSubscribe(env, request, decodeURIComponent(pathname.slice('/subscriptions/'.length)));
+      }
+      if (method === 'DELETE' && pathname.startsWith('/subscriptions/')) {
+        return handleUnsubscribe(env, request, decodeURIComponent(pathname.slice('/subscriptions/'.length)));
       }
       if (method === 'POST' && pathname === '/ads/publish') {
         return handleAdPublish(env, request);
