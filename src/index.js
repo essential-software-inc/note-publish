@@ -153,7 +153,7 @@ async function putUser(env, sub, user) {
   await env.ACCOUNTS.put('user:' + sub, JSON.stringify(user));
 }
 
-const PROFILE_NAME_MAX = 15;
+const PROFILE_NAME_MAX = 30;
 
 // Cosmetic-only display name (plan: Stories feature) set from the Log Out
 // confirm dialog. Not unique, not the real identity — email stays that.
