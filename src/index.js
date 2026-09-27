@@ -43,8 +43,9 @@
  * Cloudflare's dashboard Rate Limiting Rules (plan §4) as the primary
  * defense, PLUS an in-code per-IP backstop (checkPublishRateLimit) so the
  * two endpoints that write to R2/D1 are never left unthrottled if the
- * dashboard rule is missing, misconfigured, or reset. GET /@:slug and
- * /check-slug/:slug are intentionally left open (read-only, cheap).
+ * dashboard rule is missing, misconfigured, or reset. GET /@:slug,
+ * /check-slug/:slug, and /meta/:slug are intentionally left open
+ * (read-only, cheap).
  */
 
 const MAX_HTML_BYTES = 2 * 1024 * 1024; // 2MB — plan §6, tune as needed
@@ -65,7 +66,7 @@ const PUBLISH_RATE_LIMIT_MAX = 20;
 const PUBLISH_RATE_LIMIT_WINDOW_S = 60;
 const SLUG_RE = /^[a-z0-9-]{3,48}$/;
 const RESERVED_SLUGS = new Set([
-  'admin', 'api', 'report', 'reports', 'check-slug', 'publish', 'n',
+  'admin', 'api', 'report', 'reports', 'check-slug', 'meta', 'publish', 'n',
   'www', 'assets', 'static', 'favicon.ico', 'robots.txt', 'health',
   'auth', 'sync', 'my'
 ]);
@@ -384,6 +385,29 @@ async function handleCheckSlug(env, slug) {
   // should not let the same slug be reclaimed and republished right away.
   const takenAndLive = meta && (!meta.deletedAt || meta.adminLocked);
   return json({ available: !takenAndLive, reason: (meta && meta.adminLocked) ? 'disabled' : undefined });
+}
+
+// GET /meta/:slug — public, read-only lookup of a published page's title
+// and owner, for the app's "paste a note link" search (as opposed to
+// browsing the Stories strip, where GET /stories already returns
+// author_sub alongside each slug). check-slug deliberately only ever
+// answers "is this taken" and stays that way; this is a separate route
+// rather than a mode flag on it so a slug-availability check (typed on
+// every keystroke while publishing) never accidentally leaks a live
+// page's owner. Same not-found gating as handleServe (missing meta or
+// deletedAt) so an unpublished/never-existed slug reads identically
+// either way; adminLocked pages fall in here too since a takedown page
+// has no legitimate note content or owner to hand back.
+async function handleMeta(env, slug) {
+  if (!SLUG_RE.test(slug)) return json({ found: false }, 404);
+  const meta = await getMeta(env, slug);
+  if (!meta || meta.deletedAt || meta.adminLocked) return json({ found: false }, 404);
+  return json({
+    found: true,
+    slug,
+    title: meta.title || 'Untitled note',
+    authorSub: meta.ownerSub || null
+  });
 }
 
 // Shared backstop limiter for the two storage-writing publish routes (see
@@ -1023,6 +1047,21 @@ async function handleUnsubscribe(env, request, authorSub) {
     'DELETE FROM subscriptions WHERE subscriber_sub = ? AND author_sub = ?'
   ).bind(sub, authorSub).run();
   return json({ ok: true });
+}
+
+// GET /account/subscriber-count — how many accounts subscribe to the
+// signed-in caller, for the account sheet's own stats (not another
+// account's — this is always self-scoped, same as GET /my/pages). A
+// straight COUNT against the same `subscriptions` table handleSubscribe/
+// handleUnsubscribe already write, keyed by author_sub the way every
+// other subscriptions query here is.
+async function handleSubscriberCount(env, request) {
+  const sub = await requireSession(env, request);
+  if (!sub) return textError(401, 'sign-in required');
+  const row = await env.ADS_DB.prepare(
+    'SELECT COUNT(*) AS c FROM subscriptions WHERE author_sub = ?'
+  ).bind(sub).first();
+  return json({ count: (row && row.c) || 0 });
 }
 
 const SUBSCRIPTIONS_FEED_PAGE_SIZE = 20;
@@ -1818,6 +1857,9 @@ export default {
       if (method === 'GET' && pathname.startsWith('/check-slug/')) {
         return handleCheckSlug(env, decodeURIComponent(pathname.slice('/check-slug/'.length)));
       }
+      if (method === 'GET' && pathname.startsWith('/meta/')) {
+        return handleMeta(env, decodeURIComponent(pathname.slice('/meta/'.length)));
+      }
       if (method === 'POST' && pathname === '/publish') {
         return handlePublish(env, request);
       }
@@ -1875,6 +1917,9 @@ export default {
       }
       if (method === 'POST' && pathname.startsWith('/stories/') && pathname.endsWith('/seen')) {
         return handleMarkStorySeen(env, request, decodeURIComponent(pathname.slice('/stories/'.length, -'/seen'.length)));
+      }
+      if (method === 'GET' && pathname === '/account/subscriber-count') {
+        return handleSubscriberCount(env, request);
       }
       if (method === 'GET' && pathname === '/subscriptions/feed') {
         return handleSubscriptionsFeed(env, request);
