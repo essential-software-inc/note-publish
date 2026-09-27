@@ -5,10 +5,12 @@
  *
  * Bindings expected (see wrangler.toml):
  *   NOTES_BUCKET  - R2 bucket, stores "<slug>.html", "sync/<sub>/notes.json",
- *                   and "story-images/<slug>" (ring-avatar blobs for the
+ *                   "story-images/<slug>" (ring-avatar blobs for the
  *                   Stories feature — see storeStoryImage/handleServeStoryImage
  *                   and storeStoryCardImages/handleServeStoryCardImage for
- *                   the ring avatar vs. Subscribed-feed card thumbnails)
+ *                   the ring avatar vs. Subscribed-feed card thumbnails),
+ *                   and "profile-images/<sub>" (account profile pictures —
+ *                   see handleSetProfileImage/handleServeProfileImage)
  *   SLUGS         - KV namespace, stores JSON metadata per slug, plus
  *                   "owner:<sub>:<slug>" index keys for GET /my/pages
  *   REPORTS       - KV namespace, stores report records
@@ -181,6 +183,89 @@ async function handleGetProfileName(env, request) {
   if (!sub) return textError(401, 'sign-in required');
   const user = await getUser(env, sub);
   return json({ ok: true, profileName: (user && user.profileName) || null });
+}
+
+// R2 key for an account's profile picture. One object per sub
+// (overwritten on re-upload), mirroring storyImageKey — see that
+// function's note on why this lives in R2 rather than as a data: URI in
+// KV/D1.
+function profileImageKey(sub) {
+  return `profile-images/${sub}`;
+}
+
+// Same cap as STORY_IMAGE_MAX_BYTES, applied to the decoded bytes of a
+// profile picture upload. Kept as its own constant (rather than reusing
+// STORY_IMAGE_MAX_BYTES directly) since the two caps protect unrelated
+// uploads and aren't meant to move together if one changes later.
+const PROFILE_IMAGE_MAX_BYTES = 300 * 1024;
+
+// POST /account/profile-image — body: { dataUrl } where dataUrl is a
+// data: URI. The client already compresses/downscales the picked image
+// client-side with the same pipeline used for in-note images
+// (downscaleImageForEmbed) before sending it here, so this only needs to
+// decode and cap it, not re-encode. { dataUrl: null } clears the picture.
+// Decoded bytes are stored in R2 under profileImageKey, never in KV —
+// same reasoning as storeStoryImage.
+async function handleSetProfileImage(env, request) {
+  const sub = await requireSession(env, request);
+  if (!sub) return textError(401, 'sign-in required');
+  let body;
+  try { body = await request.json(); } catch (e) { return textError(400, 'invalid JSON body'); }
+  const dataUrl = body && body.dataUrl;
+
+  await env.NOTES_BUCKET.delete(profileImageKey(sub));
+  const user = (await getUser(env, sub)) || {};
+
+  if (dataUrl === null || dataUrl === undefined || dataUrl === '') {
+    user.hasProfileImage = false;
+    await putUser(env, sub, user);
+    return json({ ok: true, hasProfileImage: false });
+  }
+  if (typeof dataUrl !== 'string') return textError(400, 'invalid dataUrl');
+
+  const m = /^data:([^;,]*)(;base64)?,(.*)$/s.exec(dataUrl);
+  if (!m) return textError(400, 'invalid dataUrl');
+  const contentType = m[1] || 'image/jpeg';
+  if (!/^image\//.test(contentType)) return textError(400, 'not an image');
+
+  const isBase64 = !!m[2];
+  let bytes;
+  try {
+    if (isBase64) {
+      const binary = atob(m[3]);
+      bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    } else {
+      bytes = new TextEncoder().encode(decodeURIComponent(m[3]));
+    }
+  } catch (e) {
+    return textError(400, 'malformed dataUrl');
+  }
+  if (bytes.byteLength > PROFILE_IMAGE_MAX_BYTES) return textError(413, 'image too large');
+
+  await env.NOTES_BUCKET.put(profileImageKey(sub), bytes, { httpMetadata: { contentType } });
+  user.hasProfileImage = true;
+  await putUser(env, sub, user);
+  return json({ ok: true, hasProfileImage: true });
+}
+
+// GET /account/profile-image/:sub — serves the R2-stored profile picture
+// for any account. Public, like /stories/image/:slug — the story strip
+// needs to load other people's avatars, not just the signed-in viewer's
+// own. A sub with no picture (never set, or cleared) 404s; the client's
+// onerror avatar fallback chain (profile picture -> story's first image
+// -> initial letter) already handles that.
+async function handleServeProfileImage(env, sub) {
+  if (!sub) return textError(404, 'not found');
+  const obj = await env.NOTES_BUCKET.get(profileImageKey(sub));
+  if (!obj) return textError(404, 'not found');
+  return new Response(obj.body, {
+    headers: {
+      'Content-Type': (obj.httpMetadata && obj.httpMetadata.contentType) || 'application/octet-stream',
+      'Cache-Control': 'public, max-age=300',
+      ...corsHeaders()
+    }
+  });
 }
 
 async function createSession(env, sub) {
@@ -871,13 +956,25 @@ async function handleStoriesStrip(env, request) {
 
   // image_url is either STORY_IMAGE_R2_MARKER (image lives in R2, served
   // via GET /stories/image/:slug — see storeStoryImage/handleServeStoryImage),
-  // a plain remote URL (passed through as-is), or null.
+  // a plain remote URL (passed through as-is), or null. authorProfileName
+  // mirrors handleSubscriptionsFeed's per-distinct-author lookup below —
+  // the client's avatar fallback chain (profile picture -> story's first
+  // image -> initial letter) needs it for the initial when the author has
+  // a display name set.
+  const authorSubs = [...new Set(ranked.map(r => r.author_sub))];
+  const nameBySub = {};
+  for (const authorSub of authorSubs) {
+    const user = await getUser(env, authorSub);
+    nameBySub[authorSub] = (user && user.profileName) || null;
+  }
+
   const origin = new URL(request.url).origin;
   return json({
     stories: ranked.map(r => ({
       slug: r.slug,
       title: r.title,
       authorSub: r.author_sub,
+      authorProfileName: nameBySub[r.author_sub],
       createdAt: r.created_at,
       seen: seenSlugs.has(r.slug),
       imageUrl: r.image_url === STORY_IMAGE_R2_MARKER
@@ -1245,6 +1342,7 @@ async function purgeAccountData(env, sub) {
   await env.ACCOUNTS.delete('user:' + sub);
   await env.ACCOUNTS.delete('syncmeta:' + sub);
   await env.NOTES_BUCKET.delete('sync/' + sub + '/notes.json');
+  await env.NOTES_BUCKET.delete(profileImageKey(sub));
   // Subscriptions run both directions — as a follower and as someone
   // others followed — and story_seen rows are meaningless without the
   // account that saw them, so all three go with the account.
@@ -1758,6 +1856,12 @@ export default {
       }
       if (method === 'GET' && pathname === '/account/profile-name') {
         return handleGetProfileName(env, request);
+      }
+      if (method === 'POST' && pathname === '/account/profile-image') {
+        return handleSetProfileImage(env, request);
+      }
+      if (method === 'GET' && pathname.startsWith('/account/profile-image/')) {
+        return handleServeProfileImage(env, decodeURIComponent(pathname.slice('/account/profile-image/'.length)));
       }
       if (method === 'GET' && pathname === '/stories') {
         return handleStoriesStrip(env, request);
