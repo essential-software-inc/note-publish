@@ -30,7 +30,9 @@
  *                   subscriptions, and story_seen (migrations/0003_stories.sql;
  *                   the story card's description/tags/note-created time are
  *                   migrations/0009_story_card_fields.sql),
- *                   plus likes (migrations/0006_likes.sql),
+ *                   plus likes (migrations/0006_likes.sql), and published_notes, an
+ *                   indexed mirror of the SLUGS "owner:<sub>:<slug>" keys used only for
+ *                   GET /account/published-notes' keyset pagination (migrations/0010_published_notes.sql),
  *                   for the Stories feature — same rationale as the ads
  *                   tables: feed/ring queries need real joins that KV can't
  *                   do. Page HTML/slugs/tokens stay in SLUGS/NOTES_BUCKET as
@@ -798,7 +800,11 @@ async function handlePublish(env, request) {
     tags: cleanStoryTags(tags),
     noteCreatedAt: cleanNoteCreatedAt(createdAt)
   });
-  if (ownerSub) await env.SLUGS.put('owner:' + ownerSub + ':' + slug, '1');
+  if (ownerSub) {
+    await env.SLUGS.put('owner:' + ownerSub + ':' + slug, '1');
+    await env.ADS_DB.prepare('INSERT OR REPLACE INTO published_notes (slug, author_sub, created_at) VALUES (?, ?, ?)')
+      .bind(slug, ownerSub, now).run();
+  }
   if (wantsStory) {
     const imageUrl = await storeStoryImage(env, slug, html);
     const imageUrls = await storeStoryCardImages(env, slug, html);
@@ -929,7 +935,10 @@ async function handleUnpublish(env, request, slug) {
   // Drop this slug out of its owner's GET /my/pages listing either way —
   // an admin takedown shouldn't keep showing up in the owner's own page
   // list any more than a normal unpublish would.
-  if (meta.ownerSub) await env.SLUGS.delete('owner:' + meta.ownerSub + ':' + slug);
+  if (meta.ownerSub) {
+    await env.SLUGS.delete('owner:' + meta.ownerSub + ':' + slug);
+    await env.ADS_DB.prepare('DELETE FROM published_notes WHERE slug = ?').bind(slug).run();
+  }
   // A story stops being a story the moment its page is gone — it doesn't
   // wait for handlePurge's 30-day hard-delete pass, that's KV/R2 cleanup
   // for already-dead entries, not the thing that makes a story live.
@@ -1574,6 +1583,166 @@ async function ensureCardImages(env, slug, meta) {
     return j;
   } catch (e) { console.log('card images failed for ' + slug + ': ' + (e && e.message)); return null; }
 }
+// Likes each note has received, as { slug: count } (slugs with none are simply absent).
+// One grouped query per chunk, so a page of cards costs a query or two, not one per card.
+async function likeCountsFor(env, slugs) {
+  const out = {};
+  const uniq = [...new Set((slugs || []).filter(Boolean))];
+  for (let i = 0; i < uniq.length; i += 80) {
+    const chunk = uniq.slice(i, i + 80);
+    const { results } = await env.ADS_DB.prepare(
+      'SELECT slug, COUNT(*) AS c FROM likes WHERE slug IN (' + chunk.map(() => '?').join(',') + ') GROUP BY slug'
+    ).bind(...chunk).all();
+    results.forEach(r => { out[r.slug] = r.c; });
+  }
+  return out;
+}
+
+// GET /account/published-notes — the "Published" category: every live note this account
+// has published, newest first, shaped like a Subscribed-feed card plus its like total.
+// Ownership lives in the owner:<sub>:<slug> KV index (bounded by MAX_PAGES_PER_ACCOUNT),
+// so the whole set is read, ordered by publish time, and paged with a
+// `${publishedAt}:${slug}` cursor. Card details come from the stories row when the note
+// is a story, otherwise from the note's own metadata + cached thumbnails (same as Liked).
+// GET /account/stories — the "Stories" tab: the signed-in account's own published notes
+// that are toggled to show in stories AND still currently live there — i.e. within the
+// same STORIES_LOOKBACK_MS (24h) window as the public discovery strip (see
+// handleStoriesStrip). A note whose toggle is on but whose 24h has elapsed keeps showing
+// in followers' Subscribed feeds (handleSubscriptionsFeed has no such cutoff) but drops out
+// of this tab, the same as it drops out of the strip, until it's updated/republished.
+async function handleMyStories(env, request) {
+  const sub = await requireSession(env, request);
+  if (!sub) return textError(401, 'sign-in required');
+
+  const url = new URL(request.url);
+  const cursorParam = url.searchParams.get('cursor');
+  let cursorAt = null, cursorSlug = null;
+  if (cursorParam) {
+    const i = cursorParam.lastIndexOf(':');
+    if (i > 0) {
+      const at = Number(cursorParam.slice(0, i));
+      if (Number.isFinite(at)) { cursorAt = at; cursorSlug = cursorParam.slice(i + 1); }
+    }
+  }
+
+  const cutoff = Date.now() - STORIES_LOOKBACK_MS;
+  let query = `SELECT slug, title, created_at, image_urls, description, tags, note_created_at
+     FROM stories WHERE author_sub = ? AND created_at >= ?`;
+  const params = [sub, cutoff];
+  if (cursorAt !== null) {
+    query += ' AND (created_at < ? OR (created_at = ? AND slug < ?))';
+    params.push(cursorAt, cursorAt, cursorSlug);
+  }
+  query += ' ORDER BY created_at DESC, slug DESC LIMIT ?';
+  params.push(SUBSCRIPTIONS_FEED_PAGE_SIZE);
+  const { results } = await env.ADS_DB.prepare(query).bind(...params).all();
+
+  const likeCounts = await likeCountsFor(env, results.map(r => r.slug));
+  const user = await getUser(env, sub);
+  const authorId = (await authorIdsFor(env, [sub]))[sub] || null;
+  const origin = url.origin;
+  const last = results[results.length - 1];
+  return json({
+    stories: results.map(r => {
+      const card = expandStoryImageUrls(origin, r.slug, r.image_urls);
+      return {
+        slug: r.slug,
+        title: r.title,
+        authorSub: authorId,
+        authorProfileName: (user && user.profileName) || null,
+        createdAt: r.created_at,
+        noteCreatedAt: r.note_created_at || null,
+        desc: r.description || '',
+        tags: parseStoryTags(r.tags),
+        seen: false,
+        images: card.images,
+        imageCount: card.count,
+        likes: likeCounts[r.slug] || 0
+      };
+    }),
+    nextCursor: (last && results.length === SUBSCRIPTIONS_FEED_PAGE_SIZE) ? `${last.created_at}:${last.slug}` : null
+  });
+}
+
+async function handlePublishedNotes(env, request) {
+  const sub = await requireSession(env, request);
+  if (!sub) return textError(401, 'sign-in required');
+
+  const url = new URL(request.url);
+  const cursorParam = url.searchParams.get('cursor');
+  let cursorAt = null, cursorSlug = null;
+  if (cursorParam) {
+    const i = cursorParam.lastIndexOf(':');
+    if (i > 0) {
+      const at = Number(cursorParam.slice(0, i));
+      if (Number.isFinite(at)) { cursorAt = at; cursorSlug = cursorParam.slice(i + 1); }
+    }
+  }
+
+  // Indexed keyset pagination against published_notes (migrations/0010_published_notes.sql),
+  // kept in sync with the SLUGS "owner:<sub>:<slug>" keys at publish/unpublish/purge time —
+  // same shape as handleLikedNotes/handleSubscriptionsFeed, rather than listing every owned
+  // KV key and calling getMeta on each one per request.
+  let query = `SELECT slug, created_at FROM published_notes WHERE author_sub = ?`;
+  const params = [sub];
+  if (cursorAt !== null) {
+    query += ' AND (created_at < ? OR (created_at = ? AND slug < ?))';
+    params.push(cursorAt, cursorAt, cursorSlug);
+  }
+  query += ' ORDER BY created_at DESC, slug DESC LIMIT ?';
+  params.push(SUBSCRIPTIONS_FEED_PAGE_SIZE);
+  const { results } = await env.ADS_DB.prepare(query).bind(...params).all();
+
+  // Live notes only, same guard handleLikedNotes uses — a note taken down since it was
+  // indexed here (unpublish already deletes its row, so this only catches an admin
+  // takedown or a race) is skipped rather than shown; as there, a page shortened this
+  // way can under-report whether more remain, exactly like handleLikedNotes already does.
+  const rows = [];
+  for (const r of results) {
+    const meta = await getMeta(env, r.slug);
+    if (!meta || meta.deletedAt || meta.adminLocked) continue;
+    rows.push({ slug: r.slug, at: r.created_at, meta });
+  }
+
+  const storyBySlug = {};
+  if (rows.length) {
+    const slugs = rows.map(x => x.slug);
+    const { results: storyRows } = await env.ADS_DB.prepare(
+      'SELECT slug, title, image_urls, description, tags, note_created_at FROM stories WHERE slug IN (' + slugs.map(() => '?').join(',') + ')'
+    ).bind(...slugs).all();
+    storyRows.forEach(r => { storyBySlug[r.slug] = r; });
+  }
+  const likeCounts = await likeCountsFor(env, rows.map(x => x.slug));
+  const user = await getUser(env, sub);
+  const authorId = (await authorIdsFor(env, [sub]))[sub] || null;
+  const origin = url.origin;
+  const out = [];
+  for (const { slug, at, meta } of rows) {
+    const st = storyBySlug[slug];
+    const imgJson = st ? st.image_urls : await ensureCardImages(env, slug, meta);
+    const card = imgJson ? expandStoryImageUrls(origin, slug, imgJson) : { images: [], count: 0 };
+    out.push({
+      slug,
+      title: st ? st.title : (meta.title || 'Untitled note'),
+      authorSub: authorId,
+      authorProfileName: (user && user.profileName) || null,
+      publishedAt: at,
+      noteCreatedAt: (st ? st.note_created_at : meta.noteCreatedAt) || null,
+      desc: (st ? st.description : meta.desc) || '',
+      tags: st ? parseStoryTags(st.tags) : (Array.isArray(meta.tags) ? meta.tags.filter(x => typeof x === 'string') : []),
+      seen: false,
+      images: card.images,
+      imageCount: card.count,
+      likes: likeCounts[slug] || 0
+    });
+  }
+  const last = results[results.length - 1];
+  return json({
+    stories: out,
+    nextCursor: (last && results.length === SUBSCRIPTIONS_FEED_PAGE_SIZE) ? `${last.created_at}:${last.slug}` : null
+  });
+}
+
 async function handleLikedNotes(env, request) {
   const sub = await requireSession(env, request);
   if (!sub) return textError(401, 'sign-in required');
@@ -1619,6 +1788,7 @@ async function handleLikedNotes(env, request) {
     nameBySub[a] = (user && user.profileName) || null;
   }
   const idBySub = authorSubs.length ? await authorIdsFor(env, authorSubs) : {};
+  const likeCounts = await likeCountsFor(env, rows.map(x => x.r.slug));
 
   const origin = url.origin;
   const last = results[results.length - 1];
@@ -1636,7 +1806,8 @@ async function handleLikedNotes(env, request) {
         tags: parseStoryTags(isStory ? r.tags : meta.tags),
         seen: false,
         images: card.images,
-        imageCount: card.count
+        imageCount: card.count,
+        likes: likeCounts[r.slug] || 0
       };
     }),
     nextCursor: (last && results.length === SUBSCRIPTIONS_FEED_PAGE_SIZE) ? `${last.liked_at}:${last.slug}` : null
@@ -1702,6 +1873,7 @@ async function handleSubscriptionsFeed(env, request) {
     nameBySub[authorSub] = (user && user.profileName) || null;
   }
   const idBySub = await authorIdsFor(env, authorSubs);
+  const likeCounts = await likeCountsFor(env, results.map(r => r.slug));
 
   const origin = new URL(request.url).origin;
   const last = results[results.length - 1];
@@ -1719,7 +1891,8 @@ async function handleSubscriptionsFeed(env, request) {
         tags: parseStoryTags(r.tags),
         seen: !!r.seen,
         images: card.images,
-        imageCount: card.count // total images in the note, for the "+N" badge
+        imageCount: card.count, // total images in the note, for the "+N" badge
+        likes: likeCounts[r.slug] || 0 // likes the note has received, shown beside the time-ago
       };
     }),
     // A short page means we've hit the end; only hand back a cursor when
@@ -1858,7 +2031,10 @@ async function handlePurge(env) {
       }
       await env.NOTES_BUCKET.delete(slug + '.html');
       await env.SLUGS.delete(key.name);
-      if (meta.ownerSub) await env.SLUGS.delete('owner:' + meta.ownerSub + ':' + slug);
+      if (meta.ownerSub) {
+        await env.SLUGS.delete('owner:' + meta.ownerSub + ':' + slug);
+        await env.ADS_DB.prepare('DELETE FROM published_notes WHERE slug = ?').bind(slug).run();
+      }
       purged++;
     }
     cursor = page.list_complete ? undefined : page.cursor;
@@ -1999,6 +2175,7 @@ async function purgeAccountData(env, sub) {
         }
       }
       await env.SLUGS.delete(key.name);
+      await env.ADS_DB.prepare('DELETE FROM published_notes WHERE slug = ?').bind(slug).run();
     }
     cursor = page.list_complete ? undefined : page.cursor;
   } while (cursor);
@@ -2587,6 +2764,12 @@ export default {
       }
       if (method === 'GET' && pathname === '/subscriptions/feed') {
         return handleSubscriptionsFeed(env, request);
+      }
+      if (method === 'GET' && pathname === '/account/stories') {
+        return handleMyStories(env, request);
+      }
+      if (method === 'GET' && pathname === '/account/published-notes') {
+        return handlePublishedNotes(env, request);
       }
       if (method === 'GET' && pathname === '/account/liked-notes') {
         return handleLikedNotes(env, request);
