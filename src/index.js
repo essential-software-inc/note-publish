@@ -27,7 +27,8 @@
  *                   see migrations/0002_ad_viewers.sql — it never gates
  *                   spend or the views_used/views_total counters, which are
  *                   unrelated and unchanged by it). Also holds stories,
- *                   subscriptions, and story_seen (migrations/0003_stories.sql)
+ *                   subscriptions, and story_seen (migrations/0003_stories.sql),
+ *                   plus likes (migrations/0006_likes.sql),
  *                   for the Stories feature — same rationale as the ads
  *                   tables: feed/ring queries need real joins that KV can't
  *                   do. Page HTML/slugs/tokens stay in SLUGS/NOTES_BUCKET as
@@ -49,6 +50,15 @@
  */
 
 const MAX_HTML_BYTES = 2 * 1024 * 1024; // 2MB — plan §6, tune as needed
+// Backup images are stored one object each under sync/<sub>/img/<id> rather
+// than embedded in the single notes.json, so the backup file itself stays
+// small (text only) and a sync only ever uploads images it hasn't sent before.
+// The app already downsizes every image to ~1600px JPEG, so a single image is
+// normally a few hundred KB; this is a generous ceiling, not a target.
+const MAX_SYNC_IMAGE_BYTES = 6 * 1024 * 1024;
+const MAX_SYNC_IMAGES_PER_ACCOUNT = 2000;
+const SYNC_IMAGE_ID_RE = /^[A-Za-z0-9_-]{1,80}$/;
+const SYNC_IMAGE_GC_MIN_AGE_MS = 14 * 24 * 60 * 60 * 1000; // never delete a still-fresh upload — see gcSyncImages
 const MAX_SYNC_BYTES = 8 * 1024 * 1024; // notes backups carry embedded images, so a higher cap than a single published page
 // Per-account cap on simultaneously-live published pages. At MAX_HTML_BYTES
 // each this bounds one account's worst-case R2 footprint to ~1GB; well
@@ -78,7 +88,10 @@ function corsHeaders() {
   return {
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization'
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization, If-Match, If-None-Match, X-Action-Time',
+    // Without this a browser/WebView hides the ETag response header from
+    // fetch(), so the app's backup If-Match check could never engage.
+    'Access-Control-Expose-Headers': 'ETag, Retry-After'
   };
 }
 function json(data, status = 200, extraHeaders = {}) {
@@ -121,6 +134,55 @@ async function getMeta(env, slug) {
 }
 async function putMeta(env, slug, meta) {
   await env.SLUGS.put('slug:' + slug, JSON.stringify(meta));
+}
+
+/* ---------------- Opaque author IDs ---------------- */
+
+// What viewers' devices see instead of an account's Google `sub`. See
+// migrations/0008_authors.sql. The JSON field keeps its old name (`authorSub`,
+// `subs`) so app builds already in the wild keep working; the value is just
+// opaque now.
+const AUTHOR_ID_RE = /^a_[a-f0-9]{32}$/;
+// Older app builds still send a raw sub back (subscribe, profile picture URL
+// for their own account, follows queued offline). Accept it on INPUT only, so
+// nothing breaks during rollout. Set false once old builds have aged out.
+const ACCEPT_LEGACY_SUB_INPUT = true;
+function newAuthorId() {
+  const b = new Uint8Array(16);
+  crypto.getRandomValues(b);
+  return 'a_' + [...b].map(x => x.toString(16).padStart(2, '0')).join('');
+}
+async function authorIdFor(env, sub) {
+  if (!sub) return null;
+  const row = await env.ADS_DB.prepare('SELECT author_id FROM authors WHERE sub = ?').bind(sub).first();
+  if (row) return row.author_id;
+  await env.ADS_DB.prepare('INSERT OR IGNORE INTO authors (sub, author_id, created_at) VALUES (?, ?, ?)')
+    .bind(sub, newAuthorId(), Date.now()).run();
+  const made = await env.ADS_DB.prepare('SELECT author_id FROM authors WHERE sub = ?').bind(sub).first();
+  return made ? made.author_id : null;
+}
+// subs[] -> { sub: authorId }, creating any that are missing.
+async function authorIdsFor(env, subs) {
+  const out = {};
+  const uniq = [...new Set(subs.filter(Boolean))];
+  for (let i = 0; i < uniq.length; i += 80) {
+    const chunk = uniq.slice(i, i + 80);
+    const { results } = await env.ADS_DB.prepare(
+      'SELECT sub, author_id FROM authors WHERE sub IN (' + chunk.map(() => '?').join(',') + ')'
+    ).bind(...chunk).all();
+    results.forEach(r => { out[r.sub] = r.author_id; });
+  }
+  for (const sub of uniq) if (!out[sub]) out[sub] = await authorIdFor(env, sub);
+  return out;
+}
+// A path/param from a client -> the real sub, or null if it names nobody.
+async function resolveAuthorParam(env, param) {
+  if (typeof param !== 'string' || !param) return null;
+  if (AUTHOR_ID_RE.test(param)) {
+    const row = await env.ADS_DB.prepare('SELECT sub FROM authors WHERE author_id = ?').bind(param).first();
+    return row ? row.sub : null;
+  }
+  return ACCEPT_LEGACY_SUB_INPUT ? param : null;
 }
 
 /* ---------------- Google auth + sessions ---------------- */
@@ -183,7 +245,7 @@ async function handleGetProfileName(env, request) {
   const sub = await requireSession(env, request);
   if (!sub) return textError(401, 'sign-in required');
   const user = await getUser(env, sub);
-  return json({ ok: true, profileName: (user && user.profileName) || null });
+  return json({ ok: true, profileName: (user && user.profileName) || null, authorId: await authorIdFor(env, sub) });
 }
 
 // R2 key for an account's profile picture. One object per sub
@@ -250,20 +312,34 @@ async function handleSetProfileImage(env, request) {
   return json({ ok: true, hasProfileImage: true });
 }
 
-// GET /account/profile-image/:sub — serves the R2-stored profile picture
+// GET /account/profile-image/:authorId — serves the R2-stored profile picture
 // for any account. Public, like /stories/image/:slug — the story strip
 // needs to load other people's avatars, not just the signed-in viewer's
 // own. A sub with no picture (never set, or cleared) 404s; the client's
 // onerror avatar fallback chain (profile picture -> story's first image
 // -> initial letter) already handles that.
-async function handleServeProfileImage(env, sub) {
+async function handleServeProfileImage(env, param, request) {
+  // The URL carries the opaque author ID (older builds may still send the sub
+  // for their own picture — see ACCEPT_LEGACY_SUB_INPUT).
+  const sub = await resolveAuthorParam(env, param);
   if (!sub) return textError(404, 'not found');
+  // A picture exists to sit on a story, so it's only served while its owner has
+  // at least one live story — or to the owner themself (they send their session
+  // token). Anyone else, including someone holding the author ID, gets the same
+  // 404 as for a missing picture, so nothing reveals whether one exists.
+  const viewer = await requireSession(env, request);
+  const isOwner = !!viewer && viewer === sub;
+  if (!isOwner) {
+    const live = await env.ADS_DB.prepare('SELECT 1 AS x FROM stories WHERE author_sub = ? LIMIT 1').bind(sub).first();
+    if (!live) return textError(404, 'not found');
+  }
   const obj = await env.NOTES_BUCKET.get(profileImageKey(sub));
   if (!obj) return textError(404, 'not found');
   return new Response(obj.body, {
     headers: {
       'Content-Type': (obj.httpMetadata && obj.httpMetadata.contentType) || 'application/octet-stream',
-      'Cache-Control': 'public, max-age=300',
+      // Owner-only responses must not sit in shared caches after stories go away.
+      'Cache-Control': isOwner ? 'private, max-age=300' : 'public, max-age=300',
       ...corsHeaders()
     }
   });
@@ -272,9 +348,13 @@ async function handleServeProfileImage(env, sub) {
 async function createSession(env, sub) {
   const token = newToken();
   const tokenHash = await sha256Hex(token);
-  await env.ACCOUNTS.put('session:' + tokenHash, JSON.stringify({ sub, expiresAt: Date.now() + SESSION_TTL_MS }), {
-    expirationTtl: Math.ceil(SESSION_TTL_MS / 1000)
-  });
+  const ttl = { expirationTtl: Math.ceil(SESSION_TTL_MS / 1000) };
+  // `idx: true` = this session has an entry in the per-account index below, so
+  // handleDeleteAccount can revoke it. Sessions from before the index existed
+  // lack the flag and are checked against the account's deletion state instead
+  // (see requireSessionInfo) until they expire.
+  await env.ACCOUNTS.put('session:' + tokenHash, JSON.stringify({ sub, expiresAt: Date.now() + SESSION_TTL_MS, idx: true }), ttl);
+  await env.ACCOUNTS.put('usess:' + sub + ':' + tokenHash, '1', ttl);
   return token;
 }
 // Reads the session token from `Authorization: Bearer <token>` and
@@ -293,6 +373,14 @@ async function requireSessionInfo(env, request) {
   let session;
   try { session = JSON.parse(raw); } catch (e) { return null; }
   if (!session || !session.sub || session.expiresAt < Date.now()) return null;
+  if (!session.idx) {
+    // Pre-index session: can't be found by account, so ask the account instead.
+    const user = await getUser(env, session.sub);
+    if (user && user.pendingDeletionAt) {
+      await env.ACCOUNTS.delete('session:' + tokenHash);
+      return null;
+    }
+  }
   return { sub: session.sub, tokenHash };
 }
 async function requireSession(env, request) {
@@ -324,7 +412,7 @@ async function handleGoogleAuth(env, request) {
   user.lastSignInAt = now;
   await putUser(env, identity.sub, user);
   const sessionToken = await createSession(env, identity.sub);
-  return json({ sessionToken, sub: identity.sub, email: identity.email, deletionCancelled });
+  return json({ sessionToken, sub: identity.sub, email: identity.email, authorId: await authorIdFor(env, identity.sub), deletionCancelled });
 }
 
 // Sign-out is mostly a client-side concern (drop the stored token), but
@@ -337,6 +425,11 @@ async function handleSignOut(env, request) {
   const token = body && body.sessionToken;
   if (typeof token === 'string' && token) {
     const tokenHash = await sha256Hex(token);
+    try {
+      const raw = await env.ACCOUNTS.get('session:' + tokenHash);
+      const sess = raw ? JSON.parse(raw) : null;
+      if (sess && sess.sub) await env.ACCOUNTS.delete('usess:' + sess.sub + ':' + tokenHash);
+    } catch (e) { /* index entry just expires on its own */ }
     await env.ACCOUNTS.delete('session:' + tokenHash);
   }
   return json({ ok: true });
@@ -345,33 +438,177 @@ async function handleSignOut(env, request) {
 /* ---------------- Account sync (notes backup) ---------------- */
 
 // The uploaded blob is opaque to the worker — same {app, version, notes,
-// images} shape Note Builder's own file-based backup already writes, just
-// stored server-side under the account instead of downloaded. Kept as a
-// single R2 object per account (last-write-wins) rather than per-note
-// records: the client already does its own additive-by-id merge on pull
-// (see nbSyncPull), so there's no server-side merge to get right here.
+// images} shape Note Builder's own file-based backup already writes, plus
+// the app's favorites/settings fields, stored server-side under the account
+// instead of downloaded. Kept as a single R2 object per account rather than
+// per-note records: the client already does its own additive-by-id merge on
+// pull (see nbSyncPull), so there's no server-side merge to get right here.
+//
+// Concurrency: the object is one file, so a plain overwrite means whichever
+// device uploads last silently erases the other's change. To close that,
+// pulls return the object's ETag and a push may send it back as If-Match.
+// The check is R2's own conditional put (onlyIf.etagMatches), which is atomic
+// on R2's side — two devices pushing at the same instant can't both pass it,
+// unlike a read-then-write done here in the Worker. A mismatch answers 409
+// and the client pulls, merges and retries. A push with no If-Match (first
+// ever backup, or an older app build) stays an unconditional overwrite unless
+// REQUIRE_IF_MATCH is set (then 428); a first backup sends If-None-Match: *.
+function normalizeEtag(v) {
+  return String(v || '').trim().replace(/^W\//, '').replace(/^"(.*)"$/, '$1');
+}
 async function handleSyncPush(env, request) {
   const sub = await requireSession(env, request);
   if (!sub) return textError(401, 'sign-in required');
+  const limited = await accountRateLimitResponse(env, sub, 'syncPush');
+  if (limited) return limited;
   const bodyText = await request.text();
   if (new TextEncoder().encode(bodyText).length > MAX_SYNC_BYTES) return textError(413, 'backup too large');
   let parsed;
   try { parsed = JSON.parse(bodyText); } catch (e) { return textError(400, 'invalid JSON body'); }
   if (!parsed || !Array.isArray(parsed.notes)) return textError(400, 'missing notes array');
-  await env.NOTES_BUCKET.put('sync/' + sub + '/notes.json', bodyText, {
-    httpMetadata: { contentType: 'application/json; charset=utf-8' }
-  });
+  const putOpts = { httpMetadata: { contentType: 'application/json; charset=utf-8' } };
+  const ifMatch = request.headers.get('If-Match');
+  // If-None-Match: * = "create only" — the client's first ever backup, sent
+  // after a pull that definitively found none. Without it a first push that
+  // races another device's first push would overwrite it.
+  const createOnly = (request.headers.get('If-None-Match') || '').trim() === '*';
+  if (ifMatch) putOpts.onlyIf = { etagMatches: normalizeEtag(ifMatch) };
+  else if (createOnly) putOpts.onlyIf = { etagDoesNotMatch: '*' };
+  else if (env.REQUIRE_IF_MATCH === 'true' || env.REQUIRE_IF_MATCH === '1') {
+    // Older app builds send neither header and would overwrite blindly. Set
+    // REQUIRE_IF_MATCH once enough people have updated; until then they still work.
+    return json({ error: 'update the app to keep syncing' }, 428);
+  }
+  const stored = await env.NOTES_BUCKET.put('sync/' + sub + '/notes.json', bodyText, putOpts);
+  // R2 returns null (rather than throwing) when the precondition fails —
+  // including "there is no object at all" — so this is the conflict case.
+  if (!stored) return json({ error: 'backup changed on another device — pull and retry' }, 409);
   const now = Date.now();
   await env.ACCOUNTS.put('syncmeta:' + sub, JSON.stringify({ updatedAt: now, sizeBytes: bodyText.length }));
-  return json({ ok: true, updatedAt: now });
+  return json({ ok: true, updatedAt: now, etag: stored.httpEtag }, 200, { 'ETag': stored.httpEtag });
 }
 
 async function handleSyncPull(env, request) {
   const sub = await requireSession(env, request);
   if (!sub) return textError(401, 'sign-in required');
+  // Conditional pull: the app polls every ~20s and sends the ETag it already
+  // holds. A cheap metadata read answers 304 when nothing changed, without
+  // reading (or sending) the whole backup.
+  const inm = normalizeEtag(request.headers.get('If-None-Match'));
+  if (inm) {
+    const head = await env.NOTES_BUCKET.head('sync/' + sub + '/notes.json');
+    if (head && normalizeEtag(head.httpEtag) === inm) {
+      return new Response(null, { status: 304, headers: { 'ETag': head.httpEtag, ...corsHeaders() } });
+    }
+  }
   const obj = await env.NOTES_BUCKET.get('sync/' + sub + '/notes.json');
   if (!obj) return textError(404, 'no backup yet');
-  return new Response(obj.body, { headers: { 'Content-Type': 'application/json; charset=utf-8', ...corsHeaders() } });
+  return new Response(obj.body, {
+    headers: { 'Content-Type': 'application/json; charset=utf-8', 'ETag': obj.httpEtag, ...corsHeaders() }
+  });
+}
+
+/* ---------------- Account sync (backup images) ---------------- */
+
+function syncImageKey(sub, id) { return 'sync/' + sub + '/img/' + id; }
+
+// POST /sync/images/missing {ids:[...]} -> {missing:[...]}: which of these
+// image ids the server doesn't have yet. Lets a freshly signed-in or
+// reinstalled device find out what to upload in one call instead of
+// re-sending everything.
+const MAX_MISSING_IDS_PER_CALL = 500;
+async function handleSyncImagesMissing(env, request) {
+  const sub = await requireSession(env, request);
+  if (!sub) return textError(401, 'sign-in required');
+  const limited = await accountRateLimitResponse(env, sub, 'syncImage');
+  if (limited) return limited;
+  let body;
+  try { body = await request.json(); } catch (e) { return textError(400, 'invalid JSON body'); }
+  const ids = body && body.ids;
+  if (!Array.isArray(ids) || ids.length > MAX_MISSING_IDS_PER_CALL) return textError(400, 'ids must be an array of at most ' + MAX_MISSING_IDS_PER_CALL);
+  const missing = [];
+  for (const id of ids) {
+    if (typeof id !== 'string' || !SYNC_IMAGE_ID_RE.test(id)) return textError(400, 'invalid image id');
+    if (!(await env.NOTES_BUCKET.head(syncImageKey(sub, id)))) missing.push(id);
+  }
+  return json({ missing });
+}
+
+// PUT /sync/images/:id — body is the image's data: URL, exactly as the app
+// stores it. Ids are content hashes made by the app, so an id that already
+// exists is the same image: it's left alone (first write wins) and reported ok.
+async function handleSyncImagePut(env, request, id) {
+  const sub = await requireSession(env, request);
+  if (!sub) return textError(401, 'sign-in required');
+  if (!SYNC_IMAGE_ID_RE.test(id)) return textError(400, 'invalid image id');
+  const limited = await accountRateLimitResponse(env, sub, 'syncImage');
+  if (limited) return limited;
+  const text = await request.text();
+  if (new TextEncoder().encode(text).length > MAX_SYNC_IMAGE_BYTES) return textError(413, 'image too large');
+  if (!/^data:image\/[a-z0-9.+-]+[;,]/i.test(text)) return textError(400, 'expected an image data URL');
+  const key = syncImageKey(sub, id);
+  if (await env.NOTES_BUCKET.head(key)) return json({ ok: true, existed: true });
+  const listing = await env.NOTES_BUCKET.list({ prefix: 'sync/' + sub + '/img/', limit: MAX_SYNC_IMAGES_PER_ACCOUNT + 1 });
+  if (listing.objects.length >= MAX_SYNC_IMAGES_PER_ACCOUNT) return textError(413, 'too many backed-up images');
+  await env.NOTES_BUCKET.put(key, text, { httpMetadata: { contentType: 'text/plain; charset=utf-8' } });
+  return json({ ok: true, existed: false });
+}
+
+async function handleSyncImageGet(env, request, id) {
+  const sub = await requireSession(env, request);
+  if (!sub) return textError(401, 'sign-in required');
+  if (!SYNC_IMAGE_ID_RE.test(id)) return textError(400, 'invalid image id');
+  const obj = await env.NOTES_BUCKET.get(syncImageKey(sub, id));
+  if (!obj) return textError(404, 'no such image');
+  return new Response(obj.body, { headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'private, max-age=31536000, immutable', ...corsHeaders() } });
+}
+
+// Nightly cleanup of backup images no note references any more (deleted
+// notes, replaced images). Deliberately cautious, because a wrong delete here
+// is unrecoverable data loss for someone's photos:
+//  - only images older than SYNC_IMAGE_GC_MIN_AGE_MS are candidates (a device
+//    uploads images just before pushing the notes that use them, so a
+//    fresh upload can legitimately be unreferenced for a moment);
+//  - an account whose notes.json is missing or unparsable is skipped entirely;
+//  - "referenced" means any image ref found in any note's content.
+async function gcSyncImages(env) {
+  const bySub = new Map();
+  let cursor;
+  do {
+    const page = await env.NOTES_BUCKET.list({ prefix: 'sync/', cursor });
+    for (const obj of page.objects) {
+      const parts = obj.key.split('/');
+      if (parts.length === 4 && parts[2] === 'img') {
+        if (!bySub.has(parts[1])) bySub.set(parts[1], []);
+        bySub.get(parts[1]).push({ key: obj.key, id: parts[3], uploaded: obj.uploaded ? new Date(obj.uploaded).getTime() : Date.now() });
+      }
+    }
+    cursor = page.truncated ? page.cursor : undefined;
+  } while (cursor);
+  const cutoff = Date.now() - SYNC_IMAGE_GC_MIN_AGE_MS;
+  let deleted = 0;
+  for (const [sub, imgs] of bySub) {
+    const old = imgs.filter(i => i.uploaded < cutoff);
+    if (!old.length) continue;
+    const obj = await env.NOTES_BUCKET.get('sync/' + sub + '/notes.json');
+    if (!obj) continue;
+    let parsed;
+    try { parsed = JSON.parse(await new Response(obj.body).text()); } catch (e) { continue; }
+    if (!parsed || !Array.isArray(parsed.notes)) continue;
+    const referenced = new Set();
+    for (const n of parsed.notes) {
+      const content = (n && typeof n.content === 'string') ? n.content : '';
+      const re = /data-note-img-ref="([^"]+)"/g;
+      let m;
+      while ((m = re.exec(content))) referenced.add(m[1]);
+    }
+    for (const i of old) {
+      if (referenced.has(i.id)) continue;
+      await env.NOTES_BUCKET.delete(i.key);
+      deleted++;
+    }
+  }
+  return deleted;
 }
 
 /* ---------------- Route handlers ---------------- */
@@ -406,7 +643,7 @@ async function handleMeta(env, slug) {
     found: true,
     slug,
     title: meta.title || 'Untitled note',
-    authorSub: meta.ownerSub || null
+    authorSub: meta.ownerSub ? await authorIdFor(env, meta.ownerSub) : null // opaque ID, never the Google sub
   });
 }
 
@@ -422,6 +659,45 @@ async function checkPublishRateLimit(env, request) {
   if (count >= PUBLISH_RATE_LIMIT_MAX) return false;
   await env.REPORTS.put(key, String(count + 1), { expirationTtl: PUBLISH_RATE_LIMIT_WINDOW_S });
   return true;
+}
+
+// Per-account backstop for the signed-in write routes (likes, subscribing,
+// marking stories seen, backup uploads). Same best-effort KV fixed-window
+// approach as the limiters above, but keyed by account and split into
+// per-window buckets so each request only ever touches the current window's
+// key. Two things it deliberately does NOT try to be: exact (KV is
+// eventually consistent, so a burst spread across locations can slip a few
+// over) or a hard failure point (if KV itself errors, the request is allowed
+// rather than locking a signed-in person out of likes/sync).
+// Like/unlike share one bucket and subscribe/unsubscribe share another, so
+// toggling can't be used to double the allowance.
+const ACCOUNT_RATE_LIMITS = {
+  like:      { max: 60,  windowS: 60 },
+  subscribe: { max: 30,  windowS: 60 },
+  seen:      { max: 120, windowS: 60 },
+  syncPush:  { max: 30,  windowS: 60 },
+  syncImage: { max: 300, windowS: 60 }
+};
+async function checkAccountRateLimit(env, sub, action) {
+  const cfg = ACCOUNT_RATE_LIMITS[action];
+  if (!cfg) return { ok: true };
+  const nowS = Math.floor(Date.now() / 1000);
+  const bucket = Math.floor(nowS / cfg.windowS);
+  const key = 'ratelimit:acct:' + action + ':' + sub + ':' + bucket;
+  try {
+    const raw = await env.REPORTS.get(key);
+    const count = raw ? parseInt(raw, 10) || 0 : 0;
+    if (count >= cfg.max) return { ok: false, retryAfter: Math.max(1, (bucket + 1) * cfg.windowS - nowS) };
+    // KV's minimum expirationTtl is 60s; the bucket is dead after its window anyway.
+    await env.REPORTS.put(key, String(count + 1), { expirationTtl: Math.max(60, cfg.windowS * 2) });
+  } catch (e) { /* fail open — see above */ }
+  return { ok: true };
+}
+// Returns a ready 429 Response when `sub` is over its `action` limit, else null.
+async function accountRateLimitResponse(env, sub, action) {
+  const r = await checkAccountRateLimit(env, sub, action);
+  if (r.ok) return null;
+  return json({ error: 'too many requests, slow down' }, 429, { 'Retry-After': String(r.retryAfter) });
 }
 
 // Counts (a cap-bounded number of) an owner's currently-live pages via the
@@ -619,6 +895,15 @@ async function handleUnpublish(env, request, slug) {
       env.ADS_DB.prepare('DELETE FROM story_seen WHERE slug = ?').bind(slug)
     ]);
   }
+  // Likes belong to the note, not to whoever holds the slug next: an unpublished
+  // slug is reclaimable immediately, so its likes go now or a new note at the
+  // same slug would start life with someone else's likes (and the old author's
+  // total would keep counting them).
+  await env.ADS_DB.prepare('DELETE FROM likes WHERE slug = ?').bind(slug).run();
+  // An ad IS this page: unpublishing the page must take the ad down too, or
+  // /ads/next would keep handing out its HTML until the 30-day purge.
+  await env.ADS_DB.prepare("UPDATE ads SET status = 'unpublished', updated_at = ? WHERE slug = ? AND status != 'unpublished'")
+    .bind(now, slug).run();
   return json({ ok: true });
 }
 
@@ -991,13 +1276,14 @@ async function handleStoriesStrip(env, request) {
     const user = await getUser(env, authorSub);
     nameBySub[authorSub] = (user && user.profileName) || null;
   }
+  const idBySub = await authorIdsFor(env, authorSubs);
 
   const origin = new URL(request.url).origin;
   return json({
     stories: ranked.map(r => ({
       slug: r.slug,
       title: r.title,
-      authorSub: r.author_sub,
+      authorSub: idBySub[r.author_sub], // opaque author ID (field name kept for older app builds)
       authorProfileName: nameBySub[r.author_sub],
       createdAt: r.created_at,
       seen: seenSlugs.has(r.slug),
@@ -1019,6 +1305,7 @@ async function handleStoriesStrip(env, request) {
 async function handleMarkStorySeen(env, request, slug) {
   const sub = await requireSession(env, request);
   if (!sub) return textError(401, 'sign-in required');
+  { const limited = await accountRateLimitResponse(env, sub, 'seen'); if (limited) return limited; }
   if (!validSlug(slug)) return textError(400, 'invalid slug');
   await env.ADS_DB.prepare(
     'INSERT OR REPLACE INTO story_seen (subscriber_sub, slug, seen_at) VALUES (?, ?, ?)'
@@ -1026,27 +1313,62 @@ async function handleMarkStorySeen(env, request, slug) {
   return json({ ok: true });
 }
 
+// Latest-tap-wins. The app sends X-Action-Time (when the person actually
+// tapped, which for a queued offline tap is well before it arrives). An action
+// only applies if it is newer than the newest one already applied for this
+// (account, kind, item); an older replay is a no-op and the reply carries the
+// current state so the app can correct itself. The clock upsert and the change
+// run in one D1 batch (a transaction), and the change is conditional on the
+// clock still being this action's, so two devices racing can't interleave.
+// No header (older builds) = server time. Clamped to server time so a phone
+// with a fast clock can't lock an item against later taps.
+function actionTime(request) {
+  const now = Date.now();
+  const t = Number(request.headers.get('X-Action-Time'));
+  return Number.isFinite(t) && t > 0 ? Math.min(Math.floor(t), now) : now;
+}
+function clockUpsert(env, sub, kind, item, t) {
+  return env.ADS_DB.prepare(
+    'INSERT INTO action_clocks (sub, kind, item, t) VALUES (?, ?, ?, ?) ' +
+    'ON CONFLICT(sub, kind, item) DO UPDATE SET t = excluded.t WHERE excluded.t >= action_clocks.t'
+  ).bind(sub, kind, item, t);
+}
+const CLOCK_IS = 'EXISTS (SELECT 1 FROM action_clocks WHERE sub = ? AND kind = ? AND item = ? AND t = ?)';
+
 // POST /subscriptions/:authorSub — follow an author. authorSub is that
 // account's Google `sub`, taken from a story's authorSub field (the
 // client never has to know or expose email/identity beyond that).
-async function handleSubscribe(env, request, authorSub) {
+async function handleSubscribe(env, request, authorParam) {
   const sub = await requireSession(env, request);
   if (!sub) return textError(401, 'sign-in required');
-  if (!authorSub) return textError(400, 'missing author');
+  { const limited = await accountRateLimitResponse(env, sub, 'subscribe'); if (limited) return limited; }
+  if (!authorParam) return textError(400, 'missing author');
+  const authorSub = await resolveAuthorParam(env, authorParam);
+  if (!authorSub) return textError(404, 'author not found');
   if (authorSub === sub) return textError(400, "can't subscribe to yourself");
-  await env.ADS_DB.prepare(
-    'INSERT OR IGNORE INTO subscriptions (subscriber_sub, author_sub, created_at) VALUES (?, ?, ?)'
-  ).bind(sub, authorSub, Date.now()).run();
-  return json({ ok: true });
+  return applySubscription(env, request, sub, authorSub, true);
 }
 
-async function handleUnsubscribe(env, request, authorSub) {
+async function handleUnsubscribe(env, request, authorParam) {
   const sub = await requireSession(env, request);
   if (!sub) return textError(401, 'sign-in required');
-  await env.ADS_DB.prepare(
-    'DELETE FROM subscriptions WHERE subscriber_sub = ? AND author_sub = ?'
-  ).bind(sub, authorSub).run();
-  return json({ ok: true });
+  { const limited = await accountRateLimitResponse(env, sub, 'subscribe'); if (limited) return limited; }
+  const authorSub = await resolveAuthorParam(env, authorParam);
+  // An author who no longer exists has nothing left to unfollow.
+  if (!authorSub) return json({ ok: true, subscribed: false });
+  return applySubscription(env, request, sub, authorSub, false);
+}
+
+async function applySubscription(env, request, sub, authorSub, want) {
+  const t = actionTime(request);
+  const change = want
+    ? env.ADS_DB.prepare('INSERT OR IGNORE INTO subscriptions (subscriber_sub, author_sub, created_at) SELECT ?, ?, ? WHERE ' + CLOCK_IS)
+        .bind(sub, authorSub, Date.now(), sub, 'sub', authorSub, t)
+    : env.ADS_DB.prepare('DELETE FROM subscriptions WHERE subscriber_sub = ? AND author_sub = ? AND ' + CLOCK_IS)
+        .bind(sub, authorSub, sub, 'sub', authorSub, t);
+  await env.ADS_DB.batch([clockUpsert(env, sub, 'sub', authorSub, t), change]);
+  const row = await env.ADS_DB.prepare('SELECT 1 AS x FROM subscriptions WHERE subscriber_sub = ? AND author_sub = ?').bind(sub, authorSub).first();
+  return json({ ok: true, subscribed: !!row });
 }
 
 // GET /account/subscriber-count — how many accounts subscribe to the
@@ -1058,10 +1380,96 @@ async function handleUnsubscribe(env, request, authorSub) {
 async function handleSubscriberCount(env, request) {
   const sub = await requireSession(env, request);
   if (!sub) return textError(401, 'sign-in required');
+  const [subs, likes] = await env.ADS_DB.batch([
+    env.ADS_DB.prepare('SELECT COUNT(*) AS c FROM subscriptions WHERE author_sub = ?').bind(sub),
+    env.ADS_DB.prepare('SELECT COUNT(*) AS c FROM likes WHERE author_sub = ?').bind(sub)
+  ]);
+  const one = (r) => (r && r.results && r.results[0] && r.results[0].c) || 0;
+  // `likes` = total likes across every note this account has published, shown
+  // next to the subscriber count on the Account sheet.
+  return json({ count: one(subs), likes: one(likes) });
+}
+
+// GET /subscriptions — every author the signed-in account follows, as a list
+// of author subs. This is the server-side source of truth the app reconciles
+// its local "who I follow" list against, so the Subscribe button and the
+// "Subscribed" category are right on a new/second device instead of only on
+// the device where the follow happened.
+const MAX_SUBSCRIPTIONS_LISTED = 5000;
+async function handleGetSubscriptions(env, request) {
+  const sub = await requireSession(env, request);
+  if (!sub) return textError(401, 'sign-in required');
+  const { results } = await env.ADS_DB.prepare(
+    'SELECT author_sub FROM subscriptions WHERE subscriber_sub = ? ORDER BY created_at DESC LIMIT ?'
+  ).bind(sub, MAX_SUBSCRIPTIONS_LISTED).all();
+  const idBySub = await authorIdsFor(env, results.map(r => r.author_sub));
+  return json({ subs: results.map(r => idBySub[r.author_sub]) });
+}
+
+/* ---------------- Likes ---------------- */
+
+// GET /likes/:slug — has the signed-in account liked this note? Lets the
+// heart show the right state on a device that never saw the like happen.
+async function handleLikeState(env, request, slug) {
+  const sub = await requireSession(env, request);
+  if (!sub) return textError(401, 'sign-in required');
+  if (!validSlug(slug)) return textError(400, 'invalid slug');
   const row = await env.ADS_DB.prepare(
-    'SELECT COUNT(*) AS c FROM subscriptions WHERE author_sub = ?'
-  ).bind(sub).first();
-  return json({ count: (row && row.c) || 0 });
+    'SELECT 1 AS x FROM likes WHERE liker_sub = ? AND slug = ?'
+  ).bind(sub, slug).first();
+  return json({ liked: !!row });
+}
+
+// GET /likes — every slug this account has liked, so a second device shows
+// its hearts without having to open each note first.
+const MAX_LIKES_LISTED = 5000;
+async function handleLikesList(env, request) {
+  const sub = await requireSession(env, request);
+  if (!sub) return textError(401, 'sign-in required');
+  const { results } = await env.ADS_DB.prepare(
+    'SELECT slug FROM likes WHERE liker_sub = ? ORDER BY created_at DESC LIMIT ?'
+  ).bind(sub, MAX_LIKES_LISTED).all();
+  return json({ slugs: results.map(r => r.slug) });
+}
+
+// POST /likes/:slug — like a live published note. Idempotent (INSERT OR
+// IGNORE), so a retry or a second device that already liked it is harmless.
+// Same not-live gating as handleMeta/handleServe; you can't like your own
+// note (mirrors "can't subscribe to yourself"). Latest tap wins (see actionTime).
+async function handleLike(env, request, slug) {
+  const sub = await requireSession(env, request);
+  if (!sub) return textError(401, 'sign-in required');
+  { const limited = await accountRateLimitResponse(env, sub, 'like'); if (limited) return limited; }
+  if (!validSlug(slug)) return textError(400, 'invalid slug');
+  const meta = await getMeta(env, slug);
+  if (!meta || meta.deletedAt || meta.adminLocked) return textError(404, "note isn't available");
+  if (meta.ownerSub && meta.ownerSub === sub) return textError(400, "can't like your own note");
+  const t = actionTime(request);
+  await env.ADS_DB.batch([
+    clockUpsert(env, sub, 'like', slug, t),
+    env.ADS_DB.prepare('INSERT OR IGNORE INTO likes (liker_sub, slug, author_sub, created_at) SELECT ?, ?, ?, ? WHERE ' + CLOCK_IS)
+      .bind(sub, slug, meta.ownerSub || '', Date.now(), sub, 'like', slug, t)
+  ]);
+  const row = await env.ADS_DB.prepare('SELECT 1 AS x FROM likes WHERE liker_sub = ? AND slug = ?').bind(sub, slug).first();
+  return json({ ok: true, liked: !!row });
+}
+
+// DELETE /likes/:slug — remove this account's like. No liveness check on
+// purpose: someone should still be able to clear a like on a note that has
+// since been unpublished (its likes are removed anyway, so this is a no-op).
+async function handleUnlike(env, request, slug) {
+  const sub = await requireSession(env, request);
+  if (!sub) return textError(401, 'sign-in required');
+  { const limited = await accountRateLimitResponse(env, sub, 'like'); if (limited) return limited; }
+  if (!validSlug(slug)) return textError(400, 'invalid slug');
+  const t = actionTime(request);
+  await env.ADS_DB.batch([
+    clockUpsert(env, sub, 'like', slug, t),
+    env.ADS_DB.prepare('DELETE FROM likes WHERE liker_sub = ? AND slug = ? AND ' + CLOCK_IS)
+      .bind(sub, slug, sub, 'like', slug, t)
+  ]);
+  const row = await env.ADS_DB.prepare('SELECT 1 AS x FROM likes WHERE liker_sub = ? AND slug = ?').bind(sub, slug).first();
+  return json({ ok: true, liked: !!row });
 }
 
 const SUBSCRIPTIONS_FEED_PAGE_SIZE = 20;
@@ -1124,6 +1532,7 @@ async function handleSubscriptionsFeed(env, request) {
     const user = await getUser(env, authorSub);
     nameBySub[authorSub] = (user && user.profileName) || null;
   }
+  const idBySub = await authorIdsFor(env, authorSubs);
 
   const origin = new URL(request.url).origin;
   const last = results[results.length - 1];
@@ -1131,7 +1540,7 @@ async function handleSubscriptionsFeed(env, request) {
     stories: results.map(r => ({
       slug: r.slug,
       title: r.title,
-      authorSub: r.author_sub,
+      authorSub: idBySub[r.author_sub], // opaque author ID (field name kept for older app builds)
       authorProfileName: nameBySub[r.author_sub],
       createdAt: r.created_at,
       seen: !!r.seen,
@@ -1311,6 +1720,9 @@ async function handlePurge(env) {
     acctCursor = page.list_complete ? undefined : page.cursor;
   } while (acctCursor);
 
+  // Best-effort: an error here must never stop the rest of the purge above.
+  try { purged += await gcSyncImages(env); } catch (e) { console.log('gcSyncImages failed: ' + (e && e.message)); }
+
   return purged;
 }
 
@@ -1323,6 +1735,19 @@ async function handlePurge(env) {
 // elapses. Only revokes *this* session, so the device signs out right
 // away; other signed-in devices fall off naturally via their own 30-day
 // session TTL if the deletion isn't cancelled in time.
+async function revokeAllSessions(env, sub) {
+  const prefix = 'usess:' + sub + ':';
+  let cursor;
+  do {
+    const page = await env.ACCOUNTS.list({ prefix, cursor });
+    for (const key of page.keys) {
+      await env.ACCOUNTS.delete('session:' + key.name.slice(prefix.length));
+      await env.ACCOUNTS.delete(key.name);
+    }
+    cursor = page.list_complete ? undefined : page.cursor;
+  } while (cursor);
+}
+
 async function handleDeleteAccount(env, request) {
   const info = await requireSessionInfo(env, request);
   if (!info) return textError(401, 'sign-in required');
@@ -1335,6 +1760,12 @@ async function handleDeleteAccount(env, request) {
     await putUser(env, sub, user);
   }
   await env.ACCOUNTS.delete('session:' + tokenHash);
+  // Every other device signs out too: revoke all of this account's sessions.
+  // Each device finds out on its next request (the app polls sync every ~20s,
+  // and a 401 there signs it out locally). Sessions from before the index
+  // existed can't be listed; requireSessionInfo rejects those via
+  // pendingDeletionAt instead.
+  await revokeAllSessions(env, sub);
 
   return json({ ok: true, pendingDeletionAt });
 }
@@ -1364,6 +1795,7 @@ async function purgeAccountData(env, sub) {
         }
         meta.deletedAt = now;
         await putMeta(env, slug, meta);
+        await env.ADS_DB.prepare('DELETE FROM likes WHERE slug = ?').bind(slug).run();
         if (meta.showInStories) {
           await deleteStoryImage(env, slug);
           await deleteStoryCardImages(env, slug);
@@ -1378,16 +1810,32 @@ async function purgeAccountData(env, sub) {
     cursor = page.list_complete ? undefined : page.cursor;
   } while (cursor);
 
+  await revokeAllSessions(env, sub);
   await env.ACCOUNTS.delete('user:' + sub);
   await env.ACCOUNTS.delete('syncmeta:' + sub);
   await env.NOTES_BUCKET.delete('sync/' + sub + '/notes.json');
+  let imgCursor;
+  do {
+    const page = await env.NOTES_BUCKET.list({ prefix: 'sync/' + sub + '/img/', cursor: imgCursor });
+    for (const o of page.objects) await env.NOTES_BUCKET.delete(o.key);
+    imgCursor = page.truncated ? page.cursor : undefined;
+  } while (imgCursor);
   await env.NOTES_BUCKET.delete(profileImageKey(sub));
   // Subscriptions run both directions — as a follower and as someone
   // others followed — and story_seen rows are meaningless without the
   // account that saw them, so all three go with the account.
   await env.ADS_DB.batch([
     env.ADS_DB.prepare('DELETE FROM subscriptions WHERE subscriber_sub = ? OR author_sub = ?').bind(sub, sub),
-    env.ADS_DB.prepare('DELETE FROM story_seen WHERE subscriber_sub = ?').bind(sub)
+    env.ADS_DB.prepare('DELETE FROM story_seen WHERE subscriber_sub = ?').bind(sub),
+    // Likes this account gave, and any still attached to its notes.
+    env.ADS_DB.prepare('DELETE FROM likes WHERE liker_sub = ? OR author_sub = ?').bind(sub, sub),
+    env.ADS_DB.prepare('DELETE FROM action_clocks WHERE sub = ?').bind(sub),
+    env.ADS_DB.prepare('DELETE FROM authors WHERE sub = ?').bind(sub),
+    // Ads (and their unique-viewer rows) this account ran, plus its view-credit
+    // ledger (unspent balance included).
+    env.ADS_DB.prepare('DELETE FROM ad_viewers WHERE slug IN (SELECT slug FROM ads WHERE owner_sub = ?)').bind(sub),
+    env.ADS_DB.prepare('DELETE FROM ads WHERE owner_sub = ?').bind(sub),
+    env.ADS_DB.prepare('DELETE FROM view_credits_ledger WHERE owner_sub = ?').bind(sub)
   ]);
 }
 
@@ -1789,6 +2237,15 @@ async function handleAdNext(env, request) {
   ).bind(cursorRow.position).first();
   if (!ad) return json({ ad: null }); // lost a race against an unpublish between the two queries above — next tap retries
 
+  // Never serve an ad whose page is gone (unpublished, taken down, or its
+  // owner's account was purged). Also heals rows from before handleUnpublish
+  // took ads down itself.
+  const meta = await getMeta(env, ad.slug);
+  if (!meta || meta.deletedAt) {
+    await env.ADS_DB.prepare("UPDATE ads SET status = 'unpublished', updated_at = ? WHERE slug = ? AND status = 'active'")
+      .bind(Date.now(), ad.slug).run();
+    return json({ ad: null }); // next tap moves on to the next ad
+  }
   const obj = await env.NOTES_BUCKET.get(ad.slug + '.html');
   if (!obj) return json({ ad: null });
   return json({ ad: { slug: ad.slug, html: await obj.text() } });
@@ -1890,6 +2347,15 @@ export default {
       if (method === 'GET' && pathname === '/sync/notes') {
         return handleSyncPull(env, request);
       }
+      if (method === 'POST' && pathname === '/sync/images/missing') {
+        return handleSyncImagesMissing(env, request);
+      }
+      if (method === 'PUT' && pathname.startsWith('/sync/images/')) {
+        return handleSyncImagePut(env, request, decodeURIComponent(pathname.slice('/sync/images/'.length)));
+      }
+      if (method === 'GET' && pathname.startsWith('/sync/images/')) {
+        return handleSyncImageGet(env, request, decodeURIComponent(pathname.slice('/sync/images/'.length)));
+      }
       if (method === 'GET' && pathname === '/my/pages') {
         return handleMyPages(env, request);
       }
@@ -1903,7 +2369,7 @@ export default {
         return handleSetProfileImage(env, request);
       }
       if (method === 'GET' && pathname.startsWith('/account/profile-image/')) {
-        return handleServeProfileImage(env, decodeURIComponent(pathname.slice('/account/profile-image/'.length)));
+        return handleServeProfileImage(env, decodeURIComponent(pathname.slice('/account/profile-image/'.length)), request);
       }
       if (method === 'GET' && pathname === '/stories') {
         return handleStoriesStrip(env, request);
@@ -1921,8 +2387,23 @@ export default {
       if (method === 'GET' && pathname === '/account/subscriber-count') {
         return handleSubscriberCount(env, request);
       }
+      if (method === 'GET' && pathname === '/subscriptions') {
+        return handleGetSubscriptions(env, request);
+      }
       if (method === 'GET' && pathname === '/subscriptions/feed') {
         return handleSubscriptionsFeed(env, request);
+      }
+      if (method === 'GET' && pathname === '/likes') {
+        return handleLikesList(env, request);
+      }
+      if (method === 'GET' && pathname.startsWith('/likes/')) {
+        return handleLikeState(env, request, decodeURIComponent(pathname.slice('/likes/'.length)));
+      }
+      if (method === 'POST' && pathname.startsWith('/likes/')) {
+        return handleLike(env, request, decodeURIComponent(pathname.slice('/likes/'.length)));
+      }
+      if (method === 'DELETE' && pathname.startsWith('/likes/')) {
+        return handleUnlike(env, request, decodeURIComponent(pathname.slice('/likes/'.length)));
       }
       if (method === 'POST' && pathname.startsWith('/subscriptions/')) {
         return handleSubscribe(env, request, decodeURIComponent(pathname.slice('/subscriptions/'.length)));
