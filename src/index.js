@@ -791,7 +791,12 @@ async function handlePublish(env, request) {
     deletedAt: null,
     ownerSub: ownerSub || null,
     showInStories: wantsStory,
-    title: storyTitle
+    title: storyTitle,
+    // Card details kept for every published page (not just stories) so a note someone
+    // likes from its link can be shown as a full card on their Liked tab.
+    desc: cleanStoryDesc(desc) || '',
+    tags: cleanStoryTags(tags),
+    noteCreatedAt: cleanNoteCreatedAt(createdAt)
   });
   if (ownerSub) await env.SLUGS.put('owner:' + ownerSub + ':' + slug, '1');
   if (wantsStory) {
@@ -826,6 +831,11 @@ async function handleUpdate(env, request, slug) {
   meta.updatedAt = Date.now();
   meta.sizeBytes = html.length;
   if (typeof title === 'string' && title.trim()) meta.title = title.trim().slice(0, 200);
+  // Card details only change when this call actually carries them (an older app build can't wipe them).
+  { const d = cleanStoryDesc(desc), t = cleanStoryTags(tags), c = cleanNoteCreatedAt(createdAt);
+    if (d !== null) meta.desc = d;
+    if (t !== null) meta.tags = t;
+    if (c !== null) meta.noteCreatedAt = c; }
 
   // showInStories is only togglable here for an owned page — an anonymous
   // publish (meta.ownerSub null) has no account to attribute a story row
@@ -923,9 +933,11 @@ async function handleUnpublish(env, request, slug) {
   // A story stops being a story the moment its page is gone — it doesn't
   // wait for handlePurge's 30-day hard-delete pass, that's KV/R2 cleanup
   // for already-dead entries, not the thing that makes a story live.
+  // Thumbnails cached for the Liked tab exist even when the note is not a story.
+  await deleteStoryCardImages(env, slug);
+  await env.SLUGS.delete(cardImagesKey(slug));
   if (meta.showInStories) {
     await deleteStoryImage(env, slug);
-    await deleteStoryCardImages(env, slug);
     await env.ADS_DB.batch([
       env.ADS_DB.prepare('DELETE FROM stories WHERE slug = ?').bind(slug),
       env.ADS_DB.prepare('DELETE FROM story_seen WHERE slug = ?').bind(slug)
@@ -1539,6 +1551,98 @@ async function handleUnlike(env, request, slug) {
 
 const SUBSCRIPTIONS_FEED_PAGE_SIZE = 20;
 
+// GET /account/liked-notes — the "Liked" tab: every live note this account has
+// liked, newest like first, shaped like a Subscribed-feed card so the app renders
+// both the same way. A liked note doesn't have to be a story (it may have been
+// found through its link), so card details come from the stories row when there
+// is one and otherwise from the note's own metadata (title, author, no thumbnails).
+// Paged with a `${likedAt}:${slug}` cursor over the likes rows themselves; notes that
+// have since gone (taken down) are skipped without ending the page early.
+// Thumbnails for a liked note that isn't a story. Built once from the published page,
+// through the same storeStoryCardImages the stories use (so the same public
+// /stories/card-image/ URLs serve them), and cached with the page's updatedAt so an
+// edit rebuilds them. Removed with the page (unpublish / account deletion).
+function cardImagesKey(slug) { return 'cardimgs:' + slug; }
+async function ensureCardImages(env, slug, meta) {
+  try {
+    const raw = await env.SLUGS.get(cardImagesKey(slug));
+    if (raw) { const c = JSON.parse(raw); if (c && c.v === meta.updatedAt && typeof c.j === 'string') return c.j; }
+    const obj = await env.NOTES_BUCKET.get(slug + '.html');
+    if (!obj) return null;
+    const j = await storeStoryCardImages(env, slug, await obj.text());
+    await env.SLUGS.put(cardImagesKey(slug), JSON.stringify({ v: meta.updatedAt, j }));
+    return j;
+  } catch (e) { console.log('card images failed for ' + slug + ': ' + (e && e.message)); return null; }
+}
+async function handleLikedNotes(env, request) {
+  const sub = await requireSession(env, request);
+  if (!sub) return textError(401, 'sign-in required');
+
+  const url = new URL(request.url);
+  const cursorParam = url.searchParams.get('cursor');
+  let cursorAt = null, cursorSlug = null;
+  if (cursorParam) {
+    const i = cursorParam.lastIndexOf(':');
+    if (i > 0) {
+      const at = Number(cursorParam.slice(0, i));
+      if (Number.isFinite(at)) { cursorAt = at; cursorSlug = cursorParam.slice(i + 1); }
+    }
+  }
+
+  let query = `SELECT l.slug, l.author_sub AS liked_author, l.created_at AS liked_at,
+       s.author_sub AS story_author, s.title AS story_title, s.image_urls, s.description, s.tags, s.note_created_at
+     FROM likes l
+     LEFT JOIN stories s ON s.slug = l.slug
+     WHERE l.liker_sub = ?`;
+  const params = [sub];
+  if (cursorAt !== null) {
+    query += ' AND (l.created_at < ? OR (l.created_at = ? AND l.slug < ?))';
+    params.push(cursorAt, cursorAt, cursorSlug);
+  }
+  query += ' ORDER BY l.created_at DESC, l.slug DESC LIMIT ?';
+  params.push(SUBSCRIPTIONS_FEED_PAGE_SIZE);
+  const { results } = await env.ADS_DB.prepare(query).bind(...params).all();
+
+  // Live notes only, with the fields each card needs.
+  const rows = [];
+  for (const r of results) {
+    const meta = await getMeta(env, r.slug);
+    if (!meta || meta.deletedAt || meta.adminLocked) continue;
+    const authorSub = r.story_author || r.liked_author || meta.ownerSub || '';
+    const isStory = r.story_title != null;
+    rows.push({ r, meta, authorSub, isStory, imgJson: isStory ? r.image_urls : await ensureCardImages(env, r.slug, meta) });
+  }
+  const authorSubs = [...new Set(rows.map(x => x.authorSub).filter(Boolean))];
+  const nameBySub = {};
+  for (const a of authorSubs) {
+    const user = await getUser(env, a);
+    nameBySub[a] = (user && user.profileName) || null;
+  }
+  const idBySub = authorSubs.length ? await authorIdsFor(env, authorSubs) : {};
+
+  const origin = url.origin;
+  const last = results[results.length - 1];
+  return json({
+    stories: rows.map(({ r, meta, authorSub, isStory, imgJson }) => {
+      const card = imgJson ? expandStoryImageUrls(origin, r.slug, imgJson) : { images: [], count: 0 };
+      return {
+        slug: r.slug,
+        title: isStory ? r.story_title : (meta.title || 'Untitled note'),
+        authorSub: authorSub ? idBySub[authorSub] : null, // opaque author ID, same as the feed
+        authorProfileName: authorSub ? nameBySub[authorSub] : null,
+        likedAt: r.liked_at,
+        noteCreatedAt: (isStory ? r.note_created_at : meta.noteCreatedAt) || null,
+        desc: (isStory ? r.description : meta.desc) || '',
+        tags: parseStoryTags(isStory ? r.tags : meta.tags),
+        seen: false,
+        images: card.images,
+        imageCount: card.count
+      };
+    }),
+    nextCursor: (last && results.length === SUBSCRIPTIONS_FEED_PAGE_SIZE) ? `${last.liked_at}:${last.slug}` : null
+  });
+}
+
 // GET /subscriptions/feed — the "Subscribed" category: a regular social
 // feed, not a Stories surface. No 24h expiry (that ephemerality is
 // specific to the discovery strip/ring — see handleStoriesStrip). Two
@@ -1884,9 +1988,10 @@ async function purgeAccountData(env, sub) {
           env.ADS_DB.prepare('DELETE FROM likes WHERE slug = ?').bind(slug),
           env.ADS_DB.prepare("DELETE FROM action_clocks WHERE kind = 'like' AND item = ?").bind(slug)
         ]);
+        await deleteStoryCardImages(env, slug);
+        await env.SLUGS.delete(cardImagesKey(slug));
         if (meta.showInStories) {
           await deleteStoryImage(env, slug);
-          await deleteStoryCardImages(env, slug);
           await env.ADS_DB.batch([
             env.ADS_DB.prepare('DELETE FROM stories WHERE slug = ?').bind(slug),
             env.ADS_DB.prepare('DELETE FROM story_seen WHERE slug = ?').bind(slug)
@@ -2482,6 +2587,9 @@ export default {
       }
       if (method === 'GET' && pathname === '/subscriptions/feed') {
         return handleSubscriptionsFeed(env, request);
+      }
+      if (method === 'GET' && pathname === '/account/liked-notes') {
+        return handleLikedNotes(env, request);
       }
       if (method === 'GET' && pathname === '/likes') {
         return handleLikesList(env, request);
