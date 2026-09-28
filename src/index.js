@@ -1008,19 +1008,22 @@ async function extractFirstImageSrc(html) {
 }
 
 // Same idea as extractFirstImageSrc but collects up to `max` image srcs
-// in document order, for the Subscribed-feed card preview (up to 3
-// thumbnails, same as a normal note card — see storeStoryCardImages).
+// in document order (candidates for the Subscribed-feed card thumbnails)
+// while still counting every image in the note, so the card can show the
+// "+N" for the ones it doesn't preview, same as a normal note card.
 async function extractImageSrcs(html, max) {
   const found = [];
+  let total = 0;
   const rewriter = new HTMLRewriter().on('.blk-img img', {
     element(el) {
-      if (found.length >= max) return;
       const src = el.getAttribute('src') || '';
-      if (src) found.push(src);
+      if (!src) return;
+      total++;
+      if (found.length < max) found.push(src);
     }
   });
   await rewriter.transform(new Response(html)).text();
-  return found;
+  return { srcs: found, total };
 }
 
 // R2 key for one of a story's up-to-3 card-preview images (distinct from
@@ -1031,25 +1034,38 @@ function storyCardImageKey(slug, index) {
   return `story-card-images/${slug}/${index}`;
 }
 
+// Card previews live in R2 (not D1), so they get a roomier per-image cap
+// than the 300KB ring-avatar/URL-string cap: the app embeds photos at up
+// to 1600px, which routinely lands above 300KB, and dropping those left
+// the card with fewer thumbnails than the note has images.
+const STORY_CARD_IMAGE_MAX_BYTES = 1.5 * 1024 * 1024;
+
 // Mirrors storeStoryImage but for up to 3 images instead of 1. Returns a
-// JSON string for the stories.image_urls column: an array (possibly
-// empty) of entries, each either STORY_IMAGE_R2_MARKER (blob at
-// storyCardImageKey(slug, i)) or a plain remote URL — same per-entry
-// convention as the single-image column. Always clears any stale blobs
-// for indexes beyond what's stored now, so a note that loses images (or
-// shrinks from 3 to 1) doesn't leave orphaned R2 objects behind.
+// JSON string for the stories.image_urls column: {"e": [...], "n": total
+// images in the note}. "e" is an array (possibly empty) of entries, each
+// either STORY_IMAGE_R2_MARKER (blob at storyCardImageKey(slug, i)) or a
+// plain remote URL — same per-entry convention as the single-image column.
+//
+// An entry's position in the array IS its R2 slot (expandStoryImageUrls
+// builds /stories/card-image/<slug>/<position>), so blobs are written at
+// entries.length, never at the source image's index. Skipping an
+// unusable image therefore closes the gap instead of shifting every later
+// entry onto a slot that was never written (which 404'd as an empty
+// placeholder). Slots past what's stored are cleared at the end, so a
+// note that loses images (or shrinks from 3 to 1) leaves no orphans.
+//
+// Up to STORY_CARD_CANDIDATES sources are considered so an unusable image
+// (too big, malformed) is replaced by the next one and the card still
+// previews three when the note has them. "n" counts every image, so the
+// client shows "+N" for whatever isn't previewed.
+const STORY_CARD_CANDIDATES = 12;
 async function storeStoryCardImages(env, slug, html) {
-  const srcs = await extractImageSrcs(html, 3);
+  const { srcs, total } = await extractImageSrcs(html, STORY_CARD_CANDIDATES);
   const entries = [];
-  for (let i = 0; i < 3; i++) {
-    if (i >= srcs.length) {
-      await env.NOTES_BUCKET.delete(storyCardImageKey(slug, i));
-      continue;
-    }
-    const src = srcs[i];
+  for (const src of srcs) {
+    if (entries.length >= 3) break;
     const m = /^data:([^;,]*)(;base64)?,(.*)$/s.exec(src);
     if (!m) {
-      await env.NOTES_BUCKET.delete(storyCardImageKey(slug, i));
       if (new TextEncoder().encode(src).length <= STORY_IMAGE_MAX_BYTES) entries.push(src);
       continue;
     }
@@ -1065,17 +1081,14 @@ async function storeStoryCardImages(env, slug, html) {
         bytes = new TextEncoder().encode(decodeURIComponent(m[3]));
       }
     } catch (e) {
-      await env.NOTES_BUCKET.delete(storyCardImageKey(slug, i));
-      continue; // malformed data URI — treat like "no image" for this slot
+      continue; // malformed data URI — skip this image
     }
-    if (bytes.byteLength > STORY_IMAGE_MAX_BYTES) {
-      await env.NOTES_BUCKET.delete(storyCardImageKey(slug, i));
-      continue;
-    }
-    await env.NOTES_BUCKET.put(storyCardImageKey(slug, i), bytes, { httpMetadata: { contentType } });
+    if (bytes.byteLength > STORY_CARD_IMAGE_MAX_BYTES) continue;
+    await env.NOTES_BUCKET.put(storyCardImageKey(slug, entries.length), bytes, { httpMetadata: { contentType } });
     entries.push(STORY_IMAGE_R2_MARKER);
   }
-  return JSON.stringify(entries);
+  await Promise.all([0, 1, 2].filter(i => i >= entries.length).map(i => env.NOTES_BUCKET.delete(storyCardImageKey(slug, i))));
+  return JSON.stringify({ e: entries, n: total });
 }
 
 // Cleans up all of a story's card-preview blobs (up to 3), mirroring
@@ -1105,18 +1118,22 @@ async function handleServeStoryCardImage(env, slug, indexStr) {
   });
 }
 
-// Expands a stories.image_urls JSON column value into absolute URLs,
-// using the same STORY_IMAGE_R2_MARKER convention as the single-image
-// column. Tolerates a null/empty/malformed column (rows written before
-// this column existed) by returning [].
+// Expands a stories.image_urls JSON column value into absolute URLs plus
+// the note's total image count, using the same STORY_IMAGE_R2_MARKER
+// convention as the single-image column. Accepts the current {e, n} shape
+// and the older bare-array shape (count then falls back to what's
+// previewable); tolerates a null/empty/malformed column by returning no
+// images.
 function expandStoryImageUrls(origin, slug, imageUrlsJson) {
-  let entries;
-  try { entries = JSON.parse(imageUrlsJson || '[]'); } catch (e) { entries = []; }
-  if (!Array.isArray(entries)) return [];
-  return entries.map((entry, i) => entry === STORY_IMAGE_R2_MARKER
+  let parsed;
+  try { parsed = JSON.parse(imageUrlsJson || '[]'); } catch (e) { parsed = []; }
+  const entries = Array.isArray(parsed) ? parsed : (parsed && Array.isArray(parsed.e) ? parsed.e : []);
+  const images = entries.map((entry, i) => entry === STORY_IMAGE_R2_MARKER
     ? `${origin}/stories/card-image/${encodeURIComponent(slug)}/${i}`
     : entry
   ).filter(Boolean);
+  const n = parsed && !Array.isArray(parsed) ? Number(parsed.n) : NaN;
+  return { images, count: Number.isFinite(n) ? Math.max(n, images.length) : images.length };
 }
 
 // R2 key for a story's ring-avatar image blob. One object per slug
@@ -1172,7 +1189,9 @@ async function storeStoryImage(env, slug, html) {
   } catch (e) {
     return null; // malformed data URI — treat like "no image"
   }
-  if (bytes.byteLength > STORY_IMAGE_MAX_BYTES) return null;
+  // Decoded blobs live in R2, so they get the same roomier cap as the card
+  // previews; only URL strings (stored in D1) stay at STORY_IMAGE_MAX_BYTES.
+  if (bytes.byteLength > STORY_CARD_IMAGE_MAX_BYTES) return null;
 
   await env.NOTES_BUCKET.put(storyImageKey(slug), bytes, {
     httpMetadata: { contentType }
@@ -1537,15 +1556,19 @@ async function handleSubscriptionsFeed(env, request) {
   const origin = new URL(request.url).origin;
   const last = results[results.length - 1];
   return json({
-    stories: results.map(r => ({
-      slug: r.slug,
-      title: r.title,
-      authorSub: idBySub[r.author_sub], // opaque author ID (field name kept for older app builds)
-      authorProfileName: nameBySub[r.author_sub],
-      createdAt: r.created_at,
-      seen: !!r.seen,
-      images: expandStoryImageUrls(origin, r.slug, r.image_urls)
-    })),
+    stories: results.map(r => {
+      const card = expandStoryImageUrls(origin, r.slug, r.image_urls);
+      return {
+        slug: r.slug,
+        title: r.title,
+        authorSub: idBySub[r.author_sub], // opaque author ID (field name kept for older app builds)
+        authorProfileName: nameBySub[r.author_sub],
+        createdAt: r.created_at,
+        seen: !!r.seen,
+        images: card.images,
+        imageCount: card.count // total images in the note, for the "+N" badge
+      };
+    }),
     // A short page means we've hit the end; only hand back a cursor when
     // there might be more to page to.
     nextCursor: (last && results.length === SUBSCRIPTIONS_FEED_PAGE_SIZE) ? `${last.created_at}:${last.slug}` : null
