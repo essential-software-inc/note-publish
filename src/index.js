@@ -27,7 +27,9 @@
  *                   see migrations/0002_ad_viewers.sql — it never gates
  *                   spend or the views_used/views_total counters, which are
  *                   unrelated and unchanged by it). Also holds stories,
- *                   subscriptions, and story_seen (migrations/0003_stories.sql),
+ *                   subscriptions, and story_seen (migrations/0003_stories.sql;
+ *                   the story card's description/tags/note-created time are
+ *                   migrations/0009_story_card_fields.sql),
  *                   plus likes (migrations/0006_likes.sql),
  *                   for the Stories feature — same rationale as the ads
  *                   tables: feed/ring queries need real joins that KV can't
@@ -709,11 +711,39 @@ async function ownerAtPageCap(env, ownerSub) {
   return page.keys.length >= MAX_PAGES_PER_ACCOUNT;
 }
 
+// Story card fields (description, tags, when the note was created) shown on a
+// Subscribed-feed card. They live only on the stories row, so they disappear with it
+// (toggle off, unpublish, account deletion). Each cleaner returns null for "not sent"
+// so an update that doesn't carry the field leaves the stored value alone (COALESCE).
+const STORY_DESC_MAX = 200;
+const STORY_TAGS_MAX = 10;
+const STORY_TAG_MAX_LEN = 40;
+function cleanStoryDesc(v) { return typeof v === 'string' ? v.trim().slice(0, STORY_DESC_MAX) : null; }
+function cleanStoryTags(v) {
+  if (!Array.isArray(v)) return null;
+  const out = [];
+  for (const raw of v) {
+    if (typeof raw !== 'string') continue;
+    const s = raw.trim().slice(0, STORY_TAG_MAX_LEN);
+    if (s && !out.includes(s)) out.push(s);
+    if (out.length >= STORY_TAGS_MAX) break;
+  }
+  return JSON.stringify(out);
+}
+function cleanNoteCreatedAt(v) {
+  const n = Number(v);
+  return (Number.isFinite(n) && n > 0 && n <= Date.now() + 86400000) ? Math.floor(n) : null;
+}
+function parseStoryTags(raw) {
+  try { const a = JSON.parse(raw); return Array.isArray(a) ? a.filter(x => typeof x === 'string') : []; }
+  catch (e) { return []; }
+}
+
 async function handlePublish(env, request) {
   if (!(await checkPublishRateLimit(env, request))) return textError(429, 'too many publishes, slow down');
   let body;
   try { body = await request.json(); } catch (e) { return textError(400, 'invalid JSON body'); }
-  const { slug, html, title, showInStories } = body || {};
+  const { slug, html, title, showInStories, desc, tags, createdAt } = body || {};
   if (!validSlug(slug)) return textError(400, 'invalid or reserved slug');
   if (typeof html !== 'string' || !html) return textError(400, 'missing html');
   if (new TextEncoder().encode(html).length > MAX_HTML_BYTES) {
@@ -765,8 +795,8 @@ async function handlePublish(env, request) {
     const imageUrl = await storeStoryImage(env, slug, html);
     const imageUrls = await storeStoryCardImages(env, slug, html);
     await env.ADS_DB.prepare(
-      'INSERT OR REPLACE INTO stories (slug, author_sub, title, created_at, image_url, image_urls) VALUES (?, ?, ?, ?, ?, ?)'
-    ).bind(slug, ownerSub, storyTitle, now, imageUrl, imageUrls).run();
+      'INSERT OR REPLACE INTO stories (slug, author_sub, title, created_at, image_url, image_urls, description, tags, note_created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
+    ).bind(slug, ownerSub, storyTitle, now, imageUrl, imageUrls, cleanStoryDesc(desc), cleanStoryTags(tags), cleanNoteCreatedAt(createdAt)).run();
   }
   return json({ slug, token }, 201);
 }
@@ -776,7 +806,7 @@ async function handleUpdate(env, request, slug) {
   if (!validSlug(slug)) return textError(400, 'invalid slug');
   let body;
   try { body = await request.json(); } catch (e) { return textError(400, 'invalid JSON body'); }
-  const { html, token, title, showInStories } = body || {};
+  const { html, token, title, showInStories, desc, tags, createdAt } = body || {};
   if (typeof html !== 'string' || !html) return textError(400, 'missing html');
   if (typeof token !== 'string' || !token) return textError(401, 'missing token');
   if (new TextEncoder().encode(html).length > MAX_HTML_BYTES) {
@@ -804,8 +834,8 @@ async function handleUpdate(env, request, slug) {
       const imageUrl = await storeStoryImage(env, slug, html);
       const imageUrls = await storeStoryCardImages(env, slug, html);
       await env.ADS_DB.prepare(
-        'INSERT OR REPLACE INTO stories (slug, author_sub, title, created_at, image_url, image_urls) VALUES (?, ?, ?, ?, ?, ?)'
-      ).bind(slug, meta.ownerSub, meta.title || 'Untitled note', meta.updatedAt, imageUrl, imageUrls).run();
+        'INSERT OR REPLACE INTO stories (slug, author_sub, title, created_at, image_url, image_urls, description, tags, note_created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
+      ).bind(slug, meta.ownerSub, meta.title || 'Untitled note', meta.updatedAt, imageUrl, imageUrls, cleanStoryDesc(desc), cleanStoryTags(tags), cleanNoteCreatedAt(createdAt)).run();
     } else if (!wants && was) {
       await deleteStoryImage(env, slug);
       await deleteStoryCardImages(env, slug);
@@ -822,8 +852,11 @@ async function handleUpdate(env, request, slug) {
       // swapped for a remote URL, etc).
       const imageUrl = await storeStoryImage(env, slug, html);
       const imageUrls = await storeStoryCardImages(env, slug, html);
-      await env.ADS_DB.prepare('UPDATE stories SET title = ?, image_url = ?, image_urls = ? WHERE slug = ?')
-        .bind(meta.title || 'Untitled note', imageUrl, imageUrls, slug).run();
+      // description/tags/note_created_at only change when this call actually carries them
+      // (COALESCE keeps the stored value for a null), so an update from an older app build
+      // or one that only sends html can't wipe them.
+      await env.ADS_DB.prepare('UPDATE stories SET title = ?, image_url = ?, image_urls = ?, description = COALESCE(?, description), tags = COALESCE(?, tags), note_created_at = COALESCE(?, note_created_at) WHERE slug = ?')
+        .bind(meta.title || 'Untitled note', imageUrl, imageUrls, cleanStoryDesc(desc), cleanStoryTags(tags), cleanNoteCreatedAt(createdAt), slug).run();
     }
     meta.showInStories = wants;
   }
@@ -1527,7 +1560,7 @@ async function handleSubscriptionsFeed(env, request) {
     }
   }
 
-  let query = `SELECT s.slug, s.author_sub, s.title, s.created_at, s.image_urls, seen.slug IS NOT NULL AS seen
+  let query = `SELECT s.slug, s.author_sub, s.title, s.created_at, s.image_urls, s.description, s.tags, s.note_created_at, seen.slug IS NOT NULL AS seen
      FROM stories s
      JOIN subscriptions sub ON sub.author_sub = s.author_sub AND sub.subscriber_sub = ? AND s.created_at >= sub.created_at
      LEFT JOIN story_seen seen ON seen.slug = s.slug AND seen.subscriber_sub = ?`;
@@ -1563,7 +1596,10 @@ async function handleSubscriptionsFeed(env, request) {
         title: r.title,
         authorSub: idBySub[r.author_sub], // opaque author ID (field name kept for older app builds)
         authorProfileName: nameBySub[r.author_sub],
-        createdAt: r.created_at,
+        createdAt: r.created_at, // when it became a story (drives feed order)
+        noteCreatedAt: r.note_created_at || null, // when the note itself was created (what the card's time-ago shows)
+        desc: r.description || '',
+        tags: parseStoryTags(r.tags),
         seen: !!r.seen,
         images: card.images,
         imageCount: card.count // total images in the note, for the "+N" badge
