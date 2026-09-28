@@ -93,7 +93,10 @@ function corsHeaders() {
     'Access-Control-Allow-Headers': 'Content-Type, Authorization, If-Match, If-None-Match, X-Action-Time',
     // Without this a browser/WebView hides the ETag response header from
     // fetch(), so the app's backup If-Match check could never engage.
-    'Access-Control-Expose-Headers': 'ETag, Retry-After'
+    'Access-Control-Expose-Headers': 'ETag, Retry-After, X-Server-Time',
+    // Lets the app measure how far its own clock is from ours, so the
+    // X-Action-Time it sends (latest-tap-wins) isn't skewed by a slow or fast phone clock.
+    'X-Server-Time': String(Date.now())
   };
 }
 function json(data, status = 200, extraHeaders = {}) {
@@ -932,7 +935,11 @@ async function handleUnpublish(env, request, slug) {
   // slug is reclaimable immediately, so its likes go now or a new note at the
   // same slug would start life with someone else's likes (and the old author's
   // total would keep counting them).
-  await env.ADS_DB.prepare('DELETE FROM likes WHERE slug = ?').bind(slug).run();
+  await env.ADS_DB.batch([
+    env.ADS_DB.prepare('DELETE FROM likes WHERE slug = ?').bind(slug),
+    // ...and every liker's latest-tap clock for it, which would otherwise pile up unused.
+    env.ADS_DB.prepare("DELETE FROM action_clocks WHERE kind = 'like' AND item = ?").bind(slug)
+  ]);
   // An ad IS this page: unpublishing the page must take the ad down too, or
   // /ads/next would keep handing out its HTML until the 30-day purge.
   await env.ADS_DB.prepare("UPDATE ads SET status = 'unpublished', updated_at = ? WHERE slug = ? AND status != 'unpublished'")
@@ -1455,7 +1462,13 @@ async function handleGetSubscriptions(env, request) {
     'SELECT author_sub FROM subscriptions WHERE subscriber_sub = ? ORDER BY created_at DESC LIMIT ?'
   ).bind(sub, MAX_SUBSCRIPTIONS_LISTED).all();
   const idBySub = await authorIdsFor(env, results.map(r => r.author_sub));
-  return json({ subs: results.map(r => idBySub[r.author_sub]) });
+  const subs = results.map(r => idBySub[r.author_sub]).filter(id => typeof id === 'string' && id);
+  const skipped = results.length - subs.length;
+  if (skipped) console.warn('GET /subscriptions: ' + skipped + ' followed author(s) had no author id and were left out');
+  // `partial` tells the app the list can't be trusted for removals (cut off at the
+  // cap, or some authors couldn't be mapped): it may add from it but must not drop
+  // follows it already has.
+  return json({ subs, partial: skipped > 0 || results.length >= MAX_SUBSCRIPTIONS_LISTED });
 }
 
 /* ---------------- Likes ---------------- */
@@ -1481,7 +1494,7 @@ async function handleLikesList(env, request) {
   const { results } = await env.ADS_DB.prepare(
     'SELECT slug FROM likes WHERE liker_sub = ? ORDER BY created_at DESC LIMIT ?'
   ).bind(sub, MAX_LIKES_LISTED).all();
-  return json({ slugs: results.map(r => r.slug) });
+  return json({ slugs: results.map(r => r.slug), partial: results.length >= MAX_LIKES_LISTED });
 }
 
 // POST /likes/:slug — like a live published note. Idempotent (INSERT OR
@@ -1779,6 +1792,19 @@ async function handlePurge(env) {
     acctCursor = page.list_complete ? undefined : page.cursor;
   } while (acctCursor);
 
+  // Latest-tap clocks (see actionTime) that no longer guard anything: the like/follow
+  // they belong to is gone and the last tap is older than the retention window, so no
+  // queued offline replay can still be waiting on them. Also sweeps the backlog left
+  // by unpublishes from before those paths cleaned up after themselves.
+  try {
+    const r = await env.ADS_DB.prepare(
+      "DELETE FROM action_clocks WHERE t < ? AND (" +
+      "(kind = 'like' AND NOT EXISTS (SELECT 1 FROM likes l WHERE l.liker_sub = action_clocks.sub AND l.slug = action_clocks.item)) OR " +
+      "(kind = 'sub' AND NOT EXISTS (SELECT 1 FROM subscriptions s WHERE s.subscriber_sub = action_clocks.sub AND s.author_sub = action_clocks.item)))"
+    ).bind(cutoff).run();
+    purged += (r && r.meta && r.meta.changes) || 0;
+  } catch (e) { console.log('action_clocks gc failed: ' + (e && e.message)); }
+
   // Best-effort: an error here must never stop the rest of the purge above.
   try { purged += await gcSyncImages(env); } catch (e) { console.log('gcSyncImages failed: ' + (e && e.message)); }
 
@@ -1854,7 +1880,10 @@ async function purgeAccountData(env, sub) {
         }
         meta.deletedAt = now;
         await putMeta(env, slug, meta);
-        await env.ADS_DB.prepare('DELETE FROM likes WHERE slug = ?').bind(slug).run();
+        await env.ADS_DB.batch([
+          env.ADS_DB.prepare('DELETE FROM likes WHERE slug = ?').bind(slug),
+          env.ADS_DB.prepare("DELETE FROM action_clocks WHERE kind = 'like' AND item = ?").bind(slug)
+        ]);
         if (meta.showInStories) {
           await deleteStoryImage(env, slug);
           await deleteStoryCardImages(env, slug);
@@ -1889,6 +1918,8 @@ async function purgeAccountData(env, sub) {
     // Likes this account gave, and any still attached to its notes.
     env.ADS_DB.prepare('DELETE FROM likes WHERE liker_sub = ? OR author_sub = ?').bind(sub, sub),
     env.ADS_DB.prepare('DELETE FROM action_clocks WHERE sub = ?').bind(sub),
+    // Other people's follow clocks pointing at this (now gone) author.
+    env.ADS_DB.prepare("DELETE FROM action_clocks WHERE kind = 'sub' AND item = ?").bind(sub),
     env.ADS_DB.prepare('DELETE FROM authors WHERE sub = ?').bind(sub),
     // Ads (and their unique-viewer rows) this account ran, plus its view-credit
     // ledger (unspent balance included).
