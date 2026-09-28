@@ -4,14 +4,18 @@
 -- from image_url (0004_stories_image.sql), which holds just the first
 -- image for the story-ring avatar in the discovery strip.
 --
--- Column holds a JSON array (e.g. '["r2","r2",null]' isn't valid — entries
--- are only ever the sentinel STORY_IMAGE_R2_MARKER string or a plain
--- remote URL string, never null; a missing slot is just absent from the
--- array) of up to 3 entries. Each STORY_IMAGE_R2_MARKER entry's bytes live
--- in R2 at story-card-images/<slug>/<index>, served via
--- GET /stories/card-image/:slug/:index. NULL/empty column (or a row from
--- before this migration) means no card images — the client falls back to
--- no thumbnail row, same as a note with no images.
+-- Column holds a JSON object: {"e": [...], "n": <total images in the note>}.
+-- "e" is an array of up to 3 preview entries, each either the sentinel
+-- STORY_IMAGE_R2_MARKER string or a plain remote URL string (never null; a
+-- missing slot is just absent from the array). "n" counts every image in the
+-- note, so the Subscribed card can show "+N" for the ones it doesn't preview.
+-- An entry's position in "e" is its R2 slot: each STORY_IMAGE_R2_MARKER
+-- entry's bytes live in R2 at story-card-images/<slug>/<position>, served via
+-- GET /stories/card-image/:slug/:index. Rows written before "n" existed hold a
+-- bare JSON array of entries instead; expandStoryImageUrls reads both shapes
+-- (the count then falls back to the number of previewable entries). NULL/empty
+-- column (or a row from before this migration) means no card images — the
+-- client falls back to no thumbnail row, same as a note with no images.
 --
 -- Apply with: wrangler d1 execute note-publish-ads --remote --file=migrations/0005_stories_card_images.sql
 
