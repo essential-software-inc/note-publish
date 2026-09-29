@@ -389,7 +389,7 @@ async function requireSessionInfo(env, request) {
   if (!session.idx) {
     // Pre-index session: can't be found by account, so ask the account instead.
     const user = await getUser(env, session.sub);
-    if (user && user.pendingDeletionAt) {
+    if (user && (user.pendingDeletionAt || user.suspended)) {
       await env.ACCOUNTS.delete('session:' + tokenHash);
       return null;
     }
@@ -407,6 +407,7 @@ async function handleGoogleAuth(env, request) {
   const identity = await verifyGoogleIdToken(env, body && body.idToken);
   if (!identity) return textError(401, 'invalid Google idToken');
   let user = await getUser(env, identity.sub);
+  if (user && user.suspended) return textError(403, 'this account is suspended');
   const now = Date.now();
   let deletionCancelled = false;
   if (!user) {
@@ -913,6 +914,7 @@ async function handleSetStories(env, request, slug) {
 
   const was = !!meta.showInStories;
   const wants = showInStories;
+  if (wants && meta.storyBlocked) return textError(403, 'stories are disabled for this page');
   // Card details only change when this call carries them, same rule as PUT /publish/:slug.
   if (typeof title === 'string' && title.trim()) meta.title = title.trim().slice(0, 200);
   const d = cleanStoryDesc(desc), t = cleanStoryTags(tags), c = cleanNoteCreatedAt(createdAt);
@@ -973,7 +975,7 @@ async function handleUnpublish(env, request, slug) {
   if (!validSlug(slug)) return textError(400, 'invalid slug');
   let body;
   try { body = await request.json(); } catch (e) { body = {}; }
-  const { token, adminToken } = body || {};
+  const { token, adminToken, release } = body || {};
   const meta = await getMeta(env, slug);
   if (!meta || meta.deletedAt) return textError(404, 'not found');
 
@@ -982,11 +984,15 @@ async function handleUnpublish(env, request, slug) {
   // through instead. Checked before the owner-token path so an admin never
   // needs a slug's token at all.
   let isAdminTakedown = false;
+  // Admin release: same unpublish, but the slug is NOT locked, so it can be
+  // published again right away (for owners who lost their token). Admin token
+  // required; only honoured alongside a valid adminToken.
+  let isAdminRelease = false;
   if (typeof adminToken === 'string' && adminToken && env.ADMIN_TOKEN) {
     const auth = await adminAuthOk(env, request, adminToken);
     if (auth === 'limited') return textError(429, 'too many failed attempts, try again in 5 minutes');
     if (auth !== 'ok') return textError(403, 'invalid admin token');
-    isAdminTakedown = true;
+    if (release === true) isAdminRelease = true; else isAdminTakedown = true;
   } else {
     if (typeof token !== 'string' || !token) return textError(401, 'missing token');
     const tokenHash = await sha256Hex(token);
@@ -1006,7 +1012,7 @@ async function handleUnpublish(env, request, slug) {
   if (liveObj) {
     await env.NOTES_BUCKET.put(`deleted/${slug}/${now}.html`, liveObj.body, {
       httpMetadata: { contentType: 'text/html; charset=utf-8' },
-      customMetadata: { source: isAdminTakedown ? 'takedown' : 'unpublish' }
+      customMetadata: { source: isAdminTakedown ? 'takedown' : isAdminRelease ? 'release' : 'unpublish' }
     });
   }
 
@@ -1020,6 +1026,7 @@ async function handleUnpublish(env, request, slug) {
   meta.deletedAt = now;
   if (isAdminTakedown) meta.adminLocked = true;
   await putMeta(env, slug, meta);
+  if (isAdminTakedown || isAdminRelease) await audit(env, isAdminRelease ? 'release' : 'takedown', slug);
   // Drop this slug out of its owner's GET /my/pages listing either way —
   // an admin takedown shouldn't keep showing up in the owner's own page
   // list any more than a normal unpublish would.
@@ -2988,15 +2995,18 @@ async function handleAdminReports(env, request, url) {
     }
   }
   const nextCursor = done ? null : phase + ':' + (kvCursor || '');
+  const wantDismissed = url.searchParams.get('dismissed') === '1';
   const rows = await Promise.all(items.map(async (it) => {
     let rec = null;
     try { rec = JSON.parse(await env.REPORTS.get(it.key)); } catch (e) {}
-    if (rec && rec.dismissedAt) return null;
+    if (!!(rec && rec.dismissedAt) !== wantDismissed) return null;
     const meta = await getMeta(env, it.slug);
     return {
       key: it.key, slug: it.slug, reportedAt: it.ts,
       reason: rec ? rec.reason : '?', details: rec ? rec.details : '',
       isCsam: !!(rec && rec.isCsam),
+      dismissedAt: rec ? rec.dismissedAt || null : null,
+      ncmec: (rec && rec.isCsam) ? ((await getNcmec(env, it.slug)).slice(-1)[0] || null) : null,
       status: !meta ? 'missing' : meta.adminLocked ? 'taken down' : meta.deletedAt ? 'unpublished' : 'live'
     };
   }));
@@ -3027,6 +3037,8 @@ async function handleAdminDismiss(env, request) {
   } else {
     await env.REPORTS.delete(key);
   }
+  const km = key.match(REPORT_KEY_RE);
+  await audit(env, 'dismiss', km ? km[2] : ((key.match(REPORT_LEGACY_KEY_RE) || [])[1] || null));
   return json({ ok: true });
 }
 
@@ -3093,6 +3105,14 @@ async function handleAdminRestore(env, request, slug) {
   const meta = await getMeta(env, slug);
   if (!meta) return textError(404, 'not found');
   if (!meta.adminLocked || !meta.deletedAt) return textError(409, 'slug is not admin-taken-down');
+  // ?ts=<ms>: restore that specific snapshot instead of the newest copy.
+  const tsParam = new URL(request.url).searchParams.get('ts');
+  if (tsParam) {
+    if (!/^\d{10,16}$/.test(tsParam)) return textError(400, 'invalid timestamp');
+    const chosen = await env.NOTES_BUCKET.get('deleted/' + slug + '/' + tsParam + '.html');
+    if (!chosen) return textError(404, 'snapshot not found');
+    await env.NOTES_BUCKET.put(slug + '.html', chosen.body, { httpMetadata: { contentType: 'text/html; charset=utf-8' } });
+  }
   // The live object survives a takedown until the 30-day purge; if it is
   // already gone, fall back to the newest pre-takedown snapshot under deleted/.
   if (!(await env.NOTES_BUCKET.head(slug + '.html'))) {
@@ -3119,6 +3139,7 @@ async function handleAdminRestore(env, request, slug) {
     await env.ADS_DB.prepare('INSERT OR REPLACE INTO published_notes (slug, author_sub, created_at) VALUES (?, ?, ?)')
       .bind(slug, meta.ownerSub, meta.createdAt || Date.now()).run();
   }
+  await audit(env, 'restore', slug, tsParam ? 'snapshot ' + tsParam : null);
   return json({ ok: true });
 }
 
@@ -3203,6 +3224,306 @@ async function handleAdminImage(env, request, url) {
   });
 }
 
+/* ---------------- Admin tools: audit log, lookup, owner, stories, ads, NCMEC ---------------- */
+// Audit entries live in the REPORTS namespace under "audit:" (inverted timestamp so the newest
+// list first). The record rides in the key's metadata, so listing needs no extra reads. Only
+// the action, slug and a short detail are kept: no IPs, no tokens, no email addresses.
+const AUDIT_PREFIX = 'audit:';
+const AUDIT_TTL_S = 400 * 24 * 60 * 60;
+const NCMEC_PREFIX = 'ncmec:'; // SLUGS namespace: NCMEC report record(s) per slug
+
+async function audit(env, action, slug, detail) {
+  try {
+    const at = Date.now();
+    await env.REPORTS.put(
+      AUDIT_PREFIX + String(REPORT_TS_MAX - at).padStart(13, '0') + ':' + crypto.randomUUID().slice(0, 8),
+      '1',
+      { expirationTtl: AUDIT_TTL_S, metadata: { at, action, slug: slug || null, detail: detail || null } }
+    );
+  } catch (e) { console.log('audit failed: ' + (e && e.message)); }
+}
+
+async function adminGate(env, request) {
+  const auth = await adminAuthOk(env, request);
+  if (auth === 'limited') return textError(429, 'too many failed attempts, try again in 5 minutes');
+  if (auth !== 'ok') return textError(403, 'invalid admin token');
+  return null;
+}
+function adminSlugParam(url) {
+  const s = (url.searchParams.get('slug') || '').toLowerCase();
+  return SLUG_RE.test(s) ? s : null;
+}
+async function adminBody(request) {
+  try { const b = await request.json(); return b && typeof b === 'object' ? b : {}; } catch (e) { return {}; }
+}
+// How many report records exist per slug (open ones plus dismissed CSAM ones kept for the
+// retention window). Scans the key names only; capped at 5 pages of 1000.
+async function reportCounts(env) {
+  const counts = new Map();
+  let cursor;
+  for (let i = 0; i < 5; i++) {
+    const page = await env.REPORTS.list({ prefix: REPORT_KEY_PREFIX, cursor });
+    for (const k of page.keys) {
+      const m = k.name.match(REPORT_KEY_RE);
+      if (m) counts.set(m[2], (counts.get(m[2]) || 0) + 1);
+    }
+    if (page.list_complete) break;
+    cursor = page.cursor;
+  }
+  return counts;
+}
+async function getNcmec(env, slug) {
+  try { return JSON.parse(await env.SLUGS.get(NCMEC_PREFIX + slug)) || []; } catch (e) { return []; }
+}
+
+// GET /admin/lookup?slug=: everything known about one slug, reported or not.
+async function handleAdminLookup(env, request, url) {
+  const g = await adminGate(env, request); if (g) return g;
+  const slug = adminSlugParam(url);
+  if (!slug) return textError(400, 'invalid slug');
+  const meta = await getMeta(env, slug);
+  const reports = (await reportCounts(env)).get(slug) || 0;
+  if (!meta) return json({ found: false, slug, reports });
+  const [user, story, likes, ad, head, snaps, hold, ncmec] = await Promise.all([
+    meta.ownerSub ? getUser(env, meta.ownerSub) : null,
+    env.ADS_DB.prepare('SELECT title, created_at FROM stories WHERE slug = ?').bind(slug).first(),
+    env.ADS_DB.prepare('SELECT COUNT(*) AS n FROM likes WHERE slug = ?').bind(slug).first(),
+    env.ADS_DB.prepare('SELECT views_total, views_used, status FROM ads WHERE slug = ?').bind(slug).first(),
+    env.NOTES_BUCKET.head(slug + '.html'),
+    env.NOTES_BUCKET.list({ prefix: 'deleted/' + slug + '/' }),
+    env.SLUGS.get(CSAM_HOLD_PREFIX + slug),
+    getNcmec(env, slug)
+  ]);
+  return json({
+    found: true, slug,
+    status: meta.adminLocked ? 'taken down' : meta.deletedAt ? 'unpublished' : 'live',
+    title: meta.title || null, createdAt: meta.createdAt || null, updatedAt: meta.updatedAt || null,
+    deletedAt: meta.deletedAt || null,
+    sizeBytes: head ? head.size : (meta.sizeBytes || null),
+    hasOwner: !!meta.ownerSub, ownerEmail: user ? user.email : null,
+    showInStories: !!meta.showInStories, storyBlocked: !!meta.storyBlocked,
+    story: story ? { title: story.title, createdAt: story.created_at } : null,
+    likes: likes ? likes.n : 0,
+    ad: ad ? { status: ad.status, viewsTotal: ad.views_total, viewsUsed: ad.views_used } : null,
+    reports, csamHold: hold !== null, snapshots: (snaps.objects || []).length, ncmec
+  });
+}
+
+// GET /admin/owner?slug=: the account behind a slug and everything it has live.
+async function handleAdminOwner(env, request, url) {
+  const g = await adminGate(env, request); if (g) return g;
+  const slug = adminSlugParam(url);
+  if (!slug) return textError(400, 'invalid slug');
+  const meta = await getMeta(env, slug);
+  if (!meta) return textError(404, 'not found');
+  if (!meta.ownerSub) return json({ anonymous: true });
+  const sub = meta.ownerSub;
+  const [user, counts, adsRow, balance] = await Promise.all([
+    getUser(env, sub), reportCounts(env),
+    env.ADS_DB.prepare('SELECT COUNT(*) AS n FROM ads WHERE owner_sub = ?').bind(sub).first(),
+    getCreditBalance(env, sub)
+  ]);
+  const prefix = 'owner:' + sub + ':';
+  const pages = [];
+  let cursor;
+  do {
+    const page = await env.SLUGS.list({ prefix, cursor });
+    for (const k of page.keys) {
+      if (pages.length >= 100) break;
+      const s = k.name.slice(prefix.length);
+      const m = await getMeta(env, s);
+      if (!m || m.deletedAt) continue;
+      pages.push({ slug: s, title: m.title || null, updatedAt: m.updatedAt || null, showInStories: !!m.showInStories, reports: counts.get(s) || 0 });
+    }
+    cursor = (page.list_complete || pages.length >= 100) ? undefined : page.cursor;
+  } while (cursor);
+  return json({
+    email: user ? user.email : null, createdAt: user ? user.createdAt || null : null,
+    lastSignInAt: user ? user.lastSignInAt || null : null,
+    suspended: !!(user && user.suspended), pendingDeletionAt: user ? user.pendingDeletionAt || null : null,
+    pages, ads: adsRow ? adsRow.n : 0, creditBalance: balance
+  });
+}
+
+// POST /admin/owner/action {slug, action}: suspend | unsuspend | delete | cancel-delete.
+// Suspended accounts are signed out everywhere and can't sign in (handleGoogleAuth).
+// "delete" schedules the normal 30-day account deletion AND suspends, so the owner can't
+// cancel it just by signing back in; "cancel-delete" undoes that.
+async function handleAdminOwnerAction(env, request) {
+  const g = await adminGate(env, request); if (g) return g;
+  const body = await adminBody(request);
+  const slug = typeof body.slug === 'string' ? body.slug.toLowerCase() : '';
+  if (!SLUG_RE.test(slug)) return textError(400, 'invalid slug');
+  const meta = await getMeta(env, slug);
+  if (!meta || !meta.ownerSub) return textError(404, 'no account for this slug');
+  const sub = meta.ownerSub;
+  const user = await getUser(env, sub);
+  if (!user) return textError(404, 'account not found');
+  const action = body.action;
+  if (action === 'suspend') user.suspended = true;
+  else if (action === 'unsuspend') delete user.suspended;
+  else if (action === 'delete') { user.suspended = true; user.adminDeleted = true; user.pendingDeletionAt = Date.now(); }
+  else if (action === 'cancel-delete') {
+    delete user.pendingDeletionAt;
+    if (user.adminDeleted) { delete user.adminDeleted; delete user.suspended; }
+  } else return textError(400, 'invalid action');
+  await putUser(env, sub, user);
+  if (action === 'suspend' || action === 'delete') await revokeAllSessions(env, sub);
+  await audit(env, 'owner_' + action, slug);
+  return json({ ok: true, suspended: !!user.suspended, pendingDeletionAt: user.pendingDeletionAt || null });
+}
+
+// POST /admin/story {slug, action}: "remove" pulls a page out of stories (page stays online)
+// and blocks re-enabling it; "allow" lifts the block. handleSetStories enforces storyBlocked.
+async function handleAdminStory(env, request) {
+  const g = await adminGate(env, request); if (g) return g;
+  const body = await adminBody(request);
+  const slug = typeof body.slug === 'string' ? body.slug.toLowerCase() : '';
+  if (!SLUG_RE.test(slug)) return textError(400, 'invalid slug');
+  const meta = await getMeta(env, slug);
+  if (!meta || meta.deletedAt) return textError(404, 'not live');
+  if (body.action === 'remove') {
+    if (meta.showInStories) {
+      await Promise.all([
+        deleteStoryImage(env, slug),
+        deleteStoryCardImages(env, slug),
+        env.ADS_DB.batch([
+          env.ADS_DB.prepare('DELETE FROM stories WHERE slug = ?').bind(slug),
+          env.ADS_DB.prepare('DELETE FROM story_seen WHERE slug = ?').bind(slug)
+        ])
+      ]);
+    }
+    meta.showInStories = false;
+    meta.storyBlocked = true;
+  } else if (body.action === 'allow') {
+    delete meta.storyBlocked;
+  } else return textError(400, 'invalid action');
+  await putMeta(env, slug, meta);
+  await audit(env, 'story_' + body.action, slug);
+  return json({ ok: true });
+}
+
+// GET /admin/ads?status=&offset=: ads across all accounts, newest first.
+const ADMIN_ADS_PAGE = 30;
+async function handleAdminAds(env, request, url) {
+  const g = await adminGate(env, request); if (g) return g;
+  const status = url.searchParams.get('status') || '';
+  const offset = Math.max(0, parseInt(url.searchParams.get('offset') || '0', 10) || 0);
+  const filter = ['active', 'paused', 'exhausted', 'unpublished'].includes(status);
+  const stmt = env.ADS_DB.prepare(
+    'SELECT a.slug, a.owner_sub, a.views_total, a.views_used, a.status, a.created_at, ' +
+    '(SELECT COUNT(*) FROM ad_viewers v WHERE v.slug = a.slug) AS unique_viewers ' +
+    'FROM ads a ' + (filter ? 'WHERE a.status = ? ' : '') + 'ORDER BY a.created_at DESC LIMIT ? OFFSET ?'
+  );
+  const { results } = await (filter ? stmt.bind(status, ADMIN_ADS_PAGE, offset) : stmt.bind(ADMIN_ADS_PAGE, offset)).all();
+  const rows = results || [];
+  const emails = {};
+  for (const r of rows) {
+    if (!(r.owner_sub in emails)) { const u = await getUser(env, r.owner_sub); emails[r.owner_sub] = u ? u.email : null; }
+  }
+  return json({
+    ads: rows.map(r => ({
+      slug: r.slug, ownerEmail: emails[r.owner_sub], viewsTotal: r.views_total, viewsUsed: r.views_used,
+      status: r.status, createdAt: r.created_at, uniqueViewers: r.unique_viewers
+    })),
+    nextOffset: rows.length === ADMIN_ADS_PAGE ? offset + ADMIN_ADS_PAGE : null
+  });
+}
+
+// Credits the unused views of an ad back to its owner, once per slug (rc_event_id is the guard).
+async function refundAdViews(env, slug, ad) {
+  const remaining = Math.max(0, (ad.views_total || 0) - (ad.views_used || 0));
+  if (!remaining) return 0;
+  const evt = 'admin_refund:' + slug;
+  const r = await env.ADS_DB.prepare(
+    "INSERT INTO view_credits_ledger (owner_sub, delta, reason, slug, rc_event_id, created_at) " +
+    "SELECT ?, ?, 'refund', ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM view_credits_ledger WHERE rc_event_id = ?)"
+  ).bind(ad.owner_sub, remaining, slug, evt, Date.now(), evt).run();
+  return (r && r.meta && r.meta.changes) ? remaining : 0;
+}
+
+// POST /admin/ad {slug, action, refund}: pause | resume | takedown | refund.
+// takedown = the owner's unpublish (page stays up); add refund:true to also return unused views.
+// "refund" alone is for ads that are already down (e.g. their page was taken down and the
+// views were forfeited).
+async function handleAdminAd(env, request) {
+  const g = await adminGate(env, request); if (g) return g;
+  const body = await adminBody(request);
+  const slug = typeof body.slug === 'string' ? body.slug.toLowerCase() : '';
+  if (!SLUG_RE.test(slug)) return textError(400, 'invalid slug');
+  const ad = await env.ADS_DB.prepare('SELECT owner_sub, views_total, views_used, status FROM ads WHERE slug = ?').bind(slug).first();
+  if (!ad) return textError(404, 'ad not found');
+  const now = Date.now();
+  const set = (from, to) => env.ADS_DB.prepare('UPDATE ads SET status = ?, updated_at = ? WHERE slug = ? AND status = ?').bind(to, now, slug, from).run();
+  let refunded = 0;
+  try {
+    if (body.action === 'pause') {
+      if (ad.status !== 'active') return textError(409, 'ad is not active');
+      await set('active', 'paused');
+    } else if (body.action === 'resume') {
+      if (ad.status !== 'paused') return textError(409, 'ad is not paused');
+      await set('paused', 'active');
+    } else if (body.action === 'takedown') {
+      if (ad.status !== 'active' && ad.status !== 'paused') return textError(409, 'ad is not running');
+      await set(ad.status, 'unpublished');
+      if (body.refund === true) refunded = await refundAdViews(env, slug, ad);
+    } else if (body.action === 'refund') {
+      if (ad.status === 'active' || ad.status === 'paused') return textError(409, 'take the ad down first');
+      refunded = await refundAdViews(env, slug, ad);
+    } else return textError(400, 'invalid action');
+  } catch (e) {
+    console.log('admin ad action failed: ' + (e && e.message));
+    return textError(500, 'ad action failed');
+  }
+  await audit(env, 'ad_' + body.action, slug, refunded ? 'refunded ' + refunded : null);
+  return json({ ok: true, refunded });
+}
+
+// POST /admin/ncmec {slug, reportId, note}: records that the page was reported to NCMEC.
+// Kept for the CSAM retention window, independently of the slug's own metadata.
+async function handleAdminNcmec(env, request) {
+  const g = await adminGate(env, request); if (g) return g;
+  const body = await adminBody(request);
+  const slug = typeof body.slug === 'string' ? body.slug.toLowerCase() : '';
+  if (!SLUG_RE.test(slug)) return textError(400, 'invalid slug');
+  if (!(await getMeta(env, slug))) return textError(404, 'not found');
+  const reportId = typeof body.reportId === 'string' ? body.reportId.trim().slice(0, 64) : '';
+  const note = typeof body.note === 'string' ? body.note.trim().slice(0, 200) : '';
+  const list = (await getNcmec(env, slug)).slice(-19);
+  list.push({ at: Date.now(), reportId: reportId || null, note: note || null });
+  await env.SLUGS.put(NCMEC_PREFIX + slug, JSON.stringify(list), { expirationTtl: REPORT_DISMISSED_CSAM_TTL_S });
+  await audit(env, 'ncmec_recorded', slug);
+  return json({ ok: true, ncmec: list });
+}
+
+// POST /admin/undismiss {key}: brings back a dismissed CSAM report (ordinary reports are
+// deleted on dismiss, so there is nothing to bring back for those).
+async function handleAdminUndismiss(env, request) {
+  const g = await adminGate(env, request); if (g) return g;
+  const body = await adminBody(request);
+  const key = typeof body.key === 'string' ? body.key : '';
+  if (!REPORT_KEY_RE.test(key) && !REPORT_LEGACY_KEY_RE.test(key)) return textError(400, 'invalid report key');
+  const raw = await env.REPORTS.get(key);
+  if (raw === null) return textError(404, 'report not found');
+  let rec = null;
+  try { rec = JSON.parse(raw); } catch (e) {}
+  if (!rec || !rec.dismissedAt) return json({ ok: true });
+  delete rec.dismissedAt;
+  await env.REPORTS.put(key, JSON.stringify(rec));
+  await audit(env, 'undismiss', rec.slug || null);
+  return json({ ok: true });
+}
+
+// GET /admin/audit?cursor=: newest-first action log.
+async function handleAdminAudit(env, request, url) {
+  const g = await adminGate(env, request); if (g) return g;
+  const page = await env.REPORTS.list({ prefix: AUDIT_PREFIX, cursor: url.searchParams.get('cursor') || undefined, limit: ADMIN_PAGE_SIZE });
+  return json({
+    entries: page.keys.map(k => k.metadata).filter(Boolean),
+    nextCursor: page.list_complete ? null : page.cursor
+  });
+}
+
 function handleAdminPage() {
   return new Response(ADMIN_PAGE_HTML, {
     headers: {
@@ -3217,7 +3538,7 @@ function handleAdminPage() {
 
 const ADMIN_PAGE_HTML = `<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex">
-<title>Reports</title><style>
+<title>Admin</title><style>
 body{font:15px/1.4 system-ui,sans-serif;margin:0;padding:14px;background:#111;color:#eee}
 h1{font-size:18px;margin:0 0 12px}input,button{font:inherit;padding:10px 12px;border-radius:8px;border:1px solid #444;background:#222;color:#eee}
 input{width:100%;box-sizing:border-box;margin-bottom:8px}button{cursor:pointer}
@@ -3225,58 +3546,18 @@ input{width:100%;box-sizing:border-box;margin-bottom:8px}button{cursor:pointer}
 .csam{border-color:#c33}.badge{display:inline-block;padding:1px 8px;border-radius:99px;font-size:12px;background:#333;margin-left:6px}
 .badge.c{background:#c33}.row{display:flex;gap:8px;margin-top:10px;flex-wrap:wrap}.danger{background:#a22;border-color:#a22}
 .meta{color:#999;font-size:13px}.snap{font-size:13px;margin-top:8px;padding-top:8px;border-top:1px solid #333}.snap div{margin:4px 0}.snap .hit{color:#fc6}.snap code{color:#999}#imgs,#ext{width:auto;margin:0 6px 0 0;padding:0}.opt{display:block;margin:0 0 10px;color:#bbb;font-size:13px}.d{white-space:pre-wrap;word-break:break-word;margin:6px 0}#msg{margin:8px 0;color:#f88}
-a{color:#8bf}</style></head><body><h1>Reports</h1>
+a{color:#8bf}select{font:inherit;padding:8px;border-radius:8px;border:1px solid #444;background:#222;color:#eee}.tabs{display:flex;gap:6px;margin:0 0 12px;flex-wrap:wrap}.tab.on{background:#2b4a66;border-color:#69c}.pnl{display:none}.pnl.on{display:block}.filters{display:flex;gap:8px;flex-wrap:wrap;margin:0 0 10px;align-items:center}.badge.ok{background:#2a6}.kv{display:flex;gap:8px;font-size:13px;margin:3px 0;align-items:center;flex-wrap:wrap}.kv b{color:#999;font-weight:400;min-width:110px}#fgroup,#fdis{width:auto;margin:0 6px 0 0;padding:0}.filters .opt{margin:0}</style></head><body><h1>Admin</h1>
 <div id="login"><input id="tok" type="password" placeholder="Admin token" autocomplete="off"><button id="go">Load reports</button></div>
 <label class="opt"><input type="checkbox" id="imgs">Load embedded (data:) images in snapshot previews. Off by default.</label>
 <label class="opt"><input type="checkbox" id="ext">Also load external (https) images, fetched through the worker so the image hosts see the worker, not your IP. Off by default.</label>
-<div id="msg"></div><div id="list"></div><button id="more" style="display:none">Load more</button>
+<div id="tabs" class="tabs" style="display:none"><button class="tab on" data-t="reports">Reports</button><button class="tab" data-t="lookup">Lookup</button><button class="tab" data-t="ads">Ads</button><button class="tab" data-t="audit">Audit</button><button class="tab" data-t="tools">Tools</button></div>
+<div id="msg"></div>
+<div id="p-reports" class="pnl"><div class="filters"><select id="freason"><option value="">All reasons</option><option>spam</option><option>copyright</option><option>abuse</option><option>csam</option><option>other</option></select><select id="fstatus"><option value="">All statuses</option><option>live</option><option>taken down</option><option>unpublished</option><option>missing</option></select><label class="opt"><input type="checkbox" id="fgroup" checked>Group by slug</label><label class="opt"><input type="checkbox" id="fdis">Show dismissed</label></div><div id="list"></div><button id="more" style="display:none">Load more</button></div>
+<div id="p-lookup" class="pnl"><input id="lkslug" placeholder="Slug or link" autocomplete="off"><button id="lkgo">Look up</button><div id="lkout"></div><div id="lkowner"></div></div>
+<div id="p-ads" class="pnl"><div class="filters"><select id="adst"><option value="">All ads</option><option value="active">Active</option><option value="paused">Paused</option><option value="exhausted">Used up</option><option value="unpublished">Down</option></select></div><div id="adlist"></div><button id="admore" style="display:none">Load more</button></div>
+<div id="p-audit" class="pnl"><div id="aulist"></div><button id="aumore" style="display:none">Load more</button></div>
+<div id="p-tools" class="pnl"><div class="card"><div>Release a slug</div><div class="meta">Unpublishes without locking, so the slug can be reused right away.</div><input id="relslug" placeholder="Slug or link" autocomplete="off"><button id="relgo">Release slug</button></div><div class="card"><div>Purge</div><div class="meta">Same job the cron runs: deletes expired unpublished pages and accounts past their deletion window.</div><div class="row"><button id="purgego" class="danger">Run purge now</button></div></div></div>
 <script>
-var tok=sessionStorage.getItem('adm')||'',next=null,shown=0;
-var $=function(i){return document.getElementById(i)};
-function msg(t){$('msg').textContent=t||''}
-function el(t,c,x){var e=document.createElement(t);if(c)e.className=c;if(x!=null)e.textContent=x;return e}
-function load(reset){
-  if(reset){$('list').textContent='';next=null;shown=0}
-  fetch('/admin/reports'+(next?'?cursor='+encodeURIComponent(next):''),{headers:{'X-Admin-Token':tok}}).then(function(r){return r.json().then(function(j){return{ok:r.ok,j:j}})}).then(function(o){
-    if(!o.ok){msg(o.j.error||'failed');sessionStorage.removeItem('adm');$('login').style.display='';return}
-    sessionStorage.setItem('adm',tok);$('login').style.display='none';
-    o.j.reports.forEach(render);shown+=o.j.reports.length;next=o.j.nextCursor;
-    $('more').style.display=next?'':'none';
-    if(!o.j.reports.length&&next){load(false);return}
-    msg(shown?shown+' report(s) shown'+(next?' so far':''):'No open reports')
-  }).catch(function(){msg('network error')})
-}
-function render(r){
-  var c=el('div','card'+(r.isCsam?' csam':''));
-  var h=el('div',null,'/'+r.slug);var b=el('span','badge'+(r.isCsam?' c':''),r.reason);h.appendChild(b);h.appendChild(el('span','badge',r.status));c.appendChild(h);
-  c.appendChild(el('div','meta',new Date(r.reportedAt).toLocaleString()));
-  c.appendChild(el('div','d',r.details||'(no details)'));
-  var row=el('div','row');var a=el('a',null,'View page');a.href='/@'+r.slug;a.target='_blank';a.rel='noopener';row.appendChild(a);
-  if(r.status==='live'){row.appendChild(mkTake(r,c))}
-  if(r.status==='taken down'){row.appendChild(mkRestore(r,c))}
-  row.appendChild(mkSnaps(r,c));
-  row.appendChild(mkDismiss(r,c));
-  c.appendChild(row);$('list').appendChild(c)
-}
-function mkSnaps(r,card){var t=el('button',null,'Snapshots');var box=null;t.onclick=function(){
-  if(box){box.remove();box=null;return}
-  t.disabled=true;
-  fetch('/admin/snapshots/'+encodeURIComponent(r.slug),{headers:{'X-Admin-Token':tok}}).then(function(x){return x.json().then(function(j){return{ok:x.ok,j:j}})}).then(function(o){
-    t.disabled=false;
-    if(!o.ok){msg(o.j.error||'snapshot list failed');return}
-    box=el('div','snap');
-    if(!o.j.snapshots.length)box.appendChild(el('div',null,'No snapshots for /'+r.slug));
-    o.j.snapshots.forEach(function(s){
-      var d=el('div',s.ts===r.reportedAt?'hit':null);
-      d.appendChild(document.createTextNode(new Date(s.ts).toLocaleString()+' - '+s.source+(s.ts===r.reportedAt?' (this report)':'')+' '));
-      d.appendChild(el('code',null,new Date(s.ts).toISOString()+' / '+s.ts+' / '+Math.round(s.size/1024)+' KB'));
-      d.appendChild(document.createTextNode(' '));
-      d.appendChild(mkView(r,s,d));
-      box.appendChild(d)
-    });
-    card.appendChild(box)
-  }).catch(function(){t.disabled=false;msg('network error')})
-};return t}
 function toDataUrl(b){return new Promise(function(res){var r=new FileReader();r.onload=function(){res(r.result)};r.onerror=function(){res(null)};r.readAsDataURL(b)})}
 var imgCache={},imgBytes=0,IMG_BUDGET=30*1024*1024;
 function csp(want,ext){return "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; img-src "+((want||ext)?'data:':"'none'")}
@@ -3330,34 +3611,270 @@ $('ext').onchange=function(){
   if(this.checked&&!confirm('External images will be fetched by the worker from whatever hosts the page points at. Those hosts see the worker (not your IP) and that a preview was opened, and content from CSAM reports may display. Continue?')){this.checked=false;return}
   refreshFrames()
 };
-function setStatus(card,t){card.querySelectorAll('.badge')[1].textContent=t}
-function mkTake(r,card){var t=el('button','danger','Take down');t.onclick=function(){takedown(r,t,card)};return t}
-function mkRestore(r,card){var t=el('button',null,'Restore');t.onclick=function(){restore(r,t,card)};return t}
-function mkDismiss(r,card){var t=el('button',null,'Dismiss');t.onclick=function(){dismiss(r,t,card)};return t}
-function dismiss(r,btn,card){
-  var w=r.isCsam?'CSAM report: only dismiss once the page is handled and NCMEC has been notified. The record is hidden but kept for 18 months. Dismiss the report for /'+r.slug+'?':'Dismiss this report for /'+r.slug+'? It will be removed from the list.';
-  if(!confirm(w))return;btn.disabled=true;
-  fetch('/admin/dismiss',{method:'POST',headers:{'X-Admin-Token':tok,'Content-Type':'application/json'},body:JSON.stringify({key:r.key})}).then(function(x){
-    if(x.ok){card.remove();shown--;msg(shown?shown+' report(s) shown':'No open reports')}else{btn.disabled=false;msg('dismiss failed: '+x.status)}
-  }).catch(function(){btn.disabled=false;msg('network error')})
+var tok=sessionStorage.getItem('adm')||'',next=null,all=[],cur='reports',adOff=0,auNext=null;
+var $=function(i){return document.getElementById(i)};
+function msg(t){$('msg').textContent=t||''}
+function el(t,c,x){var e=document.createElement(t);if(c)e.className=c;if(x!=null)e.textContent=x;return e}
+function fmt(t){return t?new Date(t).toLocaleString():'-'}
+function api(path,o){o=o||{};var h={'X-Admin-Token':tok};if(o.body)h['Content-Type']='application/json';
+  return fetch(path,{method:o.method||'GET',headers:h,body:o.body?JSON.stringify(o.body):undefined}).then(function(r){return r.json().catch(function(){return{}}).then(function(j){return{ok:r.ok,s:r.status,j:j}})})}
+function btn(label,cls,fn){var b=el('button',cls||null,label);b.onclick=function(){fn(b)};return b}
+function kv(c,k,v){var d=el('div','kv');d.appendChild(el('b',null,k));d.appendChild(el('span',null,v));c.appendChild(d)}
+function slugFrom(v){v=(v||'').trim().toLowerCase();var q=v.indexOf('?');if(q>-1)v=v.slice(0,q);var p=v.split('/').filter(Boolean);v=p.length?p[p.length-1]:'';return v.charAt(0)==='@'?v.slice(1):v}
+function showTab(t){cur=t;
+  ['reports','lookup','ads','audit','tools'].forEach(function(n){$('p-'+n).className='pnl'+(n===t?' on':'');[].forEach.call(document.querySelectorAll('.tab'),function(b){b.className='tab'+(b.getAttribute('data-t')===cur?' on':'')})});
+  if(t==='ads'&&!$('adlist').firstChild)loadAds(true);
+  if(t==='audit'&&!$('aulist').firstChild)loadAudit(true)}
+function loggedIn(ok){$('login').style.display=ok?'none':'';$('tabs').style.display=ok?'':'none';if(!ok){['reports','lookup','ads','audit','tools'].forEach(function(n){$('p-'+n).className='pnl'})}else showTab(cur)}
+function bad(o){if(o.s===403||o.s===429){sessionStorage.removeItem('adm');loggedIn(false)}msg(o.j.error||'failed ('+o.s+')')}
+
+/* ---------- Reports ---------- */
+function loadReports(reset){
+  if(reset){all=[];next=null;$('list').textContent=''}
+  api('/admin/reports?'+($('fdis').checked?'dismissed=1&':'')+(next?'cursor='+encodeURIComponent(next):'')).then(function(o){
+    if(!o.ok){bad(o);return}
+    sessionStorage.setItem('adm',tok);loggedIn(true);
+    all=all.concat(o.j.reports);next=o.j.nextCursor;
+    $('more').style.display=next?'':'none';
+    if(!o.j.reports.length&&next){loadReports(false);return}
+    renderAll()
+  }).catch(function(){msg('network error')})
 }
-function restore(r,btn,card){
-  var w=r.isCsam?'WARNING: this page was reported as CSAM. Restoring puts it back online. Only continue if you have confirmed the report was mistaken. Restore /'+r.slug+'?':'Restore /'+r.slug+'? It returns as a plain page (story status and likes are not recovered).';
-  if(!confirm(w))return;btn.disabled=true;
-  fetch('/admin/restore/'+encodeURIComponent(r.slug),{method:'POST',headers:{'X-Admin-Token':tok}}).then(function(x){return x.json().then(function(j){return{ok:x.ok,j:j}})}).then(function(o){
-    if(o.ok){btn.replaceWith(mkTake(r,card));setStatus(card,'live');msg('')}else{btn.disabled=false;msg(o.j.error||'restore failed')}
-  }).catch(function(){btn.disabled=false;msg('network error')})
+function renderAll(){
+  var fr=$('freason').value,fs=$('fstatus').value,grp=$('fgroup').checked;
+  var items=all.filter(function(r){return(!fr||r.reason===fr)&&(!fs||r.status===fs)});
+  var groups=[],idx={};
+  items.forEach(function(r){var k=grp?r.slug:r.key;if(idx[k]==null){idx[k]=groups.length;groups.push({slug:r.slug,items:[]})}groups[idx[k]].items.push(r)});
+  function hasC(g){return g.items.some(function(x){return x.isCsam})}
+  groups.sort(function(a,b){var x=hasC(a),y=hasC(b);if(x!==y)return x?-1:1;return b.items[0].reportedAt-a.items[0].reportedAt});
+  $('list').textContent='';groups.forEach(renderGroup);
+  msg(groups.length?groups.length+' group(s) shown'+(next?' so far':''):(all.length?'No reports match the filters':'No '+($('fdis').checked?'dismissed':'open')+' reports'))
 }
-function takedown(r,btn,card){
-  var warn=r.isCsam?'CSAM report: the page is preserved under deleted/ for 18 months. You must still report to NCMEC. Take down /'+r.slug+'?':'Take down /'+r.slug+'? The slug will be permanently locked.';
-  if(!confirm(warn))return;btn.disabled=true;
-  fetch('/publish/'+encodeURIComponent(r.slug),{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({adminToken:tok})}).then(function(x){
-    if(x.ok){btn.replaceWith(mkRestore(r,card));setStatus(card,'taken down')}else if(x.status===404){btn.remove();setStatus(card,'missing')}else{btn.disabled=false;msg('takedown failed: '+x.status)}
-  }).catch(function(){btn.disabled=false;msg('network error')})
+function setSlugStatus(slug,st){all.forEach(function(r){if(r.slug===slug)r.status=st});renderAll()}
+function renderGroup(g){
+  var first=g.items[0],csam=hasCsam(g),c=el('div','card'+(csam?' csam':''));
+  var h=el('div',null,'/'+g.slug),seen={};
+  g.items.forEach(function(x){if(!seen[x.reason]){seen[x.reason]=1;h.appendChild(el('span','badge'+(x.isCsam?' c':''),x.reason))}});
+  if(g.items.length>1)h.appendChild(el('span','badge','x'+g.items.length));
+  h.appendChild(el('span','badge',first.status));
+  var nc=null;g.items.forEach(function(x){if(x.ncmec&&!nc)nc=x.ncmec});
+  if(csam)h.appendChild(el('span','badge '+(nc?'ok':'c'),nc?'NCMEC '+new Date(nc.at).toLocaleDateString():'NCMEC not recorded'));
+  c.appendChild(h);
+  g.items.forEach(function(x){c.appendChild(el('div','meta',fmt(x.reportedAt)+' - '+x.reason+(x.dismissedAt?' - dismissed '+fmt(x.dismissedAt):'')));c.appendChild(el('div','d',x.details||'(no details)'))});
+  var row=el('div','row'),a=el('a',null,'View page');a.href='/@'+g.slug;a.target='_blank';a.rel='noopener';row.appendChild(a);
+  var done=function(st){setSlugStatus(g.slug,st)};
+  if(first.status==='live'){row.appendChild(btn('Take down','danger',function(){takedown(g.slug,csam,done)}));if(!csam)row.appendChild(btn('Release slug',null,function(){release(g.slug,function(){done('unpublished')})}))}
+  if(first.status==='taken down')row.appendChild(btn('Restore',null,function(){restore(g.slug,csam,0,done)}));
+  row.appendChild(mkSnaps(g.slug,first.status,first.reportedAt,c,csam,done));
+  row.appendChild(btn('Lookup',null,function(){openLookup(g.slug)}));
+  if(csam)row.appendChild(btn(nc?'Add NCMEC record':'Record NCMEC report',null,function(){recordNcmec(g.slug,function(){loadReports(true)})}));
+  if($('fdis').checked)row.appendChild(btn('Undo dismiss',null,function(b){undismiss(g,b)}));
+  else row.appendChild(btn('Dismiss',null,function(){dismissGroup(g,csam,nc,c)}));
+  c.appendChild(row);$('list').appendChild(c)
 }
-$('go').onclick=function(){tok=$('tok').value.trim();load(true)};
-$('more').onclick=function(){load(false)};
-if(tok)load(true)
+function hasCsam(g){return g.items.some(function(x){return x.isCsam})}
+function sendKeys(path,keys){return Promise.all(keys.map(function(k){return api(path,{method:'POST',body:{key:k}})})).then(function(rs){return rs.every(function(r){return r.ok})})}
+function dropKeys(keys){all=all.filter(function(r){return keys.indexOf(r.key)<0})}
+function dismissGroup(g,csam,nc,card){
+  var keys=g.items.map(function(x){return x.key}),slug=g.slug;
+  if(csam){
+    var w='CSAM report: only dismiss once the page is handled and NCMEC has been notified.'+(nc?'':' NO NCMEC REPORT IS RECORDED for this page.')+' The record is hidden but kept for 18 months and can be brought back from Show dismissed. Dismiss /'+slug+'?';
+    if(!confirm(w))return;
+    sendKeys('/admin/dismiss',keys).then(function(ok){if(!ok){msg('dismiss failed');return}dropKeys(keys);var r=el('div','card');r.appendChild(el('span',null,'Dismissed /'+slug+'. '));r.appendChild(btn('Undo',null,function(){sendKeys('/admin/undismiss',keys).then(function(){loadReports(true)})}));card.replaceWith(r)});
+    return}
+  var row=el('div','card');row.appendChild(el('span',null,'Dismissing /'+slug+' in 8 seconds. '));
+  var t=setTimeout(function(){sendKeys('/admin/dismiss',keys).then(function(ok){if(ok){dropKeys(keys);row.remove()}else{msg('dismiss failed');row.replaceWith(card)}})},8000);
+  row.appendChild(btn('Undo',null,function(){clearTimeout(t);row.replaceWith(card)}));
+  card.replaceWith(row)
+}
+function undismiss(g,b){b.disabled=true;sendKeys('/admin/undismiss',g.items.map(function(x){return x.key})).then(function(ok){if(ok)loadReports(true);else{b.disabled=false;msg('undo failed')}})}
+
+/* ---------- Actions shared by Reports and Lookup ---------- */
+function takedown(slug,csam,done){
+  var w=csam?'CSAM report: the page is preserved under deleted/ for 18 months. You must still report to NCMEC. Take down /'+slug+'?':'Take down /'+slug+'? The slug will be permanently locked.';
+  if(!confirm(w))return;
+  api('/publish/'+encodeURIComponent(slug),{method:'DELETE',body:{adminToken:tok}}).then(function(o){
+    if(o.ok)done('taken down');else if(o.s===404){msg('/'+slug+' is not live');done('missing')}else msg('takedown failed: '+o.s)}).catch(function(){msg('network error')})
+}
+function release(slug,done){
+  if(!slug){msg('Enter a slug or link');return}
+  if(!confirm('Release /'+slug+'? The page goes offline and its likes, story and ad are removed, but the slug is NOT locked: anyone can publish to it again right away. A copy is kept for 30 days. Continue?'))return;
+  api('/publish/'+encodeURIComponent(slug),{method:'DELETE',body:{adminToken:tok,release:true}}).then(function(o){
+    if(o.ok){msg('/'+slug+' released. It can be published again now.');if(done)done()}
+    else if(o.s===404)msg('/'+slug+' is not live (never published, already unpublished, or taken down).');
+    else msg('release failed: '+o.s)}).catch(function(){msg('network error')})
+}
+function restore(slug,csam,ts,done){
+  var w=csam?'WARNING: this page was reported as CSAM. Restoring puts it back online. Only continue if you have confirmed the report was mistaken. Restore /'+slug+'?':'Restore /'+slug+'? It returns as a plain page (story status and likes are not recovered).';
+  if(ts)w+=' The copy from '+fmt(ts)+' will be used.';
+  if(!confirm(w))return;
+  api('/admin/restore/'+encodeURIComponent(slug)+(ts?'?ts='+ts:''),{method:'POST'}).then(function(o){
+    if(o.ok){msg('');done('live')}else msg(o.j.error||'restore failed')}).catch(function(){msg('network error')})
+}
+function recordNcmec(slug,done){
+  var id=prompt('NCMEC CyberTipline report ID for /'+slug+' (leave blank if none):');
+  if(id===null)return;
+  var note=prompt('Optional note (max 200 characters):');
+  api('/admin/ncmec',{method:'POST',body:{slug:slug,reportId:id,note:note||''}}).then(function(o){
+    if(o.ok){msg('NCMEC report recorded for /'+slug);if(done)done()}else msg(o.j.error||'failed')})
+}
+function mkSnaps(slug,status,hitTs,card,csam,done){var t=el('button',null,'Snapshots');var box=null;t.onclick=function(){
+  if(box){box.remove();box=null;return}
+  t.disabled=true;
+  api('/admin/snapshots/'+encodeURIComponent(slug)).then(function(o){
+    t.disabled=false;
+    if(!o.ok){msg(o.j.error||'snapshot list failed');return}
+    box=el('div','snap');
+    if(!o.j.snapshots.length)box.appendChild(el('div',null,'No snapshots for /'+slug));
+    o.j.snapshots.forEach(function(s){
+      var d=el('div',s.ts===hitTs?'hit':null);
+      d.appendChild(document.createTextNode(fmt(s.ts)+' - '+s.source+(s.ts===hitTs?' (this report)':'')+' '));
+      d.appendChild(el('code',null,new Date(s.ts).toISOString()+' / '+s.ts+' / '+Math.round(s.size/1024)+' KB'));
+      d.appendChild(document.createTextNode(' '));
+      d.appendChild(mkView({slug:slug,isCsam:csam},s,d));
+      if(status==='taken down')d.appendChild(btn('Restore this copy',null,function(){restore(slug,csam,s.ts,done)}));
+      box.appendChild(d)
+    });
+    card.appendChild(box)
+  }).catch(function(){t.disabled=false;msg('network error')})
+};return t}
+
+/* ---------- Lookup and owner ---------- */
+function openLookup(slug){showTab('lookup');$('lkslug').value=slug;doLookup(slug)}
+function doLookup(v){
+  var slug=slugFrom(v);if(!slug){msg('Enter a slug or link');return}
+  api('/admin/lookup?slug='+encodeURIComponent(slug)).then(function(o){if(!o.ok){bad(o);return}msg('');renderLookup(o.j)}).catch(function(){msg('network error')})
+}
+function renderLookup(d){
+  var out=$('lkout');out.textContent='';
+  var c=el('div','card'+(d.csamHold?' csam':''));
+  var h=el('div',null,'/'+d.slug);if(d.found)h.appendChild(el('span','badge',d.status));c.appendChild(h);
+  if(!d.found){kv(c,'Published','never');kv(c,'Reports on file',String(d.reports));out.appendChild(c);return}
+  var refresh=function(){doLookup(d.slug)};
+  kv(c,'Title',d.title||'-');kv(c,'Created',fmt(d.createdAt));kv(c,'Updated',fmt(d.updatedAt));
+  if(d.deletedAt)kv(c,'Went offline',fmt(d.deletedAt));
+  kv(c,'Size',d.sizeBytes!=null?Math.round(d.sizeBytes/1024)+' KB':'-');
+  kv(c,'Owner',d.hasOwner?(d.ownerEmail||'account missing'):'anonymous (no account)');
+  kv(c,'Stories',(d.showInStories?'showing':'not showing')+(d.storyBlocked?' (blocked by admin)':''));
+  kv(c,'Likes',String(d.likes));
+  kv(c,'Ad',d.ad?d.ad.status+', '+d.ad.viewsUsed+' of '+d.ad.viewsTotal+' views':'none');
+  kv(c,'Reports on file',String(d.reports));kv(c,'Snapshots',String(d.snapshots));
+  if(d.csamHold)kv(c,'CSAM hold','yes (kept out of purge)');
+  if(d.ncmec.length){d.ncmec.forEach(function(n){kv(c,'NCMEC',fmt(n.at)+(n.reportId?' - '+n.reportId:'')+(n.note?' - '+n.note:''))})}
+  else if(d.csamHold)kv(c,'NCMEC','not recorded');
+  var row=el('div','row');
+  if(d.status==='live'){var a=el('a',null,'View page');a.href='/@'+d.slug;a.target='_blank';a.rel='noopener';row.appendChild(a);
+    row.appendChild(btn('Take down','danger',function(){takedown(d.slug,d.csamHold,refresh)}));
+    if(!d.csamHold)row.appendChild(btn('Release slug',null,function(){release(d.slug,refresh)}));
+    if(d.showInStories)row.appendChild(btn('Remove from stories',null,function(){storyAct(d.slug,'remove',refresh)}))}
+  if(d.storyBlocked)row.appendChild(btn('Allow stories again',null,function(){storyAct(d.slug,'allow',refresh)}));
+  if(d.status==='taken down')row.appendChild(btn('Restore',null,function(){restore(d.slug,d.csamHold,0,refresh)}));
+  if(d.ad)row.appendChild(btn('Ads tab',null,function(){showTab('ads');loadAds(true)}));
+  if(d.csamHold||d.reports)row.appendChild(btn(d.ncmec.length?'Add NCMEC record':'Record NCMEC report',null,function(){recordNcmec(d.slug,refresh)}));
+  row.appendChild(mkSnaps(d.slug,d.status,0,c,d.csamHold,refresh));
+  if(d.hasOwner)row.appendChild(btn('Owner',null,function(){loadOwner(d.slug)}));
+  c.appendChild(row);out.appendChild(c);$('lkowner').textContent=''
+}
+function storyAct(slug,action,done){
+  var w=action==='remove'?'Remove /'+slug+' from stories? The page stays online. The owner cannot turn stories back on until you allow it.':'Let /'+slug+' be shown in stories again?';
+  if(!confirm(w))return;
+  api('/admin/story',{method:'POST',body:{slug:slug,action:action}}).then(function(o){if(o.ok){msg('');done()}else msg(o.j.error||'failed')})
+}
+function loadOwner(slug){
+  api('/admin/owner?slug='+encodeURIComponent(slug)).then(function(o){
+    if(!o.ok){msg(o.j.error||'failed');return}
+    var d=o.j,out=$('lkowner');out.textContent='';
+    var c=el('div','card');
+    if(d.anonymous){c.appendChild(el('div',null,'Anonymous page: no account to act on.'));out.appendChild(c);return}
+    var h=el('div',null,d.email||'(account missing)');
+    if(d.suspended)h.appendChild(el('span','badge c','suspended'));
+    if(d.pendingDeletionAt)h.appendChild(el('span','badge c','deletion '+new Date(d.pendingDeletionAt+2592000000).toLocaleDateString()));
+    c.appendChild(h);
+    kv(c,'Signed up',fmt(d.createdAt));kv(c,'Last sign-in',fmt(d.lastSignInAt));kv(c,'Ads',String(d.ads));kv(c,'Credit balance',String(d.creditBalance));
+    kv(c,'Live pages',String(d.pages.length));
+    d.pages.forEach(function(p){var r=el('div','kv');r.appendChild(btn('/'+p.slug,null,function(){openLookup(p.slug)}));r.appendChild(el('span',null,(p.reports?p.reports+' report(s) ':'')+(p.showInStories?'story':'')));c.appendChild(r)});
+    var again=function(){loadOwner(slug)};
+    var row=el('div','row');
+    row.appendChild(d.suspended?btn('Unsuspend',null,function(){ownerAct(slug,'unsuspend','Unsuspend this account?',again)}):btn('Suspend','danger',function(){ownerAct(slug,'suspend','Suspend this account? It is signed out everywhere and cannot sign in. Pages stay online.',again)}));
+    row.appendChild(d.pendingDeletionAt?btn('Cancel deletion',null,function(){ownerAct(slug,'cancel-delete','Cancel the scheduled deletion?',again)}):btn('Delete account','danger',function(){ownerAct(slug,'delete','Schedule this account for deletion in 30 days and suspend it? The owner cannot cancel by signing in.',again)}));
+    if(d.pages.length)row.appendChild(btn('Take down all live pages','danger',function(){takedownAll(d.pages,again)}));
+    c.appendChild(row);out.appendChild(c)
+  })
+}
+function ownerAct(slug,action,text,done){
+  if(!confirm(text))return;
+  api('/admin/owner/action',{method:'POST',body:{slug:slug,action:action}}).then(function(o){if(o.ok){msg('done');done()}else msg(o.j.error||'failed')})
+}
+function takedownAll(pages,done){
+  if(!confirm('Take down ALL '+pages.length+' live pages of this account and permanently lock their slugs?'))return;
+  var i=0,fails=0;
+  (function step(){
+    if(i>=pages.length){msg(fails?fails+' takedown(s) failed':'All pages taken down');done();return}
+    var s=pages[i++].slug;
+    api('/publish/'+encodeURIComponent(s),{method:'DELETE',body:{adminToken:tok}}).then(function(o){if(!o.ok&&o.s!==404)fails++;step()}).catch(function(){fails++;step()})
+  })()
+}
+
+/* ---------- Ads ---------- */
+function loadAds(reset){
+  if(reset){adOff=0;$('adlist').textContent=''}
+  api('/admin/ads?status='+encodeURIComponent($('adst').value)+'&offset='+adOff).then(function(o){
+    if(!o.ok){bad(o);return}
+    o.j.ads.forEach(renderAd);
+    adOff=o.j.nextOffset;$('admore').style.display=adOff!=null?'':'none';
+    if(!$('adlist').firstChild)msg('No ads')
+  }).catch(function(){msg('network error')})
+}
+function adAct(a,action,refund,text){
+  if(!confirm(text))return;
+  api('/admin/ad',{method:'POST',body:{slug:a.slug,action:action,refund:!!refund}}).then(function(o){
+    if(o.ok){msg(o.j.refunded?o.j.refunded+' views refunded':'done');loadAds(true)}else msg(o.j.error||'failed')})
+}
+function renderAd(a){
+  var c=el('div','card'),h=el('div',null,'/'+a.slug);h.appendChild(el('span','badge',a.status));c.appendChild(h);
+  c.appendChild(el('div','meta',(a.ownerEmail||'account missing')+' - '+a.viewsUsed+' of '+a.viewsTotal+' views - '+a.uniqueViewers+' unique - '+fmt(a.createdAt)));
+  var row=el('div','row'),left=a.viewsTotal-a.viewsUsed;
+  row.appendChild(btn('Lookup',null,function(){openLookup(a.slug)}));
+  if(a.status==='active')row.appendChild(btn('Pause',null,function(){adAct(a,'pause',0,'Pause /'+a.slug+'? It stops being served until resumed.')}));
+  if(a.status==='paused')row.appendChild(btn('Resume',null,function(){adAct(a,'resume',0,'Resume /'+a.slug+'?')}));
+  if(a.status==='active'||a.status==='paused'){
+    row.appendChild(btn('Take down','danger',function(){adAct(a,'takedown',0,'Take the ad /'+a.slug+' down? The page stays online and the '+left+' unused views are forfeited.')}));
+    if(left>0)row.appendChild(btn('Take down + refund','danger',function(){adAct(a,'takedown',1,'Take the ad /'+a.slug+' down and refund '+left+' unused views to the owner?')}))}
+  else if(a.status==='unpublished'&&left>0)row.appendChild(btn('Refund unused','danger',function(){adAct(a,'refund',0,'Refund '+left+' unused views to the owner of /'+a.slug+'? This can only be done once.')}));
+  c.appendChild(row);$('adlist').appendChild(c)
+}
+
+/* ---------- Audit ---------- */
+function loadAudit(reset){
+  if(reset){auNext=null;$('aulist').textContent=''}
+  api('/admin/audit'+(auNext?'?cursor='+encodeURIComponent(auNext):'')).then(function(o){
+    if(!o.ok){bad(o);return}
+    o.j.entries.forEach(function(e){var d=el('div','snap');d.appendChild(document.createTextNode(fmt(e.at)+' - '+e.action+' '));
+      if(e.slug)d.appendChild(btn('/'+e.slug,null,function(){openLookup(e.slug)}));
+      if(e.detail)d.appendChild(document.createTextNode(' - '+e.detail));$('aulist').appendChild(d)});
+    auNext=o.j.nextCursor;$('aumore').style.display=auNext?'':'none';
+    if(!$('aulist').firstChild)msg('No audit entries yet')
+  }).catch(function(){msg('network error')})
+}
+
+/* ---------- Wiring ---------- */
+[].forEach.call(document.querySelectorAll('.tab'),function(b){b.onclick=function(){showTab(b.getAttribute('data-t'))}});
+$('go').onclick=function(){tok=$('tok').value.trim();loadReports(true)};
+$('more').onclick=function(){loadReports(false)};
+$('admore').onclick=function(){loadAds(false)};
+$('aumore').onclick=function(){loadAudit(false)};
+$('adst').onchange=function(){loadAds(true)};
+$('freason').onchange=$('fstatus').onchange=$('fgroup').onchange=renderAll;
+$('fdis').onchange=function(){loadReports(true)};
+$('lkgo').onclick=function(){doLookup($('lkslug').value)};
+$('lkslug').onkeydown=function(e){if(e.key==='Enter')doLookup($('lkslug').value)};
+$('relgo').onclick=function(){release(slugFrom($('relslug').value),function(){$('relslug').value=''})};
+$('purgego').onclick=function(){
+  if(!confirm('Run the purge now? It permanently deletes pages unpublished more than 30 days ago (except held or locked ones) and accounts past their 30-day deletion window.'))return;
+  msg('Purging...');
+  api('/admin/purge',{method:'POST'}).then(function(o){msg(o.ok?'Purge done: '+o.j.purged+' item(s) removed':(o.j.error||'purge failed'))}).catch(function(){msg('network error')})
+};
+if(tok)loadReports(true)
 </script></body></html>`;
 
 /* ---------------- Router ---------------- */
@@ -3518,11 +4035,21 @@ export default {
         if (auth === 'limited') return textError(429, 'too many failed attempts, try again in 5 minutes');
         if (auth !== 'ok') return textError(403, 'invalid admin token');
         const purged = await handlePurge(env);
+        await audit(env, 'purge', null, purged + ' removed');
         return json({ ok: true, purged });
       }
       if (method === 'GET' && pathname === '/admin') return handleAdminPage();
       if (method === 'GET' && pathname === '/admin/reports') return handleAdminReports(env, request, url);
       if (method === 'GET' && pathname === '/admin/img') return handleAdminImage(env, request, url);
+      if (method === 'GET' && pathname === '/admin/lookup') return handleAdminLookup(env, request, url);
+      if (method === 'GET' && pathname === '/admin/owner') return handleAdminOwner(env, request, url);
+      if (method === 'GET' && pathname === '/admin/ads') return handleAdminAds(env, request, url);
+      if (method === 'GET' && pathname === '/admin/audit') return handleAdminAudit(env, request, url);
+      if (method === 'POST' && pathname === '/admin/owner/action') return handleAdminOwnerAction(env, request);
+      if (method === 'POST' && pathname === '/admin/story') return handleAdminStory(env, request);
+      if (method === 'POST' && pathname === '/admin/ad') return handleAdminAd(env, request);
+      if (method === 'POST' && pathname === '/admin/ncmec') return handleAdminNcmec(env, request);
+      if (method === 'POST' && pathname === '/admin/undismiss') return handleAdminUndismiss(env, request);
       if (method === 'POST' && pathname === '/admin/dismiss') return handleAdminDismiss(env, request);
       if (method === 'GET' && pathname.startsWith('/admin/snapshot/')) {
         const rest = pathname.slice('/admin/snapshot/'.length).split('/');
