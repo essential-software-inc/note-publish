@@ -85,6 +85,12 @@ const RESERVED_SLUGS = new Set([
   'auth', 'sync', 'my'
 ]);
 const SOFT_DELETE_RETENTION_MS = 30 * 24 * 60 * 60 * 1000; // 30 days, plan §3.5
+// CSAM-reported pages and their report records are held for 18 months (548 days),
+// counted from the report (or, for dismissed report records, from dismissal). 18 U.S.C.
+// § 2258A(h) requires preservation for 1 year from the NCMEC CyberTipline submission;
+// the extra 6 months covers the gap between a report arriving and the manual NCMEC filing.
+const CSAM_RETENTION_MS = 548 * 24 * 60 * 60 * 1000;
+const CSAM_HOLD_PREFIX = 'csamhold:'; // SLUGS key: csamhold:<slug> = {until, etag}, auto-expires via KV TTL
 const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days — re-issued on every successful /auth/google, not sliding
 const MAX_VIEWER_ID_LEN = 200; // client sends a UUID-ish string; generous cap against abuse, not a format check
 
@@ -977,7 +983,9 @@ async function handleUnpublish(env, request, slug) {
   // needs a slug's token at all.
   let isAdminTakedown = false;
   if (typeof adminToken === 'string' && adminToken && env.ADMIN_TOKEN) {
-    if (!timingSafeEqual(adminToken, env.ADMIN_TOKEN)) return textError(403, 'invalid admin token');
+    const auth = await adminAuthOk(env, request, adminToken);
+    if (auth === 'limited') return textError(429, 'too many failed attempts, try again in 5 minutes');
+    if (auth !== 'ok') return textError(403, 'invalid admin token');
     isAdminTakedown = true;
   } else {
     if (typeof token !== 'string' || !token) return textError(401, 'missing token');
@@ -997,7 +1005,8 @@ async function handleUnpublish(env, request, slug) {
   const liveObj = await env.NOTES_BUCKET.get(slug + '.html');
   if (liveObj) {
     await env.NOTES_BUCKET.put(`deleted/${slug}/${now}.html`, liveObj.body, {
-      httpMetadata: { contentType: 'text/html; charset=utf-8' }
+      httpMetadata: { contentType: 'text/html; charset=utf-8' },
+      customMetadata: { source: isAdminTakedown ? 'takedown' : 'unpublish' }
     });
   }
 
@@ -1536,7 +1545,7 @@ async function handleSubscribe(env, request, authorParam) {
   if (!authorParam) return textError(400, 'missing author');
   const authorSub = await resolveAuthorParam(env, authorParam);
   if (!authorSub) return textError(404, 'author not found');
-  if (authorSub === sub) return textError(400, "can't subscribe to yourself");
+  if (authorSub === sub) return textError(400, 'can\u2019t subscribe to yourself');
   return applySubscription(env, request, sub, authorSub, true);
 }
 
@@ -1652,8 +1661,8 @@ async function handleLike(env, request, slug) {
   { const limited = await accountRateLimitResponse(env, sub, 'like'); if (limited) return limited; }
   if (!validSlug(slug)) return textError(400, 'invalid slug');
   const meta = await getMeta(env, slug);
-  if (!meta || meta.deletedAt || meta.adminLocked) return textError(404, "note isn't available");
-  if (meta.ownerSub && meta.ownerSub === sub) return textError(400, "can't like your own note");
+  if (!meta || meta.deletedAt || meta.adminLocked) return textError(404, 'note isn\u2019t available');
+  if (meta.ownerSub && meta.ownerSub === sub) return textError(400, 'can\u2019t like your own note');
   const t = actionTime(request);
   await env.ADS_DB.batch([
     clockUpsert(env, sub, 'like', slug, t),
@@ -1683,6 +1692,16 @@ async function handleUnlike(env, request, slug) {
 }
 
 const SUBSCRIPTIONS_FEED_PAGE_SIZE = 20;
+// Size of the whole list, sent with a list's first page only (no cursor) so the app can show
+// "Library (N)" without paging through everything. Best effort: a failed count omits the field
+// and the app falls back to counting what it has loaded.
+async function listTotal(env, sql, params) {
+  try {
+    const row = await env.ADS_DB.prepare(sql).bind(...params).first();
+    const n = row && Number(row.c);
+    return Number.isFinite(n) ? n : undefined;
+  } catch (e) { return undefined; }
+}
 
 // GET /account/liked-notes — the "Liked" tab: every live note this account has
 // liked, newest like first, shaped like a Subscribed-feed card so the app renders
@@ -1766,7 +1785,10 @@ async function handleMyStories(env, request) {
   const authorId = (await authorIdsFor(env, [sub]))[sub] || null;
   const origin = url.origin;
   const last = results[results.length - 1];
+  const total = cursorParam ? undefined : await listTotal(env,
+    'SELECT COUNT(*) AS c FROM stories WHERE author_sub = ? AND created_at >= ?', [sub, cutoff]);
   return json({
+    total,
     stories: results.map(r => {
       const card = expandStoryImageUrls(origin, r.slug, r.image_urls);
       return {
@@ -1861,7 +1883,10 @@ async function handlePublishedNotes(env, request) {
     });
   }
   const last = results[results.length - 1];
+  const total = cursorParam ? undefined : await listTotal(env,
+    'SELECT COUNT(*) AS c FROM published_notes WHERE author_sub = ?', [sub]);
   return json({
+    total,
     stories: out,
     nextCursor: (last && results.length === SUBSCRIPTIONS_FEED_PAGE_SIZE) ? `${last.created_at}:${last.slug}` : null
   });
@@ -1918,7 +1943,10 @@ async function handleLikedNotes(env, request) {
 
   const origin = url.origin;
   const last = results[results.length - 1];
+  const total = cursorParam ? undefined : await listTotal(env,
+    'SELECT COUNT(*) AS c FROM likes WHERE liker_sub = ?', [sub]);
   return json({
+    total,
     stories: rows.map(({ r, meta, authorSub, isStory, imgJson }) => {
       const card = imgJson ? expandStoryImageUrls(origin, r.slug, imgJson) : { images: [], count: 0 };
       return {
@@ -2005,7 +2033,11 @@ async function handleSubscriptionsFeed(env, request) {
 
   const origin = new URL(request.url).origin;
   const last = results[results.length - 1];
+  const total = cursorParam ? undefined : await listTotal(env,
+    `SELECT COUNT(*) AS c FROM stories s
+       JOIN subscriptions sub ON sub.author_sub = s.author_sub AND sub.subscriber_sub = ? AND s.created_at >= sub.created_at`, [sub]);
   return json({
+    total,
     stories: results.map(r => {
       const card = expandStoryImageUrls(origin, r.slug, r.image_urls);
       return {
@@ -2069,25 +2101,88 @@ async function handleServe(env, slug) {
 // perfectly accurate (the window slides forward on every report within it,
 // so sustained abuse can delay the reset), but enough to stop naive
 // spam/DoS against this endpoint and the Slack webhook it can trigger.
+//
+// CSAM reports get their own, much higher bucket: a legitimate reporter on a
+// shared IP (carrier NAT, school network) must not be locked out of an urgent
+// report by other people's traffic, but the endpoint still can't be hammered
+// without bound.
 const REPORT_RATE_LIMIT_MAX = 5;
+const REPORT_RATE_LIMIT_CSAM_MAX = 30;
 const REPORT_RATE_LIMIT_WINDOW_S = 60;
-async function checkReportRateLimit(env, ip) {
-  const key = 'ratelimit:report:' + ip;
+// At most one webhook alert per slug per this window (non-CSAM only — CSAM
+// alerts are never throttled). Reports are still stored either way.
+const REPORT_ALERT_THROTTLE_S = 300;
+const REPORT_BODY_MAX_BYTES = 8192;
+// Report keys: "rpt:<13-digit inverted ms timestamp>:<slug>:<8 hex>". The
+// inverted timestamp makes KV's lexicographic list order newest-first, so the
+// admin page can paginate with the KV cursor instead of scanning everything.
+// The random suffix prevents two reports in the same millisecond overwriting
+// each other. Older records use the legacy "report:<slug>:<ms>" format; the
+// admin list still reads them (after the new ones) until they're dismissed.
+const REPORT_KEY_PREFIX = 'rpt:';
+const REPORT_TS_MAX = 9999999999999;
+const REPORT_KEY_RE = /^rpt:(\d{13}):([a-z0-9-]{3,48}):[a-f0-9]{8}$/;
+const REPORT_LEGACY_KEY_RE = /^report:([a-z0-9-]{3,48}):(\d+)$/;
+const REPORT_DISMISSED_CSAM_TTL_S = Math.ceil(CSAM_RETENTION_MS / 1000);
+
+function makeReportKey(slug, ts) {
+  return REPORT_KEY_PREFIX + String(REPORT_TS_MAX - ts).padStart(13, '0')
+    + ':' + slug + ':' + crypto.randomUUID().slice(0, 8);
+}
+
+async function checkReportRateLimit(env, ip, isCsam) {
+  const key = (isCsam ? 'ratelimit:reportcsam:' : 'ratelimit:report:') + ip;
+  const max = isCsam ? REPORT_RATE_LIMIT_CSAM_MAX : REPORT_RATE_LIMIT_MAX;
   const raw = await env.REPORTS.get(key);
   const count = raw ? (parseInt(raw, 10) || 0) : 0;
-  if (count >= REPORT_RATE_LIMIT_MAX) return false;
+  if (count >= max) return false;
   await env.REPORTS.put(key, String(count + 1), { expirationTtl: REPORT_RATE_LIMIT_WINDOW_S });
   return true;
 }
 
-async function handleReport(env, request, slug) {
+async function sendReportAlert(env, request, record) {
+  try {
+    if (!record.isCsam) {
+      const tKey = 'ratelimit:reportalert:' + record.slug;
+      if (await env.REPORTS.get(tKey)) return; // already alerted recently for this slug
+      await env.REPORTS.put(tKey, '1', { expirationTtl: REPORT_ALERT_THROTTLE_S });
+    }
+    // Slack (and most incoming-webhook consumers) require a top-level
+    // "text" field to render anything at all — a raw JSON dump of
+    // `record` with no "text" key gets silently rejected with
+    // invalid_payload, which is exactly the kind of failure the catch
+    // below would swallow without a trace. `record` itself is untouched
+    // and still what gets stored in KV either way.
+    const origin = new URL(request.url).origin;
+    const summary = `New report for /${record.slug}${record.isCsam ? ' — CSAM' : ''}\n`
+      + `Page: ${origin}/@${record.slug}\n`
+      + `Review: ${origin}/admin\n`
+      + `Reason: ${record.reason}\n`
+      + `Details: ${record.details || '(none provided)'}`;
+    await fetch(env.REPORT_WEBHOOK_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: summary })
+    });
+  } catch (e) {
+    // Don't fail the report just because alerting failed — the record is
+    // already durably stored in KV either way.
+  }
+}
+
+async function handleReport(env, request, slug, ctx) {
   if (!SLUG_RE.test(slug)) return textError(400, 'invalid slug');
   const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
-  if (!(await checkReportRateLimit(env, ip))) {
-    return textError(429, 'too many reports from this address. Try again in a minute');
-  }
+  // Read the body first: the rate-limit bucket depends on the reason (CSAM
+  // reports get the higher limit). Size-capped so this can't be used to make
+  // the Worker buffer huge bodies.
+  const declared = parseInt(request.headers.get('Content-Length') || '0', 10) || 0;
+  if (declared > REPORT_BODY_MAX_BYTES) return textError(413, 'report too large');
+  let raw;
+  try { raw = await request.text(); } catch (e) { return textError(400, 'invalid body'); }
+  if (raw.length > REPORT_BODY_MAX_BYTES) return textError(413, 'report too large');
   let body;
-  try { body = await request.json(); } catch (e) { return textError(400, 'invalid JSON body'); }
+  try { body = JSON.parse(raw); } catch (e) { return textError(400, 'invalid JSON body'); }
   const reason = typeof body?.reason === 'string' ? body.reason.slice(0, 40) : 'other';
   const details = typeof body?.details === 'string' ? body.details.slice(0, 2000) : '';
   // CSAM is split into its own category deliberately (plan §5.1/§5.2): it is
@@ -2095,34 +2190,50 @@ async function handleReport(env, request, slug) {
   // reported to NCMEC's CyberTipline and the content preserved rather than
   // deleted — that response path is a legal/operational process outside
   // this Worker, not something to automate away here.
-  const record = {
-    slug, reason, details,
-    isCsam: reason === 'csam',
-    reportedAt: Date.now()
-  };
-  const key = 'report:' + slug + ':' + record.reportedAt;
-  await env.REPORTS.put(key, JSON.stringify(record));
+  const isCsam = reason === 'csam';
+  if (!(await checkReportRateLimit(env, ip, isCsam))) {
+    return textError(429, 'too many reports from this address. Try again in a minute');
+  }
+  // Reject reports for slugs that were never published, so junk records and
+  // alerts can't be generated for made-up slugs. (Unpublished and
+  // taken-down slugs keep their metadata and stay reportable.)
+  if (!(await getMeta(env, slug))) return textError(404, 'page not found');
+
+  const record = { slug, reason, details, isCsam, reportedAt: Date.now() };
+  await env.REPORTS.put(makeReportKey(slug, record.reportedAt), JSON.stringify(record));
+  // CSAM report: snapshot the page, and hold this slug's deleted/ snapshots (and root object)
+  // out of the purge job for CSAM_RETENTION_MS. Kept in its own key so it survives the slug's KV metadata being
+  // purged. A newer report re-arms the full window.
+  if (isCsam) {
+    // Snapshot the live page now, so an owner edit/republish before takedown can't overwrite
+    // the reported content. Skipped when the page is unchanged since the last CSAM report
+    // (same etag), so repeated reports don't pile up copies. Best-effort: a failure here
+    // must not lose the report or its hold.
+    let etag = null;
+    try {
+      let prev = null;
+      try { prev = JSON.parse(await env.SLUGS.get(CSAM_HOLD_PREFIX + slug)); } catch (e) {}
+      const head = await env.NOTES_BUCKET.head(slug + '.html');
+      etag = head ? head.etag : null;
+      if (head && !(prev && prev.etag === etag)) {
+        const liveObj = await env.NOTES_BUCKET.get(slug + '.html');
+        if (liveObj) {
+          await env.NOTES_BUCKET.put(`deleted/${slug}/${record.reportedAt}.html`, liveObj.body, {
+            httpMetadata: { contentType: 'text/html; charset=utf-8' },
+            customMetadata: { source: 'report' }
+          });
+        }
+      }
+    } catch (e) { console.log('csam snapshot failed: ' + (e && e.message)); etag = null; }
+    await env.SLUGS.put(CSAM_HOLD_PREFIX + slug,
+      JSON.stringify({ until: record.reportedAt + CSAM_RETENTION_MS, etag }),
+      { expirationTtl: Math.ceil(CSAM_RETENTION_MS / 1000) });
+  }
 
   if (env.REPORT_WEBHOOK_URL) {
-    try {
-      // Slack (and most incoming-webhook consumers) require a top-level
-      // "text" field to render anything at all — a raw JSON dump of
-      // `record` with no "text" key gets silently rejected with
-      // invalid_payload, which is exactly the kind of failure the catch
-      // below would swallow without a trace. `record` itself is untouched
-      // and still what gets stored in KV either way.
-      const summary = `New report for /${slug}${record.isCsam ? ' — CSAM' : ''}\n`
-        + `Reason: ${reason}\n`
-        + `Details: ${details || '(none provided)'}`;
-      await fetch(env.REPORT_WEBHOOK_URL, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text: summary })
-      });
-    } catch (e) {
-      // Don't fail the report just because alerting failed — the record is
-      // already durably stored in KV either way.
-    }
+    // Off the reporter's critical path: the response doesn't wait on Slack.
+    const task = sendReportAlert(env, request, record);
+    if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(task); else await task;
   }
   return json({ ok: true });
 }
@@ -2133,6 +2244,10 @@ async function handleReport(env, request, slug) {
 // to the cron trigger declared in wrangler.toml via the scheduled() export
 // below — GET/POST/etc. traffic never touches this, only Cloudflare's
 // scheduler does.
+async function isCsamHeld(env, slug) {
+  return (await env.SLUGS.get(CSAM_HOLD_PREFIX + slug)) !== null;
+}
+
 async function handlePurge(env) {
   const cutoff = Date.now() - SOFT_DELETE_RETENTION_MS;
   let purged = 0;
@@ -2147,6 +2262,8 @@ async function handlePurge(env) {
       try { meta = JSON.parse(raw); } catch (e) { continue; }
       if (!meta.deletedAt || meta.deletedAt >= cutoff) continue;
       const slug = key.name.slice('slug:'.length);
+      // CSAM-reported: leave the object, metadata and lock alone until the hold expires.
+      if (await isCsamHeld(env, slug)) continue;
       // adminLocked slugs stay soft-deleted forever on purpose (see
       // handleUnpublish) — clearing the KV entry here would silently
       // reopen a DMCA/CSAM/abuse takedown for reclaim. The lock itself
@@ -2175,6 +2292,8 @@ async function handlePurge(env) {
       const match = obj.key.match(/\/(\d+)\.html$/);
       const ts = match ? parseInt(match[1], 10) : NaN;
       if (!Number.isFinite(ts) || ts >= cutoff) continue;
+      const snapSlug = obj.key.split('/')[1];
+      if (snapSlug && await isCsamHeld(env, snapSlug)) continue; // CSAM hold: keep the snapshot
       await env.NOTES_BUCKET.delete(obj.key);
       purged++;
     }
@@ -2800,10 +2919,431 @@ async function handleAdView(env, request, slug) {
   return json({ ok: true, counted: !!row, ...(row || {}) });
 }
 
+/* ---------------- Admin takedown UI ---------------- */
+// GET /admin serves a small single-file page; GET /admin/reports lists
+// stored reports (newest first, cursor-paginated) behind the ADMIN_TOKEN, sent in the
+// X-Admin-Token header; POST /admin/dismiss clears a handled report. The page's Take down button calls the existing
+// DELETE /publish/:slug admin path, so takedown semantics (snapshot to
+// deleted/, permanent adminLocked) are unchanged. The token is kept in
+// sessionStorage only (cleared when the tab closes).
+const ADMIN_PAGE_SIZE = 30; // keeps GETs per request well under the free-plan subrequest cap
+
+async function adminAuthOk(env, request, providedOverride) {
+  const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
+  const rlKey = 'ratelimit:adminfail:' + ip;
+  const fails = parseInt((await env.REPORTS.get(rlKey)) || '0', 10) || 0;
+  if (fails >= 10) return 'limited';
+  const provided = providedOverride || request.headers.get('X-Admin-Token') || '';
+  if (env.ADMIN_TOKEN && provided && timingSafeEqual(provided, env.ADMIN_TOKEN)) return 'ok';
+  await env.REPORTS.put(rlKey, String(fails + 1), { expirationTtl: 300 });
+  return 'denied';
+}
+
+// Cursor format: "<phase>:<kv cursor>" where phase "n" walks the current
+// "rpt:" keys (already newest-first) and "l" then walks legacy "report:" keys.
+// Empty/absent = start. Dismissed records are skipped, so a page can come
+// back with fewer than ADMIN_PAGE_SIZE rows (or none) while nextCursor is
+// still set; the client keeps loading until it has rows or the list ends.
+async function handleAdminReports(env, request, url) {
+  const auth = await adminAuthOk(env, request);
+  if (auth === 'limited') return textError(429, 'too many failed attempts, try again in 5 minutes');
+  if (auth !== 'ok') return textError(403, 'invalid admin token');
+  let phase = 'n', kvCursor;
+  const cursorParam = url.searchParams.get('cursor') || '';
+  if (cursorParam) {
+    const m = cursorParam.match(/^([nl]):(.*)$/s);
+    if (!m) return textError(400, 'invalid cursor');
+    phase = m[1]; kvCursor = m[2] || undefined;
+  }
+  const items = [];
+  let done = false;
+  while (items.length < ADMIN_PAGE_SIZE && !done) {
+    const page = await env.REPORTS.list({
+      prefix: phase === 'n' ? REPORT_KEY_PREFIX : 'report:',
+      cursor: kvCursor,
+      limit: ADMIN_PAGE_SIZE - items.length
+    });
+    for (const k of page.keys) {
+      if (phase === 'n') {
+        const m = k.name.match(REPORT_KEY_RE);
+        if (m) items.push({ key: k.name, slug: m[2], ts: REPORT_TS_MAX - parseInt(m[1], 10) });
+      } else {
+        const m = k.name.match(REPORT_LEGACY_KEY_RE);
+        if (m) items.push({ key: k.name, slug: m[1], ts: parseInt(m[2], 10) });
+      }
+    }
+    if (page.list_complete) {
+      if (phase === 'n') { phase = 'l'; kvCursor = undefined; } else done = true;
+    } else {
+      kvCursor = page.cursor;
+    }
+  }
+  const nextCursor = done ? null : phase + ':' + (kvCursor || '');
+  const rows = await Promise.all(items.map(async (it) => {
+    let rec = null;
+    try { rec = JSON.parse(await env.REPORTS.get(it.key)); } catch (e) {}
+    if (rec && rec.dismissedAt) return null;
+    const meta = await getMeta(env, it.slug);
+    return {
+      key: it.key, slug: it.slug, reportedAt: it.ts,
+      reason: rec ? rec.reason : '?', details: rec ? rec.details : '',
+      isCsam: !!(rec && rec.isCsam),
+      status: !meta ? 'missing' : meta.adminLocked ? 'taken down' : meta.deletedAt ? 'unpublished' : 'live'
+    };
+  }));
+  return json({ reports: rows.filter(Boolean), nextCursor });
+}
+
+// POST /admin/dismiss {key}: clears a handled/bogus report from the list.
+// Ordinary reports are deleted. CSAM reports are kept (marked dismissedAt,
+// hidden from the list, auto-expiring after 18 months) so there's still a
+// record if one is ever needed for the NCMEC/legal process. The key is
+// validated against the two report key formats so this can't be pointed at
+// other keys in the namespace (rate-limit counters etc).
+async function handleAdminDismiss(env, request) {
+  const auth = await adminAuthOk(env, request);
+  if (auth === 'limited') return textError(429, 'too many failed attempts, try again in 5 minutes');
+  if (auth !== 'ok') return textError(403, 'invalid admin token');
+  let body;
+  try { body = await request.json(); } catch (e) { return textError(400, 'invalid JSON body'); }
+  const key = typeof body?.key === 'string' ? body.key : '';
+  if (!REPORT_KEY_RE.test(key) && !REPORT_LEGACY_KEY_RE.test(key)) return textError(400, 'invalid report key');
+  const raw = await env.REPORTS.get(key);
+  if (raw === null) return json({ ok: true }); // already gone
+  let rec = null;
+  try { rec = JSON.parse(raw); } catch (e) {}
+  if (rec && rec.isCsam) {
+    rec.dismissedAt = Date.now();
+    await env.REPORTS.put(key, JSON.stringify(rec), { expirationTtl: REPORT_DISMISSED_CSAM_TTL_S });
+  } else {
+    await env.REPORTS.delete(key);
+  }
+  return json({ ok: true });
+}
+
+// GET /admin/snapshots/:slug: lists the deleted/<slug>/<ms>.html copies with
+// their timestamp and (for copies written after tagging was added) source:
+// 'report' | 'unpublish' | 'takedown'. Older copies come back as 'unknown'.
+// Called on demand from the admin page's Snapshots button so the reports list
+// itself doesn't pay an R2 list per row.
+async function handleAdminSnapshots(env, request, slug) {
+  const auth = await adminAuthOk(env, request);
+  if (auth === 'limited') return textError(429, 'too many failed attempts, try again in 5 minutes');
+  if (auth !== 'ok') return textError(403, 'invalid admin token');
+  if (!SLUG_RE.test(slug)) return textError(400, 'invalid slug');
+  const out = [];
+  let cursor;
+  for (let i = 0; i < 5; i++) { // 5 pages x 1000 is far more than one slug will ever have
+    const listed = await env.NOTES_BUCKET.list({
+      prefix: 'deleted/' + slug + '/', cursor, include: ['customMetadata']
+    });
+    for (const obj of listed.objects) {
+      const m = obj.key.match(/\/(\d+)\.html$/);
+      if (!m) continue;
+      out.push({
+        ts: parseInt(m[1], 10),
+        source: (obj.customMetadata && obj.customMetadata.source) || 'unknown',
+        size: obj.size
+      });
+    }
+    if (!listed.truncated) break;
+    cursor = listed.cursor;
+  }
+  out.sort((a, b) => b.ts - a.ts);
+  return json({ snapshots: out });
+}
+
+// GET /admin/snapshot/:slug/:ts: returns one deleted/<slug>/<ts>.html copy as
+// inert text/plain (never rendered by the browser on its own, locked-down CSP,
+// admin token required). The admin page shows it inside a fully sandboxed
+// iframe; see the View button in ADMIN_PAGE_HTML.
+async function handleAdminSnapshotGet(env, request, slug, ts) {
+  const auth = await adminAuthOk(env, request);
+  if (auth === 'limited') return textError(429, 'too many failed attempts, try again in 5 minutes');
+  if (auth !== 'ok') return textError(403, 'invalid admin token');
+  if (!SLUG_RE.test(slug)) return textError(400, 'invalid slug');
+  if (!/^\d{10,16}$/.test(ts)) return textError(400, 'invalid timestamp');
+  const obj = await env.NOTES_BUCKET.get('deleted/' + slug + '/' + ts + '.html');
+  if (!obj) return textError(404, 'snapshot not found');
+  return new Response(obj.body, {
+    headers: {
+      'Content-Type': 'text/plain; charset=utf-8',
+      'Content-Security-Policy': "default-src 'none'; sandbox",
+      'Cache-Control': 'no-store',
+      'X-Content-Type-Options': 'nosniff',
+      'Referrer-Policy': 'no-referrer'
+    }
+  });
+}
+
+async function handleAdminRestore(env, request, slug) {
+  const auth = await adminAuthOk(env, request);
+  if (auth === 'limited') return textError(429, 'too many failed attempts, try again in 5 minutes');
+  if (auth !== 'ok') return textError(403, 'invalid admin token');
+  if (!SLUG_RE.test(slug)) return textError(400, 'invalid slug');
+  const meta = await getMeta(env, slug);
+  if (!meta) return textError(404, 'not found');
+  if (!meta.adminLocked || !meta.deletedAt) return textError(409, 'slug is not admin-taken-down');
+  // The live object survives a takedown until the 30-day purge; if it is
+  // already gone, fall back to the newest pre-takedown snapshot under deleted/.
+  if (!(await env.NOTES_BUCKET.head(slug + '.html'))) {
+    let best = null;
+    const listed = await env.NOTES_BUCKET.list({ prefix: 'deleted/' + slug + '/' });
+    for (const obj of listed.objects) {
+      const m = obj.key.match(/\/(\d+)\.html$/);
+      const ts = m ? parseInt(m[1], 10) : NaN;
+      if (Number.isFinite(ts) && (!best || ts > best.ts)) best = { ts, key: obj.key };
+    }
+    if (!best) return textError(409, 'content no longer exists (past retention); cannot restore');
+    const snap = await env.NOTES_BUCKET.get(best.key);
+    if (!snap) return textError(409, 'snapshot missing; cannot restore');
+    await env.NOTES_BUCKET.put(slug + '.html', snap.body, { httpMetadata: { contentType: 'text/html; charset=utf-8' } });
+  }
+  delete meta.deletedAt;
+  delete meta.adminLocked;
+  // Story rows, story images and likes were deleted at takedown and are not
+  // recoverable, so the page comes back as a plain page, not a story.
+  meta.showInStories = false;
+  await putMeta(env, slug, meta);
+  if (meta.ownerSub) {
+    await env.SLUGS.put('owner:' + meta.ownerSub + ':' + slug, '1');
+    await env.ADS_DB.prepare('INSERT OR REPLACE INTO published_notes (slug, author_sub, created_at) VALUES (?, ?, ?)')
+      .bind(slug, meta.ownerSub, meta.createdAt || Date.now()).run();
+  }
+  return json({ ok: true });
+}
+
+// GET /admin/img?u=<https url>: admin-only image fetch-through. The admin page
+// uses this so external images in a snapshot preview load from the worker, not
+// from the admin's browser (hosts see Cloudflare, not the admin's IP). It is an
+// outbound-request endpoint, so it is deliberately narrow: admin token required;
+// https on port 443 only; hostnames only (no IP literals, localhost, or
+// single-label/internal names); no credentials in the URL; redirects followed
+// manually (max 3) with every hop re-validated; 8 s timeout; 5 MB cap; and only
+// raster image content types come back (no SVG/HTML). No cookies or Referer are
+// sent. The response is inert (nosniff, default-src 'none', no-store).
+const ADMIN_IMG_MAX_BYTES = 5 * 1024 * 1024;
+const ADMIN_IMG_TYPES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp', 'image/avif', 'image/bmp']);
+
+function adminImgTargetOk(u) {
+  if (u.protocol !== 'https:') return false;
+  if (u.username || u.password) return false;
+  if (u.port && u.port !== '443') return false;
+  const h = u.hostname.toLowerCase().replace(/\.$/, '');
+  if (!/^[a-z0-9.-]+$/.test(h)) return false;          // also rejects IPv6 literals
+  if (!h.includes('.')) return false;                  // single-label / intranet names
+  if (/^\d+(\.\d+){0,3}$/.test(h)) return false;       // IPv4 literals (incl. short forms)
+  if (/^0x/i.test(h.split('.').pop())) return false;   // hex-form IPs
+  if (h === 'localhost' || /\.(localhost|local|internal|lan|home|corp|intranet)$/.test(h)) return false;
+  return true;
+}
+
+async function handleAdminImage(env, request, url) {
+  const auth = await adminAuthOk(env, request);
+  if (auth === 'limited') return textError(429, 'too many failed attempts, try again in 5 minutes');
+  if (auth !== 'ok') return textError(403, 'invalid admin token');
+  let cur;
+  try { cur = new URL(url.searchParams.get('u') || ''); } catch (e) { return textError(400, 'invalid url'); }
+  if (cur.href.length > 2048) return textError(400, 'url too long');
+  let res = null;
+  for (let hop = 0; hop < 4; hop++) {
+    if (!adminImgTargetOk(cur)) return textError(400, 'url not allowed');
+    try {
+      res = await fetch(cur.href, {
+        method: 'GET',
+        redirect: 'manual',
+        headers: { 'Accept': 'image/*', 'User-Agent': 'Mozilla/5.0 (compatible; NoteAdminPreview)' },
+        signal: AbortSignal.timeout(8000)
+      });
+    } catch (e) { return textError(502, 'fetch failed'); }
+    if (res.status >= 300 && res.status < 400 && res.headers.get('Location')) {
+      try { cur = new URL(res.headers.get('Location'), cur); } catch (e) { return textError(502, 'bad redirect'); }
+      try { await res.body?.cancel(); } catch (e) {}
+      res = null;
+      continue;
+    }
+    break;
+  }
+  if (!res) return textError(502, 'too many redirects');
+  if (!res.ok) return textError(502, 'upstream ' + res.status);
+  const type = (res.headers.get('Content-Type') || '').split(';')[0].trim().toLowerCase();
+  if (!ADMIN_IMG_TYPES.has(type)) return textError(415, 'not a supported image type');
+  const declared = parseInt(res.headers.get('Content-Length') || '0', 10) || 0;
+  if (declared > ADMIN_IMG_MAX_BYTES) return textError(413, 'image too large');
+  const reader = res.body.getReader();
+  const chunks = [];
+  let total = 0;
+  for (;;) {
+    let r;
+    try { r = await reader.read(); } catch (e) { return textError(502, 'read failed'); }
+    if (r.done) break;
+    total += r.value.byteLength;
+    if (total > ADMIN_IMG_MAX_BYTES) { try { await reader.cancel(); } catch (e) {} return textError(413, 'image too large'); }
+    chunks.push(r.value);
+  }
+  return new Response(new Blob(chunks, { type }), {
+    headers: {
+      'Content-Type': type,
+      'Content-Security-Policy': "default-src 'none'; sandbox",
+      'Cache-Control': 'no-store',
+      'X-Content-Type-Options': 'nosniff',
+      'Referrer-Policy': 'no-referrer'
+    }
+  });
+}
+
+function handleAdminPage() {
+  return new Response(ADMIN_PAGE_HTML, {
+    headers: {
+      'Content-Type': 'text/html; charset=utf-8',
+      'Content-Security-Policy': "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; connect-src 'self'; base-uri 'none'; form-action 'none'",
+      'Cache-Control': 'no-store',
+      'X-Content-Type-Options': 'nosniff',
+      'Referrer-Policy': 'no-referrer'
+    }
+  });
+}
+
+const ADMIN_PAGE_HTML = `<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex">
+<title>Reports</title><style>
+body{font:15px/1.4 system-ui,sans-serif;margin:0;padding:14px;background:#111;color:#eee}
+h1{font-size:18px;margin:0 0 12px}input,button{font:inherit;padding:10px 12px;border-radius:8px;border:1px solid #444;background:#222;color:#eee}
+input{width:100%;box-sizing:border-box;margin-bottom:8px}button{cursor:pointer}
+.card{border:1px solid #333;border-radius:10px;padding:12px;margin:10px 0;background:#1a1a1a}
+.csam{border-color:#c33}.badge{display:inline-block;padding:1px 8px;border-radius:99px;font-size:12px;background:#333;margin-left:6px}
+.badge.c{background:#c33}.row{display:flex;gap:8px;margin-top:10px;flex-wrap:wrap}.danger{background:#a22;border-color:#a22}
+.meta{color:#999;font-size:13px}.snap{font-size:13px;margin-top:8px;padding-top:8px;border-top:1px solid #333}.snap div{margin:4px 0}.snap .hit{color:#fc6}.snap code{color:#999}#imgs,#ext{width:auto;margin:0 6px 0 0;padding:0}.opt{display:block;margin:0 0 10px;color:#bbb;font-size:13px}.d{white-space:pre-wrap;word-break:break-word;margin:6px 0}#msg{margin:8px 0;color:#f88}
+a{color:#8bf}</style></head><body><h1>Reports</h1>
+<div id="login"><input id="tok" type="password" placeholder="Admin token" autocomplete="off"><button id="go">Load reports</button></div>
+<label class="opt"><input type="checkbox" id="imgs">Load embedded (data:) images in snapshot previews. Off by default.</label>
+<label class="opt"><input type="checkbox" id="ext">Also load external (https) images, fetched through the worker so the image hosts see the worker, not your IP. Off by default.</label>
+<div id="msg"></div><div id="list"></div><button id="more" style="display:none">Load more</button>
+<script>
+var tok=sessionStorage.getItem('adm')||'',next=null,shown=0;
+var $=function(i){return document.getElementById(i)};
+function msg(t){$('msg').textContent=t||''}
+function el(t,c,x){var e=document.createElement(t);if(c)e.className=c;if(x!=null)e.textContent=x;return e}
+function load(reset){
+  if(reset){$('list').textContent='';next=null;shown=0}
+  fetch('/admin/reports'+(next?'?cursor='+encodeURIComponent(next):''),{headers:{'X-Admin-Token':tok}}).then(function(r){return r.json().then(function(j){return{ok:r.ok,j:j}})}).then(function(o){
+    if(!o.ok){msg(o.j.error||'failed');sessionStorage.removeItem('adm');$('login').style.display='';return}
+    sessionStorage.setItem('adm',tok);$('login').style.display='none';
+    o.j.reports.forEach(render);shown+=o.j.reports.length;next=o.j.nextCursor;
+    $('more').style.display=next?'':'none';
+    if(!o.j.reports.length&&next){load(false);return}
+    msg(shown?shown+' report(s) shown'+(next?' so far':''):'No open reports')
+  }).catch(function(){msg('network error')})
+}
+function render(r){
+  var c=el('div','card'+(r.isCsam?' csam':''));
+  var h=el('div',null,'/'+r.slug);var b=el('span','badge'+(r.isCsam?' c':''),r.reason);h.appendChild(b);h.appendChild(el('span','badge',r.status));c.appendChild(h);
+  c.appendChild(el('div','meta',new Date(r.reportedAt).toLocaleString()));
+  c.appendChild(el('div','d',r.details||'(no details)'));
+  var row=el('div','row');var a=el('a',null,'View page');a.href='/@'+r.slug;a.target='_blank';a.rel='noopener';row.appendChild(a);
+  if(r.status==='live'){row.appendChild(mkTake(r,c))}
+  if(r.status==='taken down'){row.appendChild(mkRestore(r,c))}
+  row.appendChild(mkSnaps(r,c));
+  row.appendChild(mkDismiss(r,c));
+  c.appendChild(row);$('list').appendChild(c)
+}
+function mkSnaps(r,card){var t=el('button',null,'Snapshots');var box=null;t.onclick=function(){
+  if(box){box.remove();box=null;return}
+  t.disabled=true;
+  fetch('/admin/snapshots/'+encodeURIComponent(r.slug),{headers:{'X-Admin-Token':tok}}).then(function(x){return x.json().then(function(j){return{ok:x.ok,j:j}})}).then(function(o){
+    t.disabled=false;
+    if(!o.ok){msg(o.j.error||'snapshot list failed');return}
+    box=el('div','snap');
+    if(!o.j.snapshots.length)box.appendChild(el('div',null,'No snapshots for /'+r.slug));
+    o.j.snapshots.forEach(function(s){
+      var d=el('div',s.ts===r.reportedAt?'hit':null);
+      d.appendChild(document.createTextNode(new Date(s.ts).toLocaleString()+' - '+s.source+(s.ts===r.reportedAt?' (this report)':'')+' '));
+      d.appendChild(el('code',null,new Date(s.ts).toISOString()+' / '+s.ts+' / '+Math.round(s.size/1024)+' KB'));
+      d.appendChild(document.createTextNode(' '));
+      d.appendChild(mkView(r,s,d));
+      box.appendChild(d)
+    });
+    card.appendChild(box)
+  }).catch(function(){t.disabled=false;msg('network error')})
+};return t}
+function toDataUrl(b){return new Promise(function(res){var r=new FileReader();r.onload=function(){res(r.result)};r.onerror=function(){res(null)};r.readAsDataURL(b)})}
+function buildDoc(t){
+  var want=$('imgs').checked,ext=$('ext').checked;
+  var head='<!doctype html><meta http-equiv=\"Content-Security-Policy\" content=\"img-src '+((want||ext)?'data:':\"'none'\")+'\">';
+  if(!ext)return Promise.resolve(head+t);
+  var d=new DOMParser().parseFromString(t,'text/html');
+  var seen={},urls=[];
+  [].slice.call(d.querySelectorAll('img')).forEach(function(im){
+    var s=(im.getAttribute('src')||'').trim(),l=s.toLowerCase();
+    im.removeAttribute('srcset');
+    if(l.indexOf('https:')===0){im.removeAttribute('src');if(!seen[s]){seen[s]=[];urls.push(s)}seen[s].push(im)}
+    else if(l.indexOf('data:')===0&&!want)im.removeAttribute('src')
+  });
+  urls=urls.slice(0,40);
+  var i=0;
+  function worker(){
+    if(i>=urls.length)return Promise.resolve();
+    var u=urls[i++];
+    return fetch('/admin/img?u='+encodeURIComponent(u),{headers:{'X-Admin-Token':tok}}).then(function(x){return x.ok?x.blob():null}).then(function(b){return b?toDataUrl(b):null}).then(function(du){if(du)seen[u].forEach(function(im){im.setAttribute('src',du)})}).catch(function(){}).then(worker)
+  }
+  return Promise.all([worker(),worker(),worker(),worker()]).then(function(){return head+d.documentElement.outerHTML})
+}
+function setFrame(f,t){var g=f._g=(f._g||0)+1;f._t=t;buildDoc(t).then(function(doc){if(f._g===g)f.srcdoc=doc})}
+function refreshFrames(){document.querySelectorAll('iframe').forEach(function(f){if(f._t!=null)setFrame(f,f._t)})}
+function mkView(r,s,row){var b=el('button',null,'View');var fr=null;b.onclick=function(){
+  if(fr){fr.remove();fr=null;b.textContent='View';return}
+  if(r.isCsam&&!confirm('This snapshot is from a CSAM report. It opens as text and styling only unless an images checkbox is on. Continue?'))return;
+  b.disabled=true;
+  fetch('/admin/snapshot/'+encodeURIComponent(r.slug)+'/'+s.ts,{headers:{'X-Admin-Token':tok}}).then(function(x){return x.text().then(function(t){return{ok:x.ok,t:t}})}).then(function(o){
+    b.disabled=false;
+    if(!o.ok){msg('snapshot load failed');return}
+    fr=document.createElement('iframe');fr.setAttribute('sandbox','');fr.referrerPolicy='no-referrer';
+    fr.style.cssText='width:100%;height:60vh;margin-top:6px;border:1px solid #444;border-radius:8px;background:#fff';
+    row.appendChild(fr);setFrame(fr,o.t);b.textContent='Hide'
+  }).catch(function(){b.disabled=false;msg('network error')})
+};return b}
+$('imgs').onchange=function(){
+  if(this.checked&&!confirm('Embedded images in snapshots (including ones from CSAM reports) will be displayed. Continue?')){this.checked=false;return}
+  refreshFrames()
+};
+$('ext').onchange=function(){
+  if(this.checked&&!confirm('External images will be fetched by the worker from whatever hosts the page points at. Those hosts see the worker (not your IP) and that a preview was opened, and content from CSAM reports may display. Continue?')){this.checked=false;return}
+  refreshFrames()
+};
+function setStatus(card,t){card.querySelectorAll('.badge')[1].textContent=t}
+function mkTake(r,card){var t=el('button','danger','Take down');t.onclick=function(){takedown(r,t,card)};return t}
+function mkRestore(r,card){var t=el('button',null,'Restore');t.onclick=function(){restore(r,t,card)};return t}
+function mkDismiss(r,card){var t=el('button',null,'Dismiss');t.onclick=function(){dismiss(r,t,card)};return t}
+function dismiss(r,btn,card){
+  var w=r.isCsam?'CSAM report: only dismiss once the page is handled and NCMEC has been notified. The record is hidden but kept for 18 months. Dismiss the report for /'+r.slug+'?':'Dismiss this report for /'+r.slug+'? It will be removed from the list.';
+  if(!confirm(w))return;btn.disabled=true;
+  fetch('/admin/dismiss',{method:'POST',headers:{'X-Admin-Token':tok,'Content-Type':'application/json'},body:JSON.stringify({key:r.key})}).then(function(x){
+    if(x.ok){card.remove();shown--;msg(shown?shown+' report(s) shown':'No open reports')}else{btn.disabled=false;msg('dismiss failed: '+x.status)}
+  }).catch(function(){btn.disabled=false;msg('network error')})
+}
+function restore(r,btn,card){
+  var w=r.isCsam?'WARNING: this page was reported as CSAM. Restoring puts it back online. Only continue if you have confirmed the report was mistaken. Restore /'+r.slug+'?':'Restore /'+r.slug+'? It returns as a plain page (story status and likes are not recovered).';
+  if(!confirm(w))return;btn.disabled=true;
+  fetch('/admin/restore/'+encodeURIComponent(r.slug),{method:'POST',headers:{'X-Admin-Token':tok}}).then(function(x){return x.json().then(function(j){return{ok:x.ok,j:j}})}).then(function(o){
+    if(o.ok){btn.replaceWith(mkTake(r,card));setStatus(card,'live');msg('')}else{btn.disabled=false;msg(o.j.error||'restore failed')}
+  }).catch(function(){btn.disabled=false;msg('network error')})
+}
+function takedown(r,btn,card){
+  var warn=r.isCsam?'CSAM report: the page is preserved under deleted/ for 18 months. You must still report to NCMEC. Take down /'+r.slug+'?':'Take down /'+r.slug+'? The slug will be permanently locked.';
+  if(!confirm(warn))return;btn.disabled=true;
+  fetch('/publish/'+encodeURIComponent(r.slug),{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({adminToken:tok})}).then(function(x){
+    if(x.ok){btn.replaceWith(mkRestore(r,card));setStatus(card,'taken down')}else if(x.status===404){btn.remove();setStatus(card,'missing')}else{btn.disabled=false;msg('takedown failed: '+x.status)}
+  }).catch(function(){btn.disabled=false;msg('network error')})
+}
+$('go').onclick=function(){tok=$('tok').value.trim();load(true)};
+$('more').onclick=function(){load(false)};
+if(tok)load(true)
+</script></body></html>`;
+
 /* ---------------- Router ---------------- */
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const { pathname } = url;
     const method = request.method;
@@ -2834,7 +3374,7 @@ export default {
         return handleServe(env, decodeURIComponent(pathname.slice('/@'.length)));
       }
       if (method === 'POST' && pathname.startsWith('/report/')) {
-        return handleReport(env, request, decodeURIComponent(pathname.slice('/report/'.length)));
+        return handleReport(env, request, decodeURIComponent(pathname.slice('/report/'.length)), ctx);
       }
       if (method === 'POST' && pathname === '/auth/google') {
         return handleGoogleAuth(env, request);
@@ -2949,20 +3489,31 @@ export default {
         return handleRevenueCatWebhook(env, request);
       }
       // Manual trigger for the same purge scheduled() runs nightly (see
-      // below) — lets you test it by just visiting a URL in a browser,
-      // no terminal/wrangler needed. Takes the admin token as a query
-      // param rather than a header/body since that's the only thing a
-      // browser address bar can send; the tradeoff is the token then sits
-      // in browser history and any server access logs, so this is meant
-      // for a one-off manual test (see remaining-steps.md §14), not
-      // something to leave linked or bookmarked long-term.
-      if (method === 'GET' && pathname === '/debug-purge') {
-        const provided = url.searchParams.get('adminToken');
-        if (!provided || !env.ADMIN_TOKEN || !timingSafeEqual(provided, env.ADMIN_TOKEN)) {
-          return textError(403, 'invalid admin token');
-        }
+      // below). POST with the admin token in the X-Admin-Token header, like
+      // the other admin endpoints — it used to be a GET taking the token as
+      // a query param, which left the token in browser history and logs.
+      //   curl -X POST -H "X-Admin-Token: $TOKEN" https://<worker>/admin/purge
+      if (method === 'POST' && pathname === '/admin/purge') {
+        const auth = await adminAuthOk(env, request);
+        if (auth === 'limited') return textError(429, 'too many failed attempts, try again in 5 minutes');
+        if (auth !== 'ok') return textError(403, 'invalid admin token');
         const purged = await handlePurge(env);
         return json({ ok: true, purged });
+      }
+      if (method === 'GET' && pathname === '/admin') return handleAdminPage();
+      if (method === 'GET' && pathname === '/admin/reports') return handleAdminReports(env, request, url);
+      if (method === 'GET' && pathname === '/admin/img') return handleAdminImage(env, request, url);
+      if (method === 'POST' && pathname === '/admin/dismiss') return handleAdminDismiss(env, request);
+      if (method === 'GET' && pathname.startsWith('/admin/snapshot/')) {
+        const rest = pathname.slice('/admin/snapshot/'.length).split('/');
+        if (rest.length !== 2) return textError(400, 'invalid path');
+        return handleAdminSnapshotGet(env, request, decodeURIComponent(rest[0]), rest[1]);
+      }
+      if (method === 'GET' && pathname.startsWith('/admin/snapshots/')) {
+        return handleAdminSnapshots(env, request, decodeURIComponent(pathname.slice('/admin/snapshots/'.length)));
+      }
+      if (method === 'POST' && pathname.startsWith('/admin/restore/')) {
+        return handleAdminRestore(env, request, decodeURIComponent(pathname.slice('/admin/restore/'.length)));
       }
       return textError(404, 'not found');
     } catch (e) {
