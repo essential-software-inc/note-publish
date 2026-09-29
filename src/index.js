@@ -1101,6 +1101,10 @@ const STORIES_STRIP_OWN_LIMIT = 20;
 // listings (see handleStoriesStrip / handleSubscriptionsFeed). Also
 // bounds the pool itself.
 const STORIES_LOOKBACK_MS = 24 * 60 * 60 * 1000;
+// How long a story stays in a follower's Subscribed feed after it became a story. Unlike the
+// 24h strip window this is a normal feed's horizon: older posts age out of the feed (the story
+// row and published page are untouched; Liked/Published tabs are unaffected).
+const SUBSCRIPTIONS_FEED_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 
 // Non-cryptographic string hash (FNV-1a) + mulberry32 PRNG, used only to
 // seed a per-viewer shuffle of the discovery-strip candidate pool — not
@@ -1751,7 +1755,7 @@ async function likeCountsFor(env, slugs) {
 // that are toggled to show in stories AND still currently live there — i.e. within the
 // same STORIES_LOOKBACK_MS (24h) window as the public discovery strip (see
 // handleStoriesStrip). A note whose toggle is on but whose 24h has elapsed keeps showing
-// in followers' Subscribed feeds (handleSubscriptionsFeed has no such cutoff) but drops out
+// in followers' Subscribed feeds (handleSubscriptionsFeed's cutoff is the longer SUBSCRIPTIONS_FEED_MAX_AGE_MS) but drops out
 // of this tab, the same as it drops out of the strip, until it's updated/republished.
 async function handleMyStories(env, request) {
   const sub = await requireSession(env, request);
@@ -1972,9 +1976,13 @@ async function handleLikedNotes(env, request) {
 
 // GET /subscriptions/feed — the "Subscribed" category: a regular social
 // feed, not a Stories surface. No 24h expiry (that ephemerality is
-// specific to the discovery strip/ring — see handleStoriesStrip). Two
+// specific to the discovery strip/ring — see handleStoriesStrip), but
+// posts age out after SUBSCRIPTIONS_FEED_MAX_AGE_MS. Three
 // things that make this behave like an actual feed rather than a dump
 // of everything:
+//
+// - Age cutoff (SUBSCRIPTIONS_FEED_MAX_AGE_MS, applied in the JOIN below):
+//   a post leaves the feed once it's older than that, like any feed.
 //
 // - Per-author floor at subscribe time (s.created_at >= sub.created_at
 //   in the JOIN below): following someone surfaces what they post from
@@ -2006,9 +2014,10 @@ async function handleSubscriptionsFeed(env, request) {
 
   let query = `SELECT s.slug, s.author_sub, s.title, s.created_at, s.image_urls, s.description, s.tags, s.note_created_at, seen.slug IS NOT NULL AS seen
      FROM stories s
-     JOIN subscriptions sub ON sub.author_sub = s.author_sub AND sub.subscriber_sub = ? AND s.created_at >= sub.created_at
+     JOIN subscriptions sub ON sub.author_sub = s.author_sub AND sub.subscriber_sub = ? AND s.created_at >= sub.created_at AND s.created_at >= ?
      LEFT JOIN story_seen seen ON seen.slug = s.slug AND seen.subscriber_sub = ?`;
-  const params = [sub, sub];
+  const feedCutoff = Date.now() - SUBSCRIPTIONS_FEED_MAX_AGE_MS;
+  const params = [sub, feedCutoff, sub];
   if (cursorCreatedAt !== null) {
     query += ' WHERE (s.created_at < ? OR (s.created_at = ? AND s.slug < ?))';
     params.push(cursorCreatedAt, cursorCreatedAt, cursorSlug);
@@ -2035,7 +2044,7 @@ async function handleSubscriptionsFeed(env, request) {
   const last = results[results.length - 1];
   const total = cursorParam ? undefined : await listTotal(env,
     `SELECT COUNT(*) AS c FROM stories s
-       JOIN subscriptions sub ON sub.author_sub = s.author_sub AND sub.subscriber_sub = ? AND s.created_at >= sub.created_at`, [sub]);
+       JOIN subscriptions sub ON sub.author_sub = s.author_sub AND sub.subscriber_sub = ? AND s.created_at >= sub.created_at AND s.created_at >= ?`, [sub, feedCutoff]);
   return json({
     total,
     stories: results.map(r => {
