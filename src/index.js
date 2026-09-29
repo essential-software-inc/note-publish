@@ -489,7 +489,7 @@ async function handleSyncPush(env, request) {
   const stored = await env.NOTES_BUCKET.put('sync/' + sub + '/notes.json', bodyText, putOpts);
   // R2 returns null (rather than throwing) when the precondition fails —
   // including "there is no object at all" — so this is the conflict case.
-  if (!stored) return json({ error: 'backup changed on another device — pull and retry' }, 409);
+  if (!stored) return json({ error: 'backup changed on another device. Pull and retry' }, 409);
   const now = Date.now();
   await env.ACCOUNTS.put('syncmeta:' + sub, JSON.stringify({ updatedAt: now, sizeBytes: bodyText.length }));
   return json({ ok: true, updatedAt: now, etag: stored.httpEtag }, 200, { 'ETag': stored.httpEtag });
@@ -764,7 +764,7 @@ async function handlePublish(env, request) {
   // requireSession call that path already does.
   const capOwnerSub = await requireSession(env, request);
   if (capOwnerSub && (await ownerAtPageCap(env, capOwnerSub))) {
-    return textError(403, `page limit reached (max ${MAX_PAGES_PER_ACCOUNT} live pages per account) — unpublish something first`);
+    return textError(403, `page limit reached (max ${MAX_PAGES_PER_ACCOUNT} live pages per account). Unpublish something first`);
   }
 
   const token = newToken();
@@ -1596,6 +1596,19 @@ async function handleLikeState(env, request, slug) {
   return json({ liked: !!row });
 }
 
+// POST /likes/counts — body { slugs: [...] } (max 200). Live like totals for the cards on screen,
+// { counts: { slug: n } } with an explicit 0 for slugs nobody has liked. One grouped read per 80 slugs.
+async function handleLikeCounts(env, request) {
+  const sub = await requireSession(env, request);
+  if (!sub) return textError(401, 'sign-in required');
+  let body; try { body = await request.json(); } catch (e) { return textError(400, 'invalid JSON body'); }
+  const slugs = Array.isArray(body && body.slugs) ? body.slugs.filter(x => typeof x === 'string' && x).slice(0, 200) : [];
+  const found = await likeCountsFor(env, slugs);
+  const counts = {};
+  slugs.forEach(sl => { counts[sl] = found[sl] || 0; });
+  return json({ counts });
+}
+
 // GET /likes — every slug this account has liked, so a second device shows
 // its hearts without having to open each note first.
 const MAX_LIKES_LISTED = 5000;
@@ -2046,7 +2059,7 @@ async function handleReport(env, request, slug) {
   if (!SLUG_RE.test(slug)) return textError(400, 'invalid slug');
   const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
   if (!(await checkReportRateLimit(env, ip))) {
-    return textError(429, 'too many reports from this address — try again in a minute');
+    return textError(429, 'too many reports from this address. Try again in a minute');
   }
   let body;
   try { body = await request.json(); } catch (e) { return textError(400, 'invalid JSON body'); }
@@ -2558,7 +2571,7 @@ async function handleAdPublish(env, request) {
   }
 
   const existingAd = await env.ADS_DB.prepare('SELECT slug FROM ads WHERE slug = ?').bind(slug).first();
-  if (existingAd) return textError(409, 'already registered as an ad — use PUT to edit or top up separately');
+  if (existingAd) return textError(409, 'already registered as an ad. Use PUT to edit or top up separately');
 
   const obj = await env.NOTES_BUCKET.get(slug + '.html');
   if (!obj) return textError(404, 'page content missing');
@@ -2867,6 +2880,9 @@ export default {
       }
       if (method === 'GET' && pathname === '/account/liked-notes') {
         return handleLikedNotes(env, request);
+      }
+      if (method === 'POST' && pathname === '/likes/counts') {
+        return handleLikeCounts(env, request);
       }
       if (method === 'GET' && pathname === '/likes') {
         return handleLikesList(env, request);
