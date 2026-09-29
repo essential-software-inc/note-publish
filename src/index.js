@@ -850,17 +850,18 @@ async function handleUpdate(env, request, slug) {
     const was = !!meta.showInStories;
     const wants = showInStories;
     if (wants && !was) {
-      const imageUrl = await storeStoryImage(env, slug, html);
-      const imageUrls = await storeStoryCardImages(env, slug, html);
+      const [imageUrl, imageUrls] = await Promise.all([storeStoryImage(env, slug, html), storeStoryCardImages(env, slug, html)]);
       await env.ADS_DB.prepare(
         'INSERT OR REPLACE INTO stories (slug, author_sub, title, created_at, image_url, image_urls, description, tags, note_created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
       ).bind(slug, meta.ownerSub, meta.title || 'Untitled note', meta.updatedAt, imageUrl, imageUrls, cleanStoryDesc(desc), cleanStoryTags(tags), cleanNoteCreatedAt(createdAt)).run();
     } else if (!wants && was) {
-      await deleteStoryImage(env, slug);
-      await deleteStoryCardImages(env, slug);
-      await env.ADS_DB.batch([
-        env.ADS_DB.prepare('DELETE FROM stories WHERE slug = ?').bind(slug),
-        env.ADS_DB.prepare('DELETE FROM story_seen WHERE slug = ?').bind(slug)
+      await Promise.all([
+        deleteStoryImage(env, slug),
+        deleteStoryCardImages(env, slug),
+        env.ADS_DB.batch([
+          env.ADS_DB.prepare('DELETE FROM stories WHERE slug = ?').bind(slug),
+          env.ADS_DB.prepare('DELETE FROM story_seen WHERE slug = ?').bind(slug)
+        ])
       ]);
     } else if (wants && was) {
       // Title and/or the note's images may have changed this same call —
@@ -869,8 +870,7 @@ async function handleUpdate(env, request, slug) {
       // edit shouldn't). storeStoryImage/storeStoryCardImages also clear/
       // replace the R2 blobs as needed (removed image, shrunk image,
       // swapped for a remote URL, etc).
-      const imageUrl = await storeStoryImage(env, slug, html);
-      const imageUrls = await storeStoryCardImages(env, slug, html);
+      const [imageUrl, imageUrls] = await Promise.all([storeStoryImage(env, slug, html), storeStoryCardImages(env, slug, html)]);
       // description/tags/note_created_at only change when this call actually carries them
       // (COALESCE keeps the stored value for a null), so an update from an older app build
       // or one that only sends html can't wipe them.
@@ -882,6 +882,85 @@ async function handleUpdate(env, request, slug) {
 
   await putMeta(env, slug, meta);
   return json({ ok: true });
+}
+
+// PUT /publish/:slug/stories — flips "Show in stories" for an owned page WITHOUT re-sending the page.
+// PUT /publish/:slug needs the whole html in the body (the app had to rebuild it, upload it, and this
+// worker had to rewrite it to R2) just to change one flag. Here the body is only { token, showInStories }
+// plus the optional card details; turning a story on reads the already-stored page from R2 for its
+// preview images. The response carries the story row in the same shape GET /stories returns, so the
+// app can put it in the strip straight away instead of making a second request.
+async function handleSetStories(env, request, slug) {
+  if (!(await checkPublishRateLimit(env, request))) return textError(429, 'too many publishes, slow down');
+  if (!validSlug(slug)) return textError(400, 'invalid slug');
+  let body;
+  try { body = await request.json(); } catch (e) { return textError(400, 'invalid JSON body'); }
+  const { token, showInStories, title, desc, tags, createdAt } = body || {};
+  if (typeof token !== 'string' || !token) return textError(401, 'missing token');
+  if (typeof showInStories !== 'boolean') return textError(400, 'showInStories must be true or false');
+  const meta = await getMeta(env, slug);
+  if (!meta || meta.deletedAt) return textError(404, 'not found');
+  const tokenHash = await sha256Hex(token);
+  if (!timingSafeEqual(tokenHash, meta.tokenHash)) return textError(403, 'invalid token');
+  // Stories are per-account; an anonymous page has no account to attribute a story row to.
+  if (!meta.ownerSub) return textError(403, 'sign-in required to show a note in stories');
+
+  const was = !!meta.showInStories;
+  const wants = showInStories;
+  // Card details only change when this call carries them, same rule as PUT /publish/:slug.
+  if (typeof title === 'string' && title.trim()) meta.title = title.trim().slice(0, 200);
+  const d = cleanStoryDesc(desc), t = cleanStoryTags(tags), c = cleanNoteCreatedAt(createdAt);
+  if (d !== null) meta.desc = d;
+  if (t !== null) meta.tags = t;
+  if (c !== null) meta.noteCreatedAt = c;
+
+  if (wants && !was) {
+    const obj = await env.NOTES_BUCKET.get(slug + '.html');
+    if (!obj) return textError(404, 'page content missing');
+    const html = await obj.text();
+    const now = Date.now();
+    meta.updatedAt = now;
+    const [imageUrl, imageUrls] = await Promise.all([storeStoryImage(env, slug, html), storeStoryCardImages(env, slug, html)]);
+    await env.ADS_DB.prepare(
+      'INSERT OR REPLACE INTO stories (slug, author_sub, title, created_at, image_url, image_urls, description, tags, note_created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
+    ).bind(slug, meta.ownerSub, meta.title || 'Untitled note', now, imageUrl, imageUrls, meta.desc ?? null, meta.tags ?? null, meta.noteCreatedAt ?? null).run();
+  } else if (!wants && was) {
+    await Promise.all([
+      deleteStoryImage(env, slug),
+      deleteStoryCardImages(env, slug),
+      env.ADS_DB.batch([
+        env.ADS_DB.prepare('DELETE FROM stories WHERE slug = ?').bind(slug),
+        env.ADS_DB.prepare('DELETE FROM story_seen WHERE slug = ?').bind(slug)
+      ])
+    ]);
+  } else if (wants && was) {
+    // Already showing: only the card text can have changed (no page was sent, so images stay as stored).
+    await env.ADS_DB.prepare('UPDATE stories SET title = ?, description = COALESCE(?, description), tags = COALESCE(?, tags), note_created_at = COALESCE(?, note_created_at) WHERE slug = ?')
+      .bind(meta.title || 'Untitled note', d, t, c, slug).run();
+  }
+  meta.showInStories = wants;
+
+  // Save the meta and (when showing) assemble the strip row side by side.
+  const origin = new URL(request.url).origin;
+  const buildStory = async () => {
+    if (!wants) return null;
+    const row = await env.ADS_DB.prepare('SELECT slug, title, created_at, image_url FROM stories WHERE slug = ?').bind(slug).first();
+    if (!row) return null;
+    const [user, idBySub] = await Promise.all([getUser(env, meta.ownerSub), authorIdsFor(env, [meta.ownerSub])]);
+    return {
+      slug: row.slug,
+      title: row.title,
+      authorSub: idBySub[meta.ownerSub], // opaque author ID, same as GET /stories
+      authorProfileName: (user && user.profileName) || null,
+      createdAt: row.created_at,
+      seen: false,
+      imageUrl: row.image_url === STORY_IMAGE_R2_MARKER
+        ? `${origin}/stories/image/${encodeURIComponent(row.slug)}`
+        : (row.image_url || null)
+    };
+  };
+  const [story] = await Promise.all([buildStory(), putMeta(env, slug, meta)]);
+  return json({ ok: true, showInStories: wants, story });
 }
 
 async function handleUnpublish(env, request, slug) {
@@ -998,6 +1077,9 @@ const STORIES_STRIP_LIMIT = 12;
 // viewers, drawing from the same pool, land on genuinely different
 // subsets/orders rather than everyone just re-deriving the same top 12.
 const STORIES_STRIP_CANDIDATE_LIMIT = 60;
+// A signed-in viewer's OWN live stories always lead the strip and don't count toward
+// STORIES_STRIP_LIMIT (which is only for other people's). Capped as a safety net, not a design limit.
+const STORIES_STRIP_OWN_LIMIT = 20;
 // A story only appears in the discovery strip or the Subscribed feed for
 // this long after being posted — Instagram-style ephemerality. The
 // published page itself is untouched; this only affects the Stories
@@ -1288,7 +1370,8 @@ async function handleServeStoryImage(env, slug) {
   });
 }
 
-// GET /stories — the horizontal strip on the Notes screen. This is a
+// GET /stories — the horizontal strip on the Notes screen. A signed-in viewer's own live stories
+// come first (not counted in the 12); the rest of it is a
 // *discovery* surface, not a feed of people you already follow: a story
 // only qualifies for STORIES_LOOKBACK_MS (24h) after it's posted, and
 // any author the signed-in caller already subscribes to is excluded
@@ -1309,15 +1392,22 @@ async function handleStoriesStrip(env, request) {
   const cutoff = now - STORIES_LOOKBACK_MS;
 
   let followedAuthors = [];
+  let ownStories = [];
   if (sub) {
-    const followRows = await env.ADS_DB.prepare(
-      'SELECT author_sub FROM subscriptions WHERE subscriber_sub = ?'
-    ).bind(sub).all();
+    // Follows and the viewer's own live stories are independent lookups: run them together.
+    const [followRows, ownRows] = await Promise.all([
+      env.ADS_DB.prepare('SELECT author_sub FROM subscriptions WHERE subscriber_sub = ?').bind(sub).all(),
+      env.ADS_DB.prepare(
+        'SELECT slug, author_sub, title, created_at, image_url FROM stories WHERE author_sub = ? AND created_at >= ? ORDER BY created_at DESC LIMIT ?'
+      ).bind(sub, cutoff, STORIES_STRIP_OWN_LIMIT).all()
+    ]);
     followedAuthors = followRows.results.map(r => r.author_sub);
+    ownStories = ownRows.results;
   }
 
   let query = 'SELECT slug, author_sub, title, created_at, image_url FROM stories WHERE created_at >= ?';
   const params = [cutoff];
+  if (sub) { query += ' AND author_sub != ?'; params.push(sub); } // own stories are added up front below, outside the 12
   if (followedAuthors.length) {
     query += ` AND author_sub NOT IN (${followedAuthors.map(() => '?').join(',')})`;
     params.push(...followedAuthors);
@@ -1332,7 +1422,7 @@ async function handleStoriesStrip(env, request) {
     const windowBucket = Math.floor(now / STORIES_LOOKBACK_MS);
     ranked = _storiesSeededShuffle(results, sub + ':' + windowBucket);
   }
-  ranked = ranked.slice(0, STORIES_STRIP_LIMIT);
+  ranked = [...ownStories, ...ranked.slice(0, STORIES_STRIP_LIMIT)]; // yours first, then up to 12 from others
 
   let seenSlugs = new Set();
   if (sub && ranked.length) {
@@ -2691,6 +2781,10 @@ export default {
       }
       if (method === 'POST' && pathname === '/publish') {
         return handlePublish(env, request);
+      }
+      if (method === 'PUT' && pathname.startsWith('/publish/') && pathname.endsWith('/stories')
+          && pathname.length > '/publish/'.length + '/stories'.length) {
+        return handleSetStories(env, request, decodeURIComponent(pathname.slice('/publish/'.length, -'/stories'.length)));
       }
       if (method === 'PUT' && pathname.startsWith('/publish/')) {
         return handleUpdate(env, request, decodeURIComponent(pathname.slice('/publish/'.length)));
