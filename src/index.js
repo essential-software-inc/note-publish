@@ -3154,9 +3154,10 @@ async function handleAdminImage(env, request, url) {
   let cur;
   try { cur = new URL(url.searchParams.get('u') || ''); } catch (e) { return textError(400, 'invalid url'); }
   if (cur.href.length > 2048) return textError(400, 'url too long');
+  if (cur.hostname.toLowerCase() === url.hostname.toLowerCase()) return textError(400, 'url not allowed'); // no self-fetch loops
   let res = null;
   for (let hop = 0; hop < 4; hop++) {
-    if (!adminImgTargetOk(cur)) return textError(400, 'url not allowed');
+    if (!adminImgTargetOk(cur) || cur.hostname.toLowerCase() === url.hostname.toLowerCase()) return textError(400, 'url not allowed');
     try {
       res = await fetch(cur.href, {
         method: 'GET',
@@ -3195,6 +3196,7 @@ async function handleAdminImage(env, request, url) {
       'Content-Type': type,
       'Content-Security-Policy': "default-src 'none'; sandbox",
       'Cache-Control': 'no-store',
+      'Cross-Origin-Resource-Policy': 'same-origin',
       'X-Content-Type-Options': 'nosniff',
       'Referrer-Policy': 'no-referrer'
     }
@@ -3205,7 +3207,7 @@ function handleAdminPage() {
   return new Response(ADMIN_PAGE_HTML, {
     headers: {
       'Content-Type': 'text/html; charset=utf-8',
-      'Content-Security-Policy': "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; connect-src 'self'; base-uri 'none'; form-action 'none'",
+      'Content-Security-Policy': "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
       'Cache-Control': 'no-store',
       'X-Content-Type-Options': 'nosniff',
       'Referrer-Policy': 'no-referrer'
@@ -3276,24 +3278,33 @@ function mkSnaps(r,card){var t=el('button',null,'Snapshots');var box=null;t.oncl
   }).catch(function(){t.disabled=false;msg('network error')})
 };return t}
 function toDataUrl(b){return new Promise(function(res){var r=new FileReader();r.onload=function(){res(r.result)};r.onerror=function(){res(null)};r.readAsDataURL(b)})}
+var imgCache={},imgBytes=0,IMG_BUDGET=30*1024*1024;
+function csp(want,ext){return "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; img-src "+((want||ext)?'data:':"'none'")}
+function fetchExt(u){
+  if(imgCache[u])return imgCache[u];
+  return imgCache[u]=fetch('/admin/img?u='+encodeURIComponent(u),{headers:{'X-Admin-Token':tok}}).then(function(x){return x.ok?x.blob():null}).then(function(b){if(!b||imgBytes+b.size>IMG_BUDGET)return null;imgBytes+=b.size;return toDataUrl(b)}).catch(function(){return null}).then(function(du){if(!du)delete imgCache[u];return du})
+}
 function buildDoc(t){
   var want=$('imgs').checked,ext=$('ext').checked;
-  var head='<!doctype html><meta http-equiv=\"Content-Security-Policy\" content=\"img-src '+((want||ext)?'data:':\"'none'\")+'\">';
-  if(!ext)return Promise.resolve(head+t);
+  var head='<!doctype html><meta http-equiv="Content-Security-Policy" content="'+csp(want,ext)+'">';
   var d=new DOMParser().parseFromString(t,'text/html');
+  [].slice.call(d.querySelectorAll('meta,link,base,script,iframe,frame,frameset,object,embed,audio,video,source,track')).forEach(function(n){n.remove()});
   var seen={},urls=[];
   [].slice.call(d.querySelectorAll('img')).forEach(function(im){
-    var s=(im.getAttribute('src')||'').trim(),l=s.toLowerCase();
+    var s=(im.getAttribute('src')||'').trim();
+    if(s.indexOf('//')===0)s='https:'+s;
+    var l=s.toLowerCase();
     im.removeAttribute('srcset');
-    if(l.indexOf('https:')===0){im.removeAttribute('src');if(!seen[s]){seen[s]=[];urls.push(s)}seen[s].push(im)}
-    else if(l.indexOf('data:')===0&&!want)im.removeAttribute('src')
+    if(ext&&l.indexOf('https:')===0){im.removeAttribute('src');if(!seen[s]){seen[s]=[];urls.push(s)}seen[s].push(im)}
+    else if(want&&l.indexOf('data:')===0){}
+    else im.removeAttribute('src')
   });
   urls=urls.slice(0,40);
   var i=0;
   function worker(){
     if(i>=urls.length)return Promise.resolve();
     var u=urls[i++];
-    return fetch('/admin/img?u='+encodeURIComponent(u),{headers:{'X-Admin-Token':tok}}).then(function(x){return x.ok?x.blob():null}).then(function(b){return b?toDataUrl(b):null}).then(function(du){if(du)seen[u].forEach(function(im){im.setAttribute('src',du)})}).catch(function(){}).then(worker)
+    return fetchExt(u).then(function(du){if(du)seen[u].forEach(function(im){im.setAttribute('src',du)})}).then(worker)
   }
   return Promise.all([worker(),worker(),worker(),worker()]).then(function(){return head+d.documentElement.outerHTML})
 }
