@@ -1862,9 +1862,11 @@ async function handleLikedNotes(env, request) {
   }
 
   let query = `SELECT l.slug, l.author_sub AS liked_author, l.created_at AS liked_at,
-       s.author_sub AS story_author, s.title AS story_title, s.image_urls, s.description, s.tags, s.note_created_at
+       s.author_sub AS story_author, s.title AS story_title, s.image_urls, s.description, s.tags, s.note_created_at,
+       s.created_at AS story_created_at, p.created_at AS published_at
      FROM likes l
      LEFT JOIN stories s ON s.slug = l.slug
+     LEFT JOIN published_notes p ON p.slug = l.slug
      WHERE l.liker_sub = ?`;
   const params = [sub];
   if (cursorAt !== null) {
@@ -1904,6 +1906,8 @@ async function handleLikedNotes(env, request) {
         authorSub: authorSub ? idBySub[authorSub] : null, // opaque author ID, same as the feed
         authorProfileName: authorSub ? nameBySub[authorSub] : null,
         likedAt: r.liked_at,
+        createdAt: isStory ? r.story_created_at : null, // when it became a story (what the card's time-ago shows)
+        publishedAt: r.published_at || null, // stands in for a liked note that isn't a story
         noteCreatedAt: (isStory ? r.note_created_at : meta.noteCreatedAt) || null,
         desc: (isStory ? r.description : meta.desc) || '',
         tags: parseStoryTags(isStory ? r.tags : meta.tags),
