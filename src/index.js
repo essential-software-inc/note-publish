@@ -3612,7 +3612,7 @@ $('ext').onchange=function(){
   refreshFrames()
 };
 var tok=sessionStorage.getItem('adm')||'',next=null,all=[],cur='reports',adOff=0,auNext=null;
-var $=function(i){return document.getElementById(i)};
+function $(i){return document.getElementById(i)}
 function msg(t){$('msg').textContent=t||''}
 function el(t,c,x){var e=document.createElement(t);if(c)e.className=c;if(x!=null)e.textContent=x;return e}
 function fmt(t){return t?new Date(t).toLocaleString():'-'}
