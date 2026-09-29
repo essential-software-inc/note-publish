@@ -3537,27 +3537,302 @@ function handleAdminPage() {
 }
 
 const ADMIN_PAGE_HTML = `<!doctype html><html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="robots" content="noindex">
+<meta name="color-scheme" content="dark"><meta name="theme-color" content="#0B1620">
 <title>Admin</title><style>
-body{font:15px/1.4 system-ui,sans-serif;margin:0;padding:14px;background:#111;color:#eee}
-h1{font-size:18px;margin:0 0 12px}input,button{font:inherit;padding:10px 12px;border-radius:8px;border:1px solid #444;background:#222;color:#eee}
-input{width:100%;box-sizing:border-box;margin-bottom:8px}button{cursor:pointer}
-.card{border:1px solid #333;border-radius:10px;padding:12px;margin:10px 0;background:#1a1a1a}
-.csam{border-color:#c33}.badge{display:inline-block;padding:1px 8px;border-radius:99px;font-size:12px;background:#333;margin-left:6px}
-.badge.c{background:#c33}.row{display:flex;gap:8px;margin-top:10px;flex-wrap:wrap}.danger{background:#a22;border-color:#a22}
-.meta{color:#999;font-size:13px}.snap{font-size:13px;margin-top:8px;padding-top:8px;border-top:1px solid #333}.snap div{margin:4px 0}.snap .hit{color:#fc6}.snap code{color:#999}#imgs,#ext{width:auto;margin:0 6px 0 0;padding:0}.opt{display:block;margin:0 0 10px;color:#bbb;font-size:13px}.d{white-space:pre-wrap;word-break:break-word;margin:6px 0}#msg{margin:8px 0;color:#f88}
-a{color:#8bf}select{font:inherit;padding:8px;border-radius:8px;border:1px solid #444;background:#222;color:#eee}.tabs{display:flex;gap:6px;margin:0 0 12px;flex-wrap:wrap}.tab.on{background:#2b4a66;border-color:#69c}.pnl{display:none}.pnl.on{display:block}.filters{display:flex;gap:8px;flex-wrap:wrap;margin:0 0 10px;align-items:center}.badge.ok{background:#2a6}.kv{display:flex;gap:8px;font-size:13px;margin:3px 0;align-items:center;flex-wrap:wrap}.kv b{color:#999;font-weight:400;min-width:110px}#fgroup,#fdis{width:auto;margin:0 6px 0 0;padding:0}.filters .opt{margin:0}</style></head><body><h1>Admin</h1>
-<div id="login"><input id="tok" type="password" placeholder="Admin token" autocomplete="off"><button id="go">Load reports</button></div>
-<label class="opt"><input type="checkbox" id="imgs">Load embedded (data:) images in snapshot previews. Off by default.</label>
-<label class="opt"><input type="checkbox" id="ext">Also load external (https) images, fetched through the worker so the image hosts see the worker, not your IP. Off by default.</label>
-<div id="tabs" class="tabs" style="display:none"><button class="tab on" data-t="reports">Reports</button><button class="tab" data-t="lookup">Lookup</button><button class="tab" data-t="ads">Ads</button><button class="tab" data-t="audit">Audit</button><button class="tab" data-t="tools">Tools</button></div>
-<div id="msg"></div>
-<div id="p-reports" class="pnl"><div class="filters"><select id="freason"><option value="">All reasons</option><option>spam</option><option>copyright</option><option>abuse</option><option>csam</option><option>other</option></select><select id="fstatus"><option value="">All statuses</option><option>live</option><option>taken down</option><option>unpublished</option><option>missing</option></select><label class="opt"><input type="checkbox" id="fgroup" checked>Group by slug</label><label class="opt"><input type="checkbox" id="fdis">Show dismissed</label></div><div id="list"></div><button id="more" style="display:none">Load more</button></div>
-<div id="p-lookup" class="pnl"><input id="lkslug" placeholder="Slug or link" autocomplete="off"><button id="lkgo">Look up</button><div id="lkout"></div><div id="lkowner"></div></div>
-<div id="p-ads" class="pnl"><div class="filters"><select id="adst"><option value="">All ads</option><option value="active">Active</option><option value="paused">Paused</option><option value="exhausted">Used up</option><option value="unpublished">Down</option></select></div><div id="adlist"></div><button id="admore" style="display:none">Load more</button></div>
-<div id="p-audit" class="pnl"><div id="aulist"></div><button id="aumore" style="display:none">Load more</button></div>
-<div id="p-tools" class="pnl"><div class="card"><div>Release a slug</div><div class="meta">Unpublishes without locking, so the slug can be reused right away.</div><input id="relslug" placeholder="Slug or link" autocomplete="off"><button id="relgo">Release slug</button></div><div class="card"><div>Purge</div><div class="meta">Same job the cron runs: deletes expired unpublished pages and accounts past their deletion window.</div><div class="row"><button id="purgego" class="danger">Run purge now</button></div></div></div>
+:root{
+  --bg:#0B1620;--surface:#122330;--surface2:#183041;--line:#22394A;--line2:#2D4A5D;
+  --text:#E7EFF4;--muted:#8CA2B1;--faint:#62798A;
+  --accent:#5EC8E5;--accent-ink:#062230;--accent-bg:rgba(94,200,229,.15);
+  --danger:#FF6B6B;--danger-bg:rgba(255,107,107,.14);
+  --ok:#4ADE9C;--ok-bg:rgba(74,222,156,.14);
+  --warn:#F5B84B;--warn-bg:rgba(245,184,75,.15);
+  --r:16px;--nav-h:64px;
+  --font:system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif
+}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html{color-scheme:dark}
+body{margin:0;background:var(--bg);color:var(--text);font:15px/1.45 var(--font);-webkit-font-smoothing:antialiased;overflow-x:hidden}
+[hidden]{display:none!important}
+button,input,select{font:inherit;color:inherit}
+button{cursor:pointer}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.ico{display:inline-grid;place-items:center;width:24px;height:24px;flex:none}
+.ico svg{width:100%;height:100%}
+body.out #app{display:none}
+body.in #login{display:none}
+
+/* login */
+#login{min-height:100vh;min-height:100dvh;display:flex;align-items:center;justify-content:center;padding:24px}
+.login-card{width:100%;max-width:380px}
+.mark{width:56px;height:56px;border-radius:18px;background:var(--surface2);border:1px solid var(--line2);display:grid;place-items:center;color:var(--accent);margin-bottom:22px}
+.mark .ico{width:28px;height:28px}
+.login-card h1{margin:0 0 6px;font-size:28px;font-weight:700;letter-spacing:-.025em}
+.login-card p{margin:0 0 22px;color:var(--muted)}
+.login-card .field{margin-bottom:12px}
+.fine{margin-top:14px;font-size:13px;color:var(--faint)}
+
+/* app bar */
+.bar{position:sticky;top:0;z-index:20;background:rgba(11,22,32,.9);-webkit-backdrop-filter:blur(14px);backdrop-filter:blur(14px);border-bottom:1px solid var(--line);padding-top:env(safe-area-inset-top,0px)}
+.bar-in{max-width:720px;margin:0 auto;height:58px;display:flex;align-items:center;gap:4px;padding:0 8px 0 14px}
+.bar-in:has(#back:not([hidden])){padding-left:6px}
+.bar-title{flex:1;min-width:0}
+.bar-title h1{margin:0;font-size:20px;font-weight:700;letter-spacing:-.02em;line-height:1.2}
+.bar-sub{font-size:13px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.bar-sub:empty{display:none}
+.icon-btn{width:42px;height:42px;border-radius:13px;border:0;background:transparent;display:grid;place-items:center;color:var(--text)}
+.icon-btn:active{background:var(--surface2)}
+
+main{max-width:720px;margin:0 auto;padding:14px 14px calc(var(--nav-h) + 32px + env(safe-area-inset-bottom,0px))}
+.pnl{display:none}.pnl.on{display:block}
+
+/* controls */
+.btn{appearance:none;-webkit-appearance:none;display:inline-flex;align-items:center;justify-content:center;gap:6px;min-height:42px;padding:0 15px;border-radius:12px;border:1px solid var(--line2);background:var(--surface2);color:var(--text);font-size:14px;font-weight:600;text-decoration:none;line-height:1;transition:transform .12s}
+.btn:active{transform:scale(.97)}
+.btn:disabled{opacity:.5;cursor:default}
+.btn.primary{background:var(--accent);border-color:transparent;color:var(--accent-ink)}
+.btn.danger{background:var(--danger-bg);border-color:rgba(255,107,107,.38);color:var(--danger)}
+.btn.block{width:100%}
+.field{width:100%;min-height:46px;padding:0 14px;border-radius:12px;border:1px solid var(--line2);background:var(--surface);color:var(--text)}
+.field::placeholder{color:var(--faint)}
+.field:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-bg)}
+.search{display:flex;gap:8px;margin-bottom:14px}
+.field-wrap{position:relative;flex:1;min-width:0}
+.field-wrap .ico{position:absolute;left:13px;top:13px;width:20px;height:20px;color:var(--muted);pointer-events:none}
+.field-wrap .field{padding-left:42px}
+
+.filters{display:flex;gap:8px;overflow-x:auto;margin:0 -14px 6px;padding:0 14px 8px;scrollbar-width:none}
+.filters::-webkit-scrollbar{display:none}
+.sel{position:relative;flex:none}
+.sel select{appearance:none;-webkit-appearance:none;height:38px;padding:0 34px 0 14px;border-radius:19px;border:1px solid var(--line2);background:var(--surface);font-size:14px;font-weight:550}
+.sel select option{background:var(--surface);color:var(--text)}
+.sel .ico{position:absolute;right:10px;top:10px;width:18px;height:18px;color:var(--muted);pointer-events:none}
+.pillck{position:relative;flex:none}
+.pillck input{position:absolute;inset:0;width:100%;height:100%;opacity:0;margin:0;cursor:pointer}
+.pillck span{display:inline-flex;align-items:center;height:38px;padding:0 14px;border-radius:19px;border:1px solid var(--line2);background:var(--surface);font-size:14px;font-weight:550;color:var(--muted)}
+.pillck input:checked+span{background:var(--accent-bg);border-color:rgba(94,200,229,.5);color:var(--accent)}
+.pillck input:focus-visible+span{outline:2px solid var(--accent);outline-offset:2px}
+.summary{font-size:13px;color:var(--muted);margin:2px 2px 10px}
+.summary:empty{display:none}
+
+.tog{display:flex;align-items:center;gap:14px;padding:12px 0;border-top:1px solid var(--line)}
+.tog:first-of-type{border-top:0}
+.tog-text{flex:1;min-width:0}
+.tog-text b{display:block;font-weight:600}
+.tog-text small{display:block;margin-top:2px;font-size:13px;line-height:1.4;color:var(--muted)}
+.tog input{appearance:none;-webkit-appearance:none;position:relative;flex:none;width:48px;height:29px;margin:0;border-radius:15px;background:var(--line2);transition:background .2s;cursor:pointer}
+.tog input::after{content:"";position:absolute;top:3px;left:3px;width:23px;height:23px;border-radius:50%;background:#fff;transition:transform .2s}
+.tog input:checked{background:var(--accent)}
+.tog input:checked::after{transform:translateX(19px)}
+
+/* cards */
+.card{--sev:var(--line2);background:var(--surface);border:1px solid var(--line);border-left:4px solid var(--sev);border-radius:var(--r);margin:0 0 10px;overflow:hidden}
+.sev-csam{--sev:#FF4D6D}.sev-abuse{--sev:#FF8A5B}.sev-copyright{--sev:#F5B84B}.sev-spam{--sev:#6E8FA3}.sev-other{--sev:#A78BFA}.sev-ad{--sev:var(--accent)}
+.card.is-csam{border-color:rgba(255,77,109,.45);border-left-color:#FF4D6D}
+.card.static{padding:16px}
+.card.note{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:12px 14px;border-left-color:var(--warn)}
+.card-head{appearance:none;-webkit-appearance:none;display:flex;align-items:center;gap:10px;width:100%;padding:14px;border:0;background:none;text-align:left}
+.card-head:focus-visible{outline-offset:-2px}
+.head-main{flex:1;min-width:0}
+.slug{font-size:16.5px;font-weight:650;letter-spacing:-.01em;word-break:break-all}
+.chips{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
+.sub{margin-top:8px;font-size:13px;color:var(--muted);word-break:break-word}
+.chev{color:var(--muted);transition:transform .24s}
+.card.open .chev{transform:rotate(180deg)}
+.card-body{display:grid;grid-template-rows:0fr;transition:grid-template-rows .24s ease}
+.card.open .card-body{grid-template-rows:1fr}
+.inner{min-height:0;overflow:hidden;visibility:hidden;transition:visibility 0s .24s}
+.card.open .inner{visibility:visible;transition-delay:0s}
+.pad{padding:2px 14px 14px}
+.card-top{margin-bottom:2px}
+
+.chip{display:inline-flex;align-items:center;gap:6px;height:24px;padding:0 10px;border-radius:12px;font-size:12px;font-weight:600;background:var(--surface2);color:var(--muted);white-space:nowrap}
+.chip.r-csam{color:#FF7C93;background:rgba(255,77,109,.16)}
+.chip.r-abuse{color:#FFA07C;background:rgba(255,138,91,.15)}
+.chip.r-copyright{color:var(--warn);background:var(--warn-bg)}
+.chip.r-spam{color:#9DB7C7;background:rgba(110,143,163,.17)}
+.chip.r-other{color:#BEA9FB;background:rgba(167,139,250,.16)}
+.chip.good{color:var(--ok);background:var(--ok-bg)}
+.chip.bad{color:var(--danger);background:var(--danger-bg)}
+.chip.warn{color:var(--warn);background:var(--warn-bg)}
+.chip.st::before{content:"";width:6px;height:6px;border-radius:50%;background:currentColor}
+.chip.s-live{color:var(--ok);background:var(--ok-bg)}
+.chip.s-bad{color:var(--danger);background:var(--danger-bg)}
+.chip.s-warn{color:var(--warn);background:var(--warn-bg)}
+.chip.s-off{color:var(--muted)}
+
+.rep{padding:11px 12px;border-radius:12px;background:var(--surface2);margin:0 0 8px}
+.rep-top{display:flex;align-items:center;flex-wrap:wrap;gap:8px;font-size:13px;color:var(--muted)}
+.rep .d{margin:8px 0 0;white-space:pre-wrap;word-break:break-word}
+.rep .d.none{color:var(--faint)}
+.rep .was{margin-top:6px;font-size:13px;color:var(--faint)}
+
+.actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}
+.actions.divide{margin-top:14px;padding-top:14px;border-top:1px solid var(--line)}
+.meter{height:6px;border-radius:3px;background:var(--line);margin-top:12px;overflow:hidden}
+.meter i{display:block;height:100%;border-radius:3px;background:var(--accent)}
+
+.kvs{margin-top:12px}
+.kv{display:grid;grid-template-columns:118px 1fr;gap:10px;align-items:center;padding:9px 0;border-top:1px solid var(--line);font-size:14px}
+.kv:first-child{border-top:0}
+.kv b{font-weight:500;font-size:13px;color:var(--muted)}
+.kv span{word-break:break-word}
+.kv.pg{grid-template-columns:1fr auto}
+
+.snaps{margin-top:14px;border-top:1px solid var(--line)}
+.snap-row{padding:11px 0;border-top:1px solid var(--line)}
+.snap-row:first-child{border-top:0}
+.snap-line{display:flex;flex-wrap:wrap;align-items:center;gap:8px}
+.snap-line .when{font-size:14px;font-weight:550;margin-right:auto}
+.snap-meta{margin:6px 0 8px;font-size:12px;color:var(--faint);word-break:break-all}
+.snap-none{padding:12px 0 2px;color:var(--muted)}
+.snap-row iframe{display:block}
+
+.log{background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:12px 14px;margin:0 0 8px}
+.log-top{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.log-top .ago{font-size:13px;color:var(--muted)}
+.log-main{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-top:9px}
+.log-main .det{color:var(--muted);font-size:14px;word-break:break-word}
+.log-time{margin-top:6px;font-size:12px;color:var(--faint)}
+.lnk{appearance:none;-webkit-appearance:none;border:0;background:none;padding:0;color:var(--accent);font-weight:650}
+
+.empty{text-align:center;padding:46px 20px;color:var(--muted)}
+.empty-ico{display:block;width:46px;height:46px;margin:0 auto 12px;color:var(--faint)}
+.empty-t{color:var(--text);font-weight:650;font-size:16px}
+.empty-s{margin-top:4px;font-size:14px}
+.skel{height:80px;margin:0 0 10px;border-radius:var(--r);background:var(--surface);border:1px solid var(--line);border-left:4px solid var(--line2);animation:pulse 1.3s ease-in-out infinite}
+@keyframes pulse{50%{opacity:.45}}
+.more{margin-top:4px}
+
+.card-t{font-weight:650;font-size:16px}
+.card-s{margin:4px 0 12px;font-size:14px;color:var(--muted)}
+.card.zone{border-left-color:var(--danger)}
+
+/* bottom nav */
+.nav{position:fixed;left:0;right:0;bottom:0;z-index:20;background:rgba(11,22,32,.93);-webkit-backdrop-filter:blur(14px);backdrop-filter:blur(14px);border-top:1px solid var(--line);padding-bottom:env(safe-area-inset-bottom,0px)}
+.nav-in{position:relative;max-width:720px;margin:0 auto;height:var(--nav-h);display:grid;grid-template-columns:repeat(5,1fr)}
+.tab{position:relative;z-index:1;display:flex;flex-direction:column;align-items:center;justify-content:flex-start;gap:3px;padding:8px 0 0;border:0;background:none;color:var(--muted);font-size:11.5px;font-weight:600}
+.tab.on{color:var(--accent)}
+.ico-wrap{position:relative;display:grid;place-items:center;height:32px;width:58px}
+.pill{position:absolute;top:8px;left:0;width:20%;height:32px;display:flex;justify-content:center;pointer-events:none;transition:transform .3s cubic-bezier(.3,.9,.3,1)}
+.pill::before{content:"";width:58px;height:32px;border-radius:16px;background:var(--accent-bg)}
+.nb{position:absolute;top:-1px;right:2px;min-width:18px;height:18px;padding:0 5px;border-radius:9px;background:var(--accent);color:var(--accent-ink);font-size:11px;font-weight:700;display:grid;place-items:center;line-height:1}
+.nb.hot{background:#FF4D6D;color:#fff}
+
+#msg{position:fixed;left:14px;right:14px;bottom:calc(var(--nav-h) + env(safe-area-inset-bottom,0px) + 12px);z-index:30;max-width:520px;margin:0 auto;padding:12px 14px;border-radius:14px;background:#1E374A;border:1px solid var(--line2);box-shadow:0 10px 28px rgba(0,0,0,.4);font-size:14px;opacity:0;transform:translateY(10px);pointer-events:none;transition:opacity .2s,transform .2s}
+#msg.show{opacity:1;transform:none;pointer-events:auto}
+#msg.err{border-color:rgba(255,107,107,.55);color:#FFD6D6}
+body.out #msg{bottom:calc(env(safe-area-inset-bottom,0px) + 20px)}
+
+@media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
+</style></head><body class="out">
+
+<div id="login">
+  <div class="login-card">
+    <div class="mark"><span class="ico" data-i="shield"></span></div>
+    <h1>Admin</h1>
+    <p>Sign in with your admin token to review reports and manage pages.</p>
+    <input class="field" id="tok" type="password" placeholder="Admin token" autocomplete="off" autocapitalize="off" spellcheck="false">
+    <button class="btn primary block" id="go">Sign in</button>
+    <div class="fine">The token stays in this tab only and is cleared when the tab closes.</div>
+  </div>
+</div>
+
+<div id="app">
+  <header class="bar"><div class="bar-in">
+    <button class="icon-btn" id="back" aria-label="Back" hidden><span class="ico" data-i="back"></span></button>
+    <div class="bar-title"><h1 id="ttl">Reports</h1><div class="bar-sub" id="sub"></div></div>
+    <button class="icon-btn" id="rf" aria-label="Refresh"><span class="ico" data-i="refresh"></span></button>
+    <button class="icon-btn" id="so" aria-label="Sign out"><span class="ico" data-i="lock"></span></button>
+  </div></header>
+
+  <main>
+    <div id="p-reports" class="pnl on">
+      <div class="filters">
+        <label class="sel"><select id="freason" aria-label="Reason"><option value="">All reasons</option><option>spam</option><option>copyright</option><option>abuse</option><option>csam</option><option>other</option></select><span class="ico" data-i="chev"></span></label>
+        <label class="sel"><select id="fstatus" aria-label="Status"><option value="">All statuses</option><option>live</option><option>taken down</option><option>unpublished</option><option>missing</option></select><span class="ico" data-i="chev"></span></label>
+        <label class="pillck"><input type="checkbox" id="fgroup" checked><span>Group by slug</span></label>
+        <label class="pillck"><input type="checkbox" id="fdis"><span>Show dismissed</span></label>
+      </div>
+      <div class="summary" id="rsum"></div>
+      <div id="list"></div>
+      <button class="btn block more" id="more" style="display:none">Load more</button>
+    </div>
+
+    <div id="p-lookup" class="pnl">
+      <div class="search">
+        <div class="field-wrap"><span class="ico" data-i="search"></span><input class="field" id="lkslug" placeholder="Slug or link" autocomplete="off" autocapitalize="off" spellcheck="false"></div>
+        <button class="btn primary" id="lkgo">Look up</button>
+      </div>
+      <div id="lkout"></div>
+      <div id="lkowner"></div>
+    </div>
+
+    <div id="p-ads" class="pnl">
+      <div class="filters">
+        <label class="sel"><select id="adst" aria-label="Ad status"><option value="">All ads</option><option value="active">Active</option><option value="paused">Paused</option><option value="exhausted">Used up</option><option value="unpublished">Down</option></select><span class="ico" data-i="chev"></span></label>
+      </div>
+      <div id="adlist"></div>
+      <button class="btn block more" id="admore" style="display:none">Load more</button>
+    </div>
+
+    <div id="p-audit" class="pnl">
+      <div id="aulist"></div>
+      <button class="btn block more" id="aumore" style="display:none">Load more</button>
+    </div>
+
+    <div id="p-tools" class="pnl">
+      <div class="card static">
+        <div class="card-t">Snapshot previews</div>
+        <div class="card-s">Choose which images load when you view a snapshot from a report.</div>
+        <label class="tog"><span class="tog-text"><b>Embedded images</b><small>Load embedded (data:) images in snapshot previews. Off by default.</small></span><input type="checkbox" id="imgs"></label>
+        <label class="tog"><span class="tog-text"><b>External images</b><small>Load external (https) images, fetched through the worker so the image hosts see the worker, not your IP. Off by default.</small></span><input type="checkbox" id="ext"></label>
+      </div>
+      <div class="card static">
+        <div class="card-t">Release a slug</div>
+        <div class="card-s">Unpublishes without locking, so the slug can be reused right away.</div>
+        <input class="field" id="relslug" placeholder="Slug or link" autocomplete="off" autocapitalize="off" spellcheck="false" style="margin-bottom:10px">
+        <button class="btn block" id="relgo">Release slug</button>
+      </div>
+      <div class="card static zone">
+        <div class="card-t">Purge</div>
+        <div class="card-s">Same job the cron runs: deletes expired unpublished pages and accounts past their deletion window.</div>
+        <button class="btn danger block" id="purgego">Run purge now</button>
+      </div>
+    </div>
+  </main>
+
+  <nav class="nav" aria-label="Sections"><div class="nav-in">
+    <i class="pill" id="pill"></i>
+    <button class="tab on" data-t="reports"><span class="ico-wrap"><span class="ico" data-i="reports"></span><span class="nb" id="nb-reports" hidden></span></span>Reports</button>
+    <button class="tab" data-t="lookup"><span class="ico-wrap"><span class="ico" data-i="search"></span></span>Lookup</button>
+    <button class="tab" data-t="ads"><span class="ico-wrap"><span class="ico" data-i="ads"></span></span>Ads</button>
+    <button class="tab" data-t="audit"><span class="ico-wrap"><span class="ico" data-i="audit"></span></span>Audit</button>
+    <button class="tab" data-t="tools"><span class="ico-wrap"><span class="ico" data-i="tools"></span></span>Tools</button>
+  </div></nav>
+</div>
+
+<div id="msg" role="status" aria-live="polite"></div>
+
 <script>
+function $(i){return document.getElementById(i)}
+var ICON={
+  back:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="m14.5 5.5-6.5 6.5 6.5 6.5"/></svg>',
+  chev:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9.5 6 6 6-6"/></svg>',
+  refresh:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M19.5 11a7.5 7.5 0 1 0-2.2 5.3"/><path d="M19.5 4.5V11H13"/></svg>',
+  lock:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="10.5" width="14" height="10" rx="2.5"/><path d="M8.5 10.5V8a3.5 3.5 0 0 1 7 0v2.5"/></svg>',
+  shield:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3.5 5 6v5.5c0 4.2 2.8 7.8 7 9 4.2-1.2 7-4.8 7-9V6l-7-2.5Z"/><path d="m9 12 2 2 4-4"/></svg>',
+  reports:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M5.5 21V4.5"/><path d="M5.5 4.5h12l-2.5 4 2.5 4h-12"/></svg>',
+  search:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="6.5"/><path d="m20 20-4.2-4.2"/></svg>',
+  ads:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 14v-4l10-4v12L4 14Z"/><path d="M17.5 9.5a3.5 3.5 0 0 1 0 5"/><path d="m6.5 14.5 1.5 4.5h2.5l-1-3.7"/></svg>',
+  audit:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/></svg>',
+  tools:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h8M17 7h3M4 17h3M12 17h8"/><circle cx="14.5" cy="7" r="2.3"/><circle cx="9.5" cy="17" r="2.3"/></svg>',
+  check:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="m8 12.5 3 3 5-6"/></svg>'
+};
+function ico(n,c){var s=document.createElement('span');s.className='ico'+(c?' '+c:'');s.innerHTML=ICON[n];return s}
+[].forEach.call(document.querySelectorAll('[data-i]'),function(n){n.innerHTML=ICON[n.getAttribute('data-i')]});
+
+/* ---------- Snapshot preview (sandboxed) ---------- */
 function toDataUrl(b){return new Promise(function(res){var r=new FileReader();r.onload=function(){res(r.result)};r.onerror=function(){res(null)};r.readAsDataURL(b)})}
 var imgCache={},imgBytes=0,IMG_BUDGET=30*1024*1024;
 function csp(want,ext){return "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; img-src "+((want||ext)?'data:':"'none'")}
@@ -3591,18 +3866,6 @@ function buildDoc(t){
 }
 function setFrame(f,t){var g=f._g=(f._g||0)+1;f._t=t;buildDoc(t).then(function(doc){if(f._g===g)f.srcdoc=doc})}
 function refreshFrames(){document.querySelectorAll('iframe').forEach(function(f){if(f._t!=null)setFrame(f,f._t)})}
-function mkView(r,s,row){var b=el('button',null,'View');var fr=null;b.onclick=function(){
-  if(fr){fr.remove();fr=null;b.textContent='View';return}
-  if(r.isCsam&&!confirm('This snapshot is from a CSAM report. It opens as text and styling only unless an images checkbox is on. Continue?'))return;
-  b.disabled=true;
-  fetch('/admin/snapshot/'+encodeURIComponent(r.slug)+'/'+s.ts,{headers:{'X-Admin-Token':tok}}).then(function(x){return x.text().then(function(t){return{ok:x.ok,t:t}})}).then(function(o){
-    b.disabled=false;
-    if(!o.ok){msg('snapshot load failed');return}
-    fr=document.createElement('iframe');fr.setAttribute('sandbox','');fr.referrerPolicy='no-referrer';
-    fr.style.cssText='width:100%;height:60vh;margin-top:6px;border:1px solid #444;border-radius:8px;background:#fff';
-    row.appendChild(fr);setFrame(fr,o.t);b.textContent='Hide'
-  }).catch(function(){b.disabled=false;msg('network error')})
-};return b}
 $('imgs').onchange=function(){
   if(this.checked&&!confirm('Embedded images in snapshots (including ones from CSAM reports) will be displayed. Continue?')){this.checked=false;return}
   refreshFrames()
@@ -3611,68 +3874,148 @@ $('ext').onchange=function(){
   if(this.checked&&!confirm('External images will be fetched by the worker from whatever hosts the page points at. Those hosts see the worker (not your IP) and that a preview was opened, and content from CSAM reports may display. Continue?')){this.checked=false;return}
   refreshFrames()
 };
-var tok=sessionStorage.getItem('adm')||'',next=null,all=[],cur='reports',adOff=0,auNext=null;
-function $(i){return document.getElementById(i)}
-function msg(t){$('msg').textContent=t||''}
+
+/* ---------- Core state and helpers ---------- */
+var tok=sessionStorage.getItem('adm')||'',next=null,all=[],cur='reports',adOff=0,auNext=null,lkSlug='',stack=[],openSet={},mt=null;
+var TABS=['reports','lookup','ads','audit','tools'];
+var TITLES={reports:'Reports',lookup:'Lookup',ads:'Ads',audit:'Audit',tools:'Tools'};
 function el(t,c,x){var e=document.createElement(t);if(c)e.className=c;if(x!=null)e.textContent=x;return e}
 function fmt(t){return t?new Date(t).toLocaleString():'-'}
+function ago(t){if(!t)return'-';var s=Math.max(0,(Date.now()-t)/1000);if(s<60)return'just now';var m=s/60;if(m<60)return Math.floor(m)+'m ago';var h=m/60;if(h<24)return Math.floor(h)+'h ago';var d=h/24;if(d<30)return Math.floor(d)+'d ago';return new Date(t).toLocaleDateString()}
+function msg(t,k){
+  var m=$('msg');clearTimeout(mt);
+  if(!t){m.className='';m.textContent='';return}
+  k=k||(/fail|error|invalid|denied|too many|not live|enter a slug|enter your|cannot|couldn/i.test(t)?'err':'ok');
+  m.textContent=t;m.className='show '+k;
+  mt=setTimeout(function(){m.className=''},k==='err'?7000:4000)
+}
 function api(path,o){o=o||{};var h={'X-Admin-Token':tok};if(o.body)h['Content-Type']='application/json';
   return fetch(path,{method:o.method||'GET',headers:h,body:o.body?JSON.stringify(o.body):undefined}).then(function(r){return r.json().catch(function(){return{}}).then(function(j){return{ok:r.ok,s:r.status,j:j}})})}
-function btn(label,cls,fn){var b=el('button',cls||null,label);b.onclick=function(){fn(b)};return b}
+function btn(label,cls,fn){var b=document.createElement('button');b.type='button';b.className='btn'+(cls?' '+cls:'');b.textContent=label;b.onclick=function(){fn(b)};return b}
+function link(label,href){var a=el('a','btn',label);a.href=href;a.target='_blank';a.rel='noopener';return a}
+function chip(text,cls){return el('span','chip'+(cls?' '+cls:''),text)}
 function kv(c,k,v){var d=el('div','kv');d.appendChild(el('b',null,k));d.appendChild(el('span',null,v));c.appendChild(d)}
 function slugFrom(v){v=(v||'').trim().toLowerCase();var q=v.indexOf('?');if(q>-1)v=v.slice(0,q);var p=v.split('/').filter(Boolean);v=p.length?p[p.length-1]:'';return v.charAt(0)==='@'?v.slice(1):v}
-function showTab(t){cur=t;
-  ['reports','lookup','ads','audit','tools'].forEach(function(n){$('p-'+n).className='pnl'+(n===t?' on':'');[].forEach.call(document.querySelectorAll('.tab'),function(b){b.className='tab'+(b.getAttribute('data-t')===cur?' on':'')})});
+function empty(title,text,icon){var d=el('div','empty');d.appendChild(ico(icon||'check','empty-ico'));d.appendChild(el('div','empty-t',title));if(text)d.appendChild(el('div','empty-s',text));return d}
+function skel(c,n){for(var i=0;i<n;i++)c.appendChild(el('div','skel'))}
+function unskel(c){[].forEach.call(c.querySelectorAll('.skel'),function(n){n.remove()})}
+
+var SEV=['csam','abuse','copyright','other','spam'];
+function rcls(r){return 'r-'+(SEV.indexOf(r)<0?'other':r)}
+function topReason(g){var best='spam',bi=99;g.items.forEach(function(x){var i=SEV.indexOf(x.reason);if(i<0)i=3;if(i<bi){bi=i;best=SEV[i]}});return best}
+function stChip(s){var m={'live':'s-live','taken down':'s-bad','unpublished':'s-off','missing':'s-off','active':'s-live','paused':'s-warn','exhausted':'s-off'};return chip(s,'st '+(m[s]||'s-off'))}
+
+/* collapsible card: returns {c: article, pad: body container} */
+function mkCard(cls,slug,chips,sub,extra,key){
+  var c=el('article','card '+cls),h=el('button','card-head');h.type='button';h.setAttribute('aria-expanded','false');
+  var m=el('div','head-main');m.appendChild(el('div','slug',slug));
+  var cr=el('div','chips');chips.forEach(function(x){cr.appendChild(x)});m.appendChild(cr);
+  if(sub)m.appendChild(el('div','sub',sub));
+  if(extra)m.appendChild(extra);
+  h.appendChild(m);h.appendChild(ico('chev','chev'));
+  var body=el('div','card-body'),inner=el('div','inner'),pad=el('div','pad');
+  inner.appendChild(pad);body.appendChild(inner);
+  function set(o){c.classList.toggle('open',o);h.setAttribute('aria-expanded',o?'true':'false');if(key)openSet[key]=o}
+  h.onclick=function(){set(!c.classList.contains('open'))};
+  if(key&&openSet[key])set(true);
+  c.appendChild(h);c.appendChild(body);
+  return{c:c,pad:pad}
+}
+
+/* ---------- Navigation ---------- */
+function state(){return{t:cur,slug:cur==='lookup'?lkSlug:''}}
+function setSub(){$('sub').textContent=(cur==='lookup'&&lkSlug)?'/'+lkSlug:''}
+function showTab(t){
+  cur=t;
+  TABS.forEach(function(n){$('p-'+n).className='pnl'+(n===t?' on':'')});
+  [].forEach.call(document.querySelectorAll('.tab'),function(b){var on=b.getAttribute('data-t')===t;b.className='tab'+(on?' on':'');if(on)b.setAttribute('aria-current','page');else b.removeAttribute('aria-current')});
+  $('pill').style.transform='translateX('+(TABS.indexOf(t)*100)+'%)';
+  $('ttl').textContent=TITLES[t];
+  $('back').hidden=!stack.length;
+  $('rf').style.display=t==='tools'?'none':'';
+  setSub();
   if(t==='ads'&&!$('adlist').firstChild)loadAds(true);
-  if(t==='audit'&&!$('aulist').firstChild)loadAudit(true)}
-function loggedIn(ok){$('login').style.display=ok?'none':'';$('tabs').style.display=ok?'':'none';if(!ok){['reports','lookup','ads','audit','tools'].forEach(function(n){$('p-'+n).className='pnl'})}else showTab(cur)}
+  if(t==='audit'&&!$('aulist').firstChild)loadAudit(true)
+}
+function goTab(t){stack.push(state());showTab(t);window.scrollTo(0,0)}
+function goBack(){
+  var s=stack.pop();if(!s)return;
+  showTab(s.t);
+  if(s.t==='lookup'&&s.slug){lkSlug=s.slug;$('lkslug').value=s.slug;doLookup(s.slug)}
+  window.scrollTo(0,0)
+}
+function loggedIn(ok){
+  document.body.className=ok?'in':'out';
+  if(ok)showTab(cur)
+}
 function bad(o){if(o.s===403||o.s===429){sessionStorage.removeItem('adm');loggedIn(false)}msg(o.j.error||'failed ('+o.s+')')}
 
 /* ---------- Reports ---------- */
 function loadReports(reset){
-  if(reset){all=[];next=null;$('list').textContent=''}
-  api('/admin/reports?'+($('fdis').checked?'dismissed=1&':'')+(next?'cursor='+encodeURIComponent(next):'')).then(function(o){
+  var L=$('list');
+  if(reset){all=[];next=null;L.textContent='';skel(L,3)}
+  return api('/admin/reports?'+($('fdis').checked?'dismissed=1&':'')+(next?'cursor='+encodeURIComponent(next):'')).then(function(o){
+    unskel(L);
     if(!o.ok){bad(o);return}
-    sessionStorage.setItem('adm',tok);loggedIn(true);
+    sessionStorage.setItem('adm',tok);if(document.body.className!=='in')loggedIn(true);
     all=all.concat(o.j.reports);next=o.j.nextCursor;
     $('more').style.display=next?'':'none';
-    if(!o.j.reports.length&&next){loadReports(false);return}
+    if(!o.j.reports.length&&next){return loadReports(false)}
     renderAll()
-  }).catch(function(){msg('network error')})
+  }).catch(function(){unskel(L);msg('network error')})
 }
+function setBadge(n,hot){var b=$('nb-reports');if(!n){b.hidden=true;return}b.hidden=false;b.textContent=(n>99?'99+':String(n))+(next?'+':'');b.className='nb'+(hot?' hot':'')}
 function renderAll(){
-  var fr=$('freason').value,fs=$('fstatus').value,grp=$('fgroup').checked;
+  var fr=$('freason').value,fs=$('fstatus').value,grp=$('fgroup').checked,dis=$('fdis').checked;
   var items=all.filter(function(r){return(!fr||r.reason===fr)&&(!fs||r.status===fs)});
   var groups=[],idx={};
-  items.forEach(function(r){var k=grp?r.slug:r.key;if(idx[k]==null){idx[k]=groups.length;groups.push({slug:r.slug,items:[]})}groups[idx[k]].items.push(r)});
-  function hasC(g){return g.items.some(function(x){return x.isCsam})}
-  groups.sort(function(a,b){var x=hasC(a),y=hasC(b);if(x!==y)return x?-1:1;return b.items[0].reportedAt-a.items[0].reportedAt});
-  $('list').textContent='';groups.forEach(renderGroup);
-  msg(groups.length?groups.length+' group(s) shown'+(next?' so far':''):(all.length?'No reports match the filters':'No '+($('fdis').checked?'dismissed':'open')+' reports'))
+  items.forEach(function(r){var k=grp?r.slug:r.key;if(idx[k]==null){idx[k]=groups.length;groups.push({slug:r.slug,key:k,items:[]})}groups[idx[k]].items.push(r)});
+  groups.sort(function(a,b){var x=hasCsam(a),y=hasCsam(b);if(x!==y)return x?-1:1;return b.items[0].reportedAt-a.items[0].reportedAt});
+  var L=$('list');L.textContent='';groups.forEach(renderGroup);
+  var n=groups.length;
+  $('rsum').textContent=n?(n+(n===1?' page ':' pages ')+(dis?'dismissed':'with open reports')+(next?', more to load':'')):'';
+  if(!n){
+    if(all.length)L.appendChild(empty('Nothing matches','Change the filters above to see more reports.','reports'));
+    else L.appendChild(empty(dis?'No dismissed reports':'All clear',dis?'Dismissed reports show up here.':'There are no open reports.','check'))
+  }
+  if(!dis){var s={},h=false;all.forEach(function(r){s[r.slug]=1;if(r.isCsam)h=true});setBadge(Object.keys(s).length,h)}
 }
 function setSlugStatus(slug,st){all.forEach(function(r){if(r.slug===slug)r.status=st});renderAll()}
-function renderGroup(g){
-  var first=g.items[0],csam=hasCsam(g),c=el('div','card'+(csam?' csam':''));
-  var h=el('div',null,'/'+g.slug),seen={};
-  g.items.forEach(function(x){if(!seen[x.reason]){seen[x.reason]=1;h.appendChild(el('span','badge'+(x.isCsam?' c':''),x.reason))}});
-  if(g.items.length>1)h.appendChild(el('span','badge','x'+g.items.length));
-  h.appendChild(el('span','badge',first.status));
-  var nc=null;g.items.forEach(function(x){if(x.ncmec&&!nc)nc=x.ncmec});
-  if(csam)h.appendChild(el('span','badge '+(nc?'ok':'c'),nc?'NCMEC '+new Date(nc.at).toLocaleDateString():'NCMEC not recorded'));
-  c.appendChild(h);
-  g.items.forEach(function(x){c.appendChild(el('div','meta',fmt(x.reportedAt)+' - '+x.reason+(x.dismissedAt?' - dismissed '+fmt(x.dismissedAt):'')));c.appendChild(el('div','d',x.details||'(no details)'))});
-  var row=el('div','row'),a=el('a',null,'View page');a.href='/@'+g.slug;a.target='_blank';a.rel='noopener';row.appendChild(a);
-  var done=function(st){setSlugStatus(g.slug,st)};
-  if(first.status==='live'){row.appendChild(btn('Take down','danger',function(){takedown(g.slug,csam,done)}));if(!csam)row.appendChild(btn('Release slug',null,function(){release(g.slug,function(){done('unpublished')})}))}
-  if(first.status==='taken down')row.appendChild(btn('Restore',null,function(){restore(g.slug,csam,0,done)}));
-  row.appendChild(mkSnaps(g.slug,first.status,first.reportedAt,c,csam,done));
-  row.appendChild(btn('Lookup',null,function(){openLookup(g.slug)}));
-  if(csam)row.appendChild(btn(nc?'Add NCMEC record':'Record NCMEC report',null,function(){recordNcmec(g.slug,function(){loadReports(true)})}));
-  if($('fdis').checked)row.appendChild(btn('Undo dismiss',null,function(b){undismiss(g,b)}));
-  else row.appendChild(btn('Dismiss',null,function(){dismissGroup(g,csam,nc,c)}));
-  c.appendChild(row);$('list').appendChild(c)
-}
 function hasCsam(g){return g.items.some(function(x){return x.isCsam})}
+function renderGroup(g){
+  var first=g.items[0],csam=hasCsam(g),sev=csam?'csam':topReason(g);
+  var nc=null;g.items.forEach(function(x){if(x.ncmec&&!nc)nc=x.ncmec});
+  var chips=[],seen={};
+  g.items.forEach(function(x){if(!seen[x.reason]){seen[x.reason]=1;chips.push(chip(x.reason,x.isCsam?'r-csam':rcls(x.reason)))}});
+  chips.push(stChip(first.status));
+  if(g.items.length>1)chips.push(chip(g.items.length+' reports'));
+  if(csam)chips.push(chip(nc?'NCMEC '+new Date(nc.at).toLocaleDateString():'NCMEC not recorded',nc?'good':'bad'));
+  var card=mkCard('sev-'+sev+(csam?' is-csam':''),'/'+g.slug,chips,'Latest report '+ago(first.reportedAt),null,'rep:'+g.key);
+  var pad=card.pad;
+  g.items.forEach(function(x){
+    var r=el('div','rep'),top=el('div','rep-top');
+    top.appendChild(chip(x.reason,x.isCsam?'r-csam':rcls(x.reason)));
+    top.appendChild(el('span',null,fmt(x.reportedAt)));
+    r.appendChild(top);
+    r.appendChild(el('div','d'+(x.details?'':' none'),x.details||'(no details)'));
+    if(x.dismissedAt)r.appendChild(el('div','was','Dismissed '+fmt(x.dismissedAt)));
+    pad.appendChild(r)
+  });
+  var done=function(st){setSlugStatus(g.slug,st)};
+  var a1=el('div','actions');
+  a1.appendChild(link('View page','/@'+g.slug));
+  a1.appendChild(btn('Lookup',null,function(){openLookup(g.slug)}));
+  a1.appendChild(mkSnaps(g.slug,first.status,first.reportedAt,pad,csam,done));
+  pad.appendChild(a1);
+  var a2=el('div','actions divide');
+  if(first.status==='live'){a2.appendChild(btn('Take down','danger',function(){takedown(g.slug,csam,done)}));if(!csam)a2.appendChild(btn('Release slug',null,function(){release(g.slug,function(){done('unpublished')})}))}
+  if(first.status==='taken down')a2.appendChild(btn('Restore',null,function(){restore(g.slug,csam,0,done)}));
+  if(csam)a2.appendChild(btn(nc?'Add NCMEC record':'Record NCMEC report',null,function(){recordNcmec(g.slug,function(){loadReports(true)})}));
+  if($('fdis').checked)a2.appendChild(btn('Undo dismiss',null,function(b){undismiss(g,b)}));
+  else a2.appendChild(btn('Dismiss',null,function(){dismissGroup(g,csam,nc,card.c)}));
+  pad.appendChild(a2);
+  $('list').appendChild(card.c)
+}
 function sendKeys(path,keys){return Promise.all(keys.map(function(k){return api(path,{method:'POST',body:{key:k}})})).then(function(rs){return rs.every(function(r){return r.ok})})}
 function dropKeys(keys){all=all.filter(function(r){return keys.indexOf(r.key)<0})}
 function dismissGroup(g,csam,nc,card){
@@ -3680,10 +4023,10 @@ function dismissGroup(g,csam,nc,card){
   if(csam){
     var w='CSAM report: only dismiss once the page is handled and NCMEC has been notified.'+(nc?'':' NO NCMEC REPORT IS RECORDED for this page.')+' The record is hidden but kept for 18 months and can be brought back from Show dismissed. Dismiss /'+slug+'?';
     if(!confirm(w))return;
-    sendKeys('/admin/dismiss',keys).then(function(ok){if(!ok){msg('dismiss failed');return}dropKeys(keys);var r=el('div','card');r.appendChild(el('span',null,'Dismissed /'+slug+'. '));r.appendChild(btn('Undo',null,function(){sendKeys('/admin/undismiss',keys).then(function(){loadReports(true)})}));card.replaceWith(r)});
+    sendKeys('/admin/dismiss',keys).then(function(ok){if(!ok){msg('dismiss failed');return}dropKeys(keys);var r=el('div','card note');r.appendChild(el('span',null,'Dismissed /'+slug));r.appendChild(btn('Undo',null,function(){sendKeys('/admin/undismiss',keys).then(function(){loadReports(true)})}));card.replaceWith(r)});
     return}
-  var row=el('div','card');row.appendChild(el('span',null,'Dismissing /'+slug+' in 8 seconds. '));
-  var t=setTimeout(function(){sendKeys('/admin/dismiss',keys).then(function(ok){if(ok){dropKeys(keys);row.remove()}else{msg('dismiss failed');row.replaceWith(card)}})},8000);
+  var row=el('div','card note');row.appendChild(el('span',null,'Dismissing /'+slug+' in 8 seconds'));
+  var t=setTimeout(function(){sendKeys('/admin/dismiss',keys).then(function(ok){if(ok){dropKeys(keys);row.remove();renderAll()}else{msg('dismiss failed');row.replaceWith(card)}})},8000);
   row.appendChild(btn('Undo',null,function(){clearTimeout(t);row.replaceWith(card)}));
   card.replaceWith(row)
 }
@@ -3718,62 +4061,97 @@ function recordNcmec(slug,done){
   api('/admin/ncmec',{method:'POST',body:{slug:slug,reportId:id,note:note||''}}).then(function(o){
     if(o.ok){msg('NCMEC report recorded for /'+slug);if(done)done()}else msg(o.j.error||'failed')})
 }
-function mkSnaps(slug,status,hitTs,card,csam,done){var t=el('button',null,'Snapshots');var box=null;t.onclick=function(){
-  if(box){box.remove();box=null;return}
-  t.disabled=true;
-  api('/admin/snapshots/'+encodeURIComponent(slug)).then(function(o){
-    t.disabled=false;
-    if(!o.ok){msg(o.j.error||'snapshot list failed');return}
-    box=el('div','snap');
-    if(!o.j.snapshots.length)box.appendChild(el('div',null,'No snapshots for /'+slug));
-    o.j.snapshots.forEach(function(s){
-      var d=el('div',s.ts===hitTs?'hit':null);
-      d.appendChild(document.createTextNode(fmt(s.ts)+' - '+s.source+(s.ts===hitTs?' (this report)':'')+' '));
-      d.appendChild(el('code',null,new Date(s.ts).toISOString()+' / '+s.ts+' / '+Math.round(s.size/1024)+' KB'));
-      d.appendChild(document.createTextNode(' '));
-      d.appendChild(mkView({slug:slug,isCsam:csam},s,d));
-      if(status==='taken down')d.appendChild(btn('Restore this copy',null,function(){restore(slug,csam,s.ts,done)}));
-      box.appendChild(d)
-    });
-    card.appendChild(box)
-  }).catch(function(){t.disabled=false;msg('network error')})
-};return t}
+function mkView(r,s,row){
+  var fr=null;
+  var b=btn('View',null,function(){
+    if(fr){fr.remove();fr=null;b.textContent='View';return}
+    if(r.isCsam&&!confirm('This snapshot is from a CSAM report. It opens as text and styling only unless an images checkbox is on. Continue?'))return;
+    b.disabled=true;
+    fetch('/admin/snapshot/'+encodeURIComponent(r.slug)+'/'+s.ts,{headers:{'X-Admin-Token':tok}}).then(function(x){return x.text().then(function(t){return{ok:x.ok,t:t}})}).then(function(o){
+      b.disabled=false;
+      if(!o.ok){msg('snapshot load failed');return}
+      fr=document.createElement('iframe');fr.setAttribute('sandbox','');fr.referrerPolicy='no-referrer';
+      fr.style.cssText='width:100%;height:60vh;margin-top:10px;border:1px solid var(--line2);border-radius:12px;background:#fff';
+      row.appendChild(fr);setFrame(fr,o.t);b.textContent='Hide'
+    }).catch(function(){b.disabled=false;msg('network error')})
+  });
+  return b
+}
+function mkSnaps(slug,status,hitTs,card,csam,done){
+  var box=null;
+  var t=btn('Snapshots',null,function(){
+    if(box){box.remove();box=null;return}
+    t.disabled=true;
+    api('/admin/snapshots/'+encodeURIComponent(slug)).then(function(o){
+      t.disabled=false;
+      if(!o.ok){msg(o.j.error||'snapshot list failed');return}
+      box=el('div','snaps');
+      if(!o.j.snapshots.length)box.appendChild(el('div','snap-none','No snapshots for /'+slug));
+      o.j.snapshots.forEach(function(s){
+        var d=el('div','snap-row'+(s.ts===hitTs?' hit':'')),line=el('div','snap-line');
+        line.appendChild(el('span','when',fmt(s.ts)));
+        line.appendChild(chip(s.source));
+        if(s.ts===hitTs)line.appendChild(chip('this report','warn'));
+        line.appendChild(mkView({slug:slug,isCsam:csam},s,d));
+        if(status==='taken down')line.appendChild(btn('Restore this copy',null,function(){restore(slug,csam,s.ts,done)}));
+        d.appendChild(line);
+        var m=el('div','snap-meta');m.appendChild(el('code',null,new Date(s.ts).toISOString()+' / '+s.ts+' / '+Math.round(s.size/1024)+' KB'));
+        d.insertBefore(m,line.nextSibling);
+        box.appendChild(d)
+      });
+      card.appendChild(box)
+    }).catch(function(){t.disabled=false;msg('network error')})
+  });
+  return t
+}
 
 /* ---------- Lookup and owner ---------- */
-function openLookup(slug){showTab('lookup');$('lkslug').value=slug;doLookup(slug)}
+function lookupHint(){var o=$('lkout');o.textContent='';o.appendChild(empty('Look up a page','Enter a slug or paste a link to see its status, owner and history.','search'))}
+function openLookup(slug){
+  if(cur!=='lookup'||lkSlug!==slug)stack.push(state());
+  lkSlug=slug;showTab('lookup');$('lkslug').value=slug;window.scrollTo(0,0);doLookup(slug)
+}
 function doLookup(v){
   var slug=slugFrom(v);if(!slug){msg('Enter a slug or link');return}
+  lkSlug=slug;setSub();
   api('/admin/lookup?slug='+encodeURIComponent(slug)).then(function(o){if(!o.ok){bad(o);return}msg('');renderLookup(o.j)}).catch(function(){msg('network error')})
 }
 function renderLookup(d){
-  var out=$('lkout');out.textContent='';
-  var c=el('div','card'+(d.csamHold?' csam':''));
-  var h=el('div',null,'/'+d.slug);if(d.found)h.appendChild(el('span','badge',d.status));c.appendChild(h);
-  if(!d.found){kv(c,'Published','never');kv(c,'Reports on file',String(d.reports));out.appendChild(c);return}
+  var out=$('lkout');out.textContent='';$('lkowner').textContent='';
+  var c=el('div','card static'+(d.csamHold?' is-csam':''));
+  var top=el('div','card-top');top.appendChild(el('div','slug','/'+d.slug));
+  if(d.found){var cr=el('div','chips');cr.appendChild(stChip(d.status));top.appendChild(cr)}
+  c.appendChild(top);
+  var k=el('div','kvs');c.appendChild(k);
+  if(!d.found){kv(k,'Published','never');kv(k,'Reports on file',String(d.reports));out.appendChild(c);return}
   var refresh=function(){doLookup(d.slug)};
-  kv(c,'Title',d.title||'-');kv(c,'Created',fmt(d.createdAt));kv(c,'Updated',fmt(d.updatedAt));
-  if(d.deletedAt)kv(c,'Went offline',fmt(d.deletedAt));
-  kv(c,'Size',d.sizeBytes!=null?Math.round(d.sizeBytes/1024)+' KB':'-');
-  kv(c,'Owner',d.hasOwner?(d.ownerEmail||'account missing'):'anonymous (no account)');
-  kv(c,'Stories',(d.showInStories?'showing':'not showing')+(d.storyBlocked?' (blocked by admin)':''));
-  kv(c,'Likes',String(d.likes));
-  kv(c,'Ad',d.ad?d.ad.status+', '+d.ad.viewsUsed+' of '+d.ad.viewsTotal+' views':'none');
-  kv(c,'Reports on file',String(d.reports));kv(c,'Snapshots',String(d.snapshots));
-  if(d.csamHold)kv(c,'CSAM hold','yes (kept out of purge)');
-  if(d.ncmec.length){d.ncmec.forEach(function(n){kv(c,'NCMEC',fmt(n.at)+(n.reportId?' - '+n.reportId:'')+(n.note?' - '+n.note:''))})}
-  else if(d.csamHold)kv(c,'NCMEC','not recorded');
-  var row=el('div','row');
-  if(d.status==='live'){var a=el('a',null,'View page');a.href='/@'+d.slug;a.target='_blank';a.rel='noopener';row.appendChild(a);
-    row.appendChild(btn('Take down','danger',function(){takedown(d.slug,d.csamHold,refresh)}));
-    if(!d.csamHold)row.appendChild(btn('Release slug',null,function(){release(d.slug,refresh)}));
-    if(d.showInStories)row.appendChild(btn('Remove from stories',null,function(){storyAct(d.slug,'remove',refresh)}))}
-  if(d.storyBlocked)row.appendChild(btn('Allow stories again',null,function(){storyAct(d.slug,'allow',refresh)}));
-  if(d.status==='taken down')row.appendChild(btn('Restore',null,function(){restore(d.slug,d.csamHold,0,refresh)}));
-  if(d.ad)row.appendChild(btn('Ads tab',null,function(){showTab('ads');loadAds(true)}));
-  if(d.csamHold||d.reports)row.appendChild(btn(d.ncmec.length?'Add NCMEC record':'Record NCMEC report',null,function(){recordNcmec(d.slug,refresh)}));
-  row.appendChild(mkSnaps(d.slug,d.status,0,c,d.csamHold,refresh));
-  if(d.hasOwner)row.appendChild(btn('Owner',null,function(){loadOwner(d.slug)}));
-  c.appendChild(row);out.appendChild(c);$('lkowner').textContent=''
+  kv(k,'Title',d.title||'-');kv(k,'Created',fmt(d.createdAt));kv(k,'Updated',fmt(d.updatedAt));
+  if(d.deletedAt)kv(k,'Went offline',fmt(d.deletedAt));
+  kv(k,'Size',d.sizeBytes!=null?Math.round(d.sizeBytes/1024)+' KB':'-');
+  kv(k,'Owner',d.hasOwner?(d.ownerEmail||'account missing'):'anonymous (no account)');
+  kv(k,'Stories',(d.showInStories?'showing':'not showing')+(d.storyBlocked?' (blocked by admin)':''));
+  kv(k,'Likes',String(d.likes));
+  kv(k,'Ad',d.ad?d.ad.status+', '+d.ad.viewsUsed+' of '+d.ad.viewsTotal+' views':'none');
+  kv(k,'Reports on file',String(d.reports));kv(k,'Snapshots',String(d.snapshots));
+  if(d.csamHold)kv(k,'CSAM hold','yes (kept out of purge)');
+  if(d.ncmec.length){d.ncmec.forEach(function(n){kv(k,'NCMEC',fmt(n.at)+(n.reportId?' - '+n.reportId:'')+(n.note?' - '+n.note:''))})}
+  else if(d.csamHold)kv(k,'NCMEC','not recorded');
+  var a1=el('div','actions divide');
+  if(d.status==='live')a1.appendChild(link('View page','/@'+d.slug));
+  a1.appendChild(mkSnaps(d.slug,d.status,0,c,d.csamHold,refresh));
+  if(d.hasOwner)a1.appendChild(btn('Owner',null,function(){loadOwner(d.slug)}));
+  if(d.ad)a1.appendChild(btn('Ads tab',null,function(){goTab('ads')}));
+  c.appendChild(a1);
+  var a2=el('div','actions');
+  if(d.status==='live'){
+    a2.appendChild(btn('Take down','danger',function(){takedown(d.slug,d.csamHold,refresh)}));
+    if(!d.csamHold)a2.appendChild(btn('Release slug',null,function(){release(d.slug,refresh)}));
+    if(d.showInStories)a2.appendChild(btn('Remove from stories',null,function(){storyAct(d.slug,'remove',refresh)}))}
+  if(d.storyBlocked)a2.appendChild(btn('Allow stories again',null,function(){storyAct(d.slug,'allow',refresh)}));
+  if(d.status==='taken down')a2.appendChild(btn('Restore',null,function(){restore(d.slug,d.csamHold,0,refresh)}));
+  if(d.csamHold||d.reports)a2.appendChild(btn(d.ncmec.length?'Add NCMEC record':'Record NCMEC report',null,function(){recordNcmec(d.slug,refresh)}));
+  if(a2.children.length)c.appendChild(a2);
+  out.appendChild(c)
 }
 function storyAct(slug,action,done){
   var w=action==='remove'?'Remove /'+slug+' from stories? The page stays online. The owner cannot turn stories back on until you allow it.':'Let /'+slug+' be shown in stories again?';
@@ -3784,17 +4162,20 @@ function loadOwner(slug){
   api('/admin/owner?slug='+encodeURIComponent(slug)).then(function(o){
     if(!o.ok){msg(o.j.error||'failed');return}
     var d=o.j,out=$('lkowner');out.textContent='';
-    var c=el('div','card');
+    var c=el('div','card static');
     if(d.anonymous){c.appendChild(el('div',null,'Anonymous page: no account to act on.'));out.appendChild(c);return}
-    var h=el('div',null,d.email||'(account missing)');
-    if(d.suspended)h.appendChild(el('span','badge c','suspended'));
-    if(d.pendingDeletionAt)h.appendChild(el('span','badge c','deletion '+new Date(d.pendingDeletionAt+2592000000).toLocaleDateString()));
-    c.appendChild(h);
-    kv(c,'Signed up',fmt(d.createdAt));kv(c,'Last sign-in',fmt(d.lastSignInAt));kv(c,'Ads',String(d.ads));kv(c,'Credit balance',String(d.creditBalance));
-    kv(c,'Live pages',String(d.pages.length));
-    d.pages.forEach(function(p){var r=el('div','kv');r.appendChild(btn('/'+p.slug,null,function(){openLookup(p.slug)}));r.appendChild(el('span',null,(p.reports?p.reports+' report(s) ':'')+(p.showInStories?'story':'')));c.appendChild(r)});
+    var top=el('div','card-top');top.appendChild(el('div','slug',d.email||'(account missing)'));
+    var cr=el('div','chips');
+    if(d.suspended)cr.appendChild(chip('suspended','bad'));
+    if(d.pendingDeletionAt)cr.appendChild(chip('deletion '+new Date(d.pendingDeletionAt+2592000000).toLocaleDateString(),'bad'));
+    if(cr.children.length)top.appendChild(cr);
+    c.appendChild(top);
+    var k=el('div','kvs');c.appendChild(k);
+    kv(k,'Signed up',fmt(d.createdAt));kv(k,'Last sign-in',fmt(d.lastSignInAt));kv(k,'Ads',String(d.ads));kv(k,'Credit balance',String(d.creditBalance));
+    kv(k,'Live pages',String(d.pages.length));
+    d.pages.forEach(function(p){var r=el('div','kv pg');r.appendChild(btn('/'+p.slug,null,function(){openLookup(p.slug)}));r.appendChild(el('span',null,(p.reports?p.reports+' report(s) ':'')+(p.showInStories?'story':'')));k.appendChild(r)});
     var again=function(){loadOwner(slug)};
-    var row=el('div','row');
+    var row=el('div','actions divide');
     row.appendChild(d.suspended?btn('Unsuspend',null,function(){ownerAct(slug,'unsuspend','Unsuspend this account?',again)}):btn('Suspend','danger',function(){ownerAct(slug,'suspend','Suspend this account? It is signed out everywhere and cannot sign in. Pages stay online.',again)}));
     row.appendChild(d.pendingDeletionAt?btn('Cancel deletion',null,function(){ownerAct(slug,'cancel-delete','Cancel the scheduled deletion?',again)}):btn('Delete account','danger',function(){ownerAct(slug,'delete','Schedule this account for deletion in 30 days and suspend it? The owner cannot cancel by signing in.',again)}));
     if(d.pages.length)row.appendChild(btn('Take down all live pages','danger',function(){takedownAll(d.pages,again)}));
@@ -3817,13 +4198,15 @@ function takedownAll(pages,done){
 
 /* ---------- Ads ---------- */
 function loadAds(reset){
-  if(reset){adOff=0;$('adlist').textContent=''}
-  api('/admin/ads?status='+encodeURIComponent($('adst').value)+'&offset='+adOff).then(function(o){
+  var L=$('adlist');
+  if(reset){adOff=0;L.textContent='';skel(L,3)}
+  return api('/admin/ads?status='+encodeURIComponent($('adst').value)+'&offset='+adOff).then(function(o){
+    unskel(L);
     if(!o.ok){bad(o);return}
     o.j.ads.forEach(renderAd);
     adOff=o.j.nextOffset;$('admore').style.display=adOff!=null?'':'none';
-    if(!$('adlist').firstChild)msg('No ads')
-  }).catch(function(){msg('network error')})
+    if(!L.firstChild)L.appendChild(empty('No ads','No ads match this filter.','ads'))
+  }).catch(function(){unskel(L);msg('network error')})
 }
 function adAct(a,action,refund,text){
   if(!confirm(text))return;
@@ -3831,9 +4214,14 @@ function adAct(a,action,refund,text){
     if(o.ok){msg(o.j.refunded?o.j.refunded+' views refunded':'done');loadAds(true)}else msg(o.j.error||'failed')})
 }
 function renderAd(a){
-  var c=el('div','card'),h=el('div',null,'/'+a.slug);h.appendChild(el('span','badge',a.status));c.appendChild(h);
-  c.appendChild(el('div','meta',(a.ownerEmail||'account missing')+' - '+a.viewsUsed+' of '+a.viewsTotal+' views - '+a.uniqueViewers+' unique - '+fmt(a.createdAt)));
-  var row=el('div','row'),left=a.viewsTotal-a.viewsUsed;
+  var left=a.viewsTotal-a.viewsUsed;
+  var pct=a.viewsTotal?Math.min(100,Math.round(a.viewsUsed/a.viewsTotal*100)):0;
+  var m=el('div','meter'),i=document.createElement('i');i.style.width=pct+'%';m.appendChild(i);
+  var card=mkCard('sev-ad','/'+a.slug,[stChip(a.status),chip(a.viewsUsed+' of '+a.viewsTotal+' views')],a.ownerEmail||'account missing',m,'ad:'+a.slug);
+  var pad=card.pad,k=el('div','kvs');
+  kv(k,'Unique viewers',String(a.uniqueViewers));kv(k,'Views left',String(left));kv(k,'Created',fmt(a.createdAt));
+  pad.appendChild(k);
+  var row=el('div','actions divide');
   row.appendChild(btn('Lookup',null,function(){openLookup(a.slug)}));
   if(a.status==='active')row.appendChild(btn('Pause',null,function(){adAct(a,'pause',0,'Pause /'+a.slug+'? It stops being served until resumed.')}));
   if(a.status==='paused')row.appendChild(btn('Resume',null,function(){adAct(a,'resume',0,'Resume /'+a.slug+'?')}));
@@ -3841,25 +4229,57 @@ function renderAd(a){
     row.appendChild(btn('Take down','danger',function(){adAct(a,'takedown',0,'Take the ad /'+a.slug+' down? The page stays online and the '+left+' unused views are forfeited.')}));
     if(left>0)row.appendChild(btn('Take down + refund','danger',function(){adAct(a,'takedown',1,'Take the ad /'+a.slug+' down and refund '+left+' unused views to the owner?')}))}
   else if(a.status==='unpublished'&&left>0)row.appendChild(btn('Refund unused','danger',function(){adAct(a,'refund',0,'Refund '+left+' unused views to the owner of /'+a.slug+'? This can only be done once.')}));
-  c.appendChild(row);$('adlist').appendChild(c)
+  pad.appendChild(row);$('adlist').appendChild(card.c)
 }
 
 /* ---------- Audit ---------- */
+function actCls(a){a=String(a||'');if(/take|purge|suspend|delete|ban/.test(a)&&!/unsuspend/.test(a))return'bad';if(/restore|release|unsuspend|allow|refund|resume/.test(a))return'good';return''}
 function loadAudit(reset){
-  if(reset){auNext=null;$('aulist').textContent=''}
-  api('/admin/audit'+(auNext?'?cursor='+encodeURIComponent(auNext):'')).then(function(o){
+  var L=$('aulist');
+  if(reset){auNext=null;L.textContent='';skel(L,4)}
+  return api('/admin/audit'+(auNext?'?cursor='+encodeURIComponent(auNext):'')).then(function(o){
+    unskel(L);
     if(!o.ok){bad(o);return}
-    o.j.entries.forEach(function(e){var d=el('div','snap');d.appendChild(document.createTextNode(fmt(e.at)+' - '+e.action+' '));
-      if(e.slug)d.appendChild(btn('/'+e.slug,null,function(){openLookup(e.slug)}));
-      if(e.detail)d.appendChild(document.createTextNode(' - '+e.detail));$('aulist').appendChild(d)});
+    o.j.entries.forEach(function(e){
+      var d=el('div','log'),top=el('div','log-top');
+      top.appendChild(chip(e.action,actCls(e.action)));top.appendChild(el('span','ago',ago(e.at)));
+      d.appendChild(top);
+      if(e.slug||e.detail){
+        var main=el('div','log-main');
+        if(e.slug){var lb=el('button','lnk','/'+e.slug);lb.type='button';lb.onclick=function(){openLookup(e.slug)};main.appendChild(lb)}
+        if(e.detail)main.appendChild(el('span','det',e.detail));
+        d.appendChild(main)
+      }
+      d.appendChild(el('div','log-time',fmt(e.at)));
+      L.appendChild(d)
+    });
     auNext=o.j.nextCursor;$('aumore').style.display=auNext?'':'none';
-    if(!$('aulist').firstChild)msg('No audit entries yet')
-  }).catch(function(){msg('network error')})
+    if(!L.firstChild)L.appendChild(empty('No audit entries yet','Takedowns, releases and other admin actions are logged here.','audit'))
+  }).catch(function(){unskel(L);msg('network error')})
 }
 
 /* ---------- Wiring ---------- */
-[].forEach.call(document.querySelectorAll('.tab'),function(b){b.onclick=function(){showTab(b.getAttribute('data-t'))}});
-$('go').onclick=function(){tok=$('tok').value.trim();loadReports(true)};
+[].forEach.call(document.querySelectorAll('.tab'),function(b){b.onclick=function(){stack=[];showTab(b.getAttribute('data-t'));window.scrollTo(0,0)}});
+$('back').onclick=goBack;
+$('rf').onclick=function(){
+  if(cur==='reports')loadReports(true);
+  else if(cur==='lookup'){if(lkSlug)doLookup(lkSlug)}
+  else if(cur==='ads')loadAds(true);
+  else if(cur==='audit')loadAudit(true)
+};
+$('so').onclick=function(){
+  sessionStorage.removeItem('adm');tok='';all=[];next=null;stack=[];lkSlug='';cur='reports';openSet={};
+  ['list','lkowner','adlist','aulist'].forEach(function(i){$(i).textContent=''});
+  lookupHint();setBadge(0);$('rsum').textContent='';$('tok').value='';
+  loggedIn(false);msg('Signed out','ok')
+};
+$('go').onclick=function(){
+  var v=$('tok').value.trim();
+  if(!v){msg('Enter your admin token');return}
+  tok=v;var b=$('go');b.disabled=true;b.textContent='Checking';
+  loadReports(true).then(function(){b.disabled=false;b.textContent='Sign in'})
+};
+$('tok').onkeydown=function(e){if(e.key==='Enter')$('go').onclick()};
 $('more').onclick=function(){loadReports(false)};
 $('admore').onclick=function(){loadAds(false)};
 $('aumore').onclick=function(){loadAudit(false)};
@@ -3871,10 +4291,12 @@ $('lkslug').onkeydown=function(e){if(e.key==='Enter')doLookup($('lkslug').value)
 $('relgo').onclick=function(){release(slugFrom($('relslug').value),function(){$('relslug').value=''})};
 $('purgego').onclick=function(){
   if(!confirm('Run the purge now? It permanently deletes pages unpublished more than 30 days ago (except held or locked ones) and accounts past their 30-day deletion window.'))return;
-  msg('Purging...');
+  msg('Purging...','ok');
   api('/admin/purge',{method:'POST'}).then(function(o){msg(o.ok?'Purge done: '+o.j.purged+' item(s) removed':(o.j.error||'purge failed'))}).catch(function(){msg('network error')})
 };
-if(tok)loadReports(true)
+$('msg').onclick=function(){msg('')};
+lookupHint();
+if(tok){loggedIn(true);loadReports(true)}
 </script></body></html>`;
 
 /* ---------------- Router ---------------- */
