@@ -1072,11 +1072,17 @@ async function handleMyPages(env, request) {
 /* ---------------- Stories ---------------- */
 
 const STORIES_STRIP_LIMIT = 12;
-// Signed-in candidate pool for the discovery strip is wider than what's
-// shown (see handleStoriesStrip's per-viewer shuffle) so that different
-// viewers, drawing from the same pool, land on genuinely different
-// subsets/orders rather than everyone just re-deriving the same top 12.
-const STORIES_STRIP_CANDIDATE_LIMIT = 60;
+// Discovery-strip pool: wider than what's shown (see handleStoriesStrip) so that different
+// viewers, drawing from the same pool, land on genuinely different subsets rather than
+// everyone re-deriving the same top 12. The pool is the newest stories with at most
+// STORIES_STRIP_PER_AUTHOR per author, so a heavy poster can't fill it.
+const STORIES_STRIP_CANDIDATE_LIMIT = 120;
+const STORIES_STRIP_PER_AUTHOR = 2;
+// Of the 12 slots for other people's stories, this many are the same for every signed-in viewer
+// in a rotation window (the shared experience); the rest are personal to the viewer.
+const STORIES_STRIP_SHARED = 4;
+// How often the shared picks and each viewer's personal picks reshuffle.
+const STORIES_STRIP_ROTATE_MS = 6 * 60 * 60 * 1000;
 // A signed-in viewer's OWN live stories always lead the strip and don't count toward
 // STORIES_STRIP_LIMIT (which is only for other people's). Capped as a safety net, not a design limit.
 const STORIES_STRIP_OWN_LIMIT = 20;
@@ -1084,9 +1090,7 @@ const STORIES_STRIP_OWN_LIMIT = 20;
 // this long after being posted — Instagram-style ephemerality. The
 // published page itself is untouched; this only affects the Stories
 // listings (see handleStoriesStrip / handleSubscriptionsFeed). Also
-// doubles as the rotation period for the per-viewer shuffle seed below,
-// so a viewer's particular slice of the pool changes on the same cadence
-// the pool itself does.
+// bounds the pool itself.
 const STORIES_LOOKBACK_MS = 24 * 60 * 60 * 1000;
 
 // Non-cryptographic string hash (FNV-1a) + mulberry32 PRNG, used only to
@@ -1111,17 +1115,12 @@ function _storiesMulberry32(seed) {
     return ((r ^ (r >>> 14)) >>> 0) / 4294967296;
   };
 }
-// Deterministic Fisher-Yates shuffle: same seedStr always yields the same
-// order, different seedStr (different viewer, or same viewer next
-// STORIES_LOOKBACK_MS window) yields a different one.
-function _storiesSeededShuffle(arr, seedStr) {
-  const rng = _storiesMulberry32(_storiesHashSeed(seedStr));
-  const a = arr.slice();
-  for (let i = a.length - 1; i > 0; i--) {
-    const j = Math.floor(rng() * (i + 1));
-    [a[i], a[j]] = [a[j], a[i]];
-  }
-  return a;
+// Deterministic pseudo-random order: each story gets a score from (seedStr, slug), and the list is
+// sorted by it. Same seedStr always yields the same order, and unlike an index-based shuffle a story
+// being posted or expiring doesn't reorder the others, so picks stay stable through a rotation window.
+function _storiesSeededOrder(arr, seedStr) {
+  const score = r => _storiesMulberry32(_storiesHashSeed(seedStr + '|' + r.slug))();
+  return arr.map(r => [score(r), r]).sort((x, y) => x[0] - y[0]).map(x => x[1]);
 }
 // Ring avatar preview: skip storing an image bigger than this, whether
 // it ends up in R2 (decoded data: URI bytes) or, for an already-remote
@@ -1378,14 +1377,14 @@ async function handleServeStoryImage(env, slug) {
 // (those show as note cards in the Subscribed category instead — see
 // handleSubscriptionsFeed).
 //
-// Different signed-in viewers see different slices of that pool, not
-// just the same newest-12: pull a wider recent candidate window, then
-// deterministically shuffle it per viewer (seeded by their sub + which
-// STORIES_LOOKBACK_MS window we're in, so it's stable for a given viewer
-// through the window and reshuffles once the window rolls over) before
-// taking the top STORIES_STRIP_LIMIT. Anonymous callers have no identity
-// to vary by, so they get the flat newest-first list within the same 24h
-// window — same as before.
+// Signed-in viewers get a mix of shared and personal picks from a wide pool (the newest
+// STORIES_STRIP_CANDIDATE_LIMIT stories, at most STORIES_STRIP_PER_AUTHOR per author):
+//  - STORIES_STRIP_SHARED slots are the same for everyone: the first eligible stories of a
+//    shuffle seeded only by the rotation window, skipping the viewer's own and followed authors.
+//  - The remaining slots are personal: a shuffle seeded by the viewer + window, with stories
+//    the viewer hasn't opened ahead of ones they have.
+// Both reshuffle every STORIES_STRIP_ROTATE_MS. Anonymous callers have no identity to vary
+// by, so they get the newest-first list of the same pool.
 async function handleStoriesStrip(env, request) {
   const sub = await requireSession(env, request);
   const now = Date.now();
@@ -1405,33 +1404,55 @@ async function handleStoriesStrip(env, request) {
     ownStories = ownRows.results;
   }
 
-  let query = 'SELECT slug, author_sub, title, created_at, image_url FROM stories WHERE created_at >= ?';
-  const params = [cutoff];
-  if (sub) { query += ' AND author_sub != ?'; params.push(sub); } // own stories are added up front below, outside the 12
-  if (followedAuthors.length) {
-    query += ` AND author_sub NOT IN (${followedAuthors.map(() => '?').join(',')})`;
-    params.push(...followedAuthors);
+  // Global pool, identical for every viewer (so the shared picks can be): newest first, capped per author.
+  const { results: rawPool } = await env.ADS_DB.prepare(
+    'SELECT slug, author_sub, title, created_at, image_url FROM stories WHERE created_at >= ? ORDER BY created_at DESC LIMIT ?'
+  ).bind(cutoff, STORIES_STRIP_CANDIDATE_LIMIT * 3).all();
+  const perAuthor = {};
+  const pool = [];
+  for (const r of rawPool) {
+    perAuthor[r.author_sub] = (perAuthor[r.author_sub] || 0) + 1;
+    if (perAuthor[r.author_sub] <= STORIES_STRIP_PER_AUTHOR) pool.push(r);
+    if (pool.length >= STORIES_STRIP_CANDIDATE_LIMIT) break;
   }
-  query += ' ORDER BY created_at DESC LIMIT ?';
-  params.push(sub ? STORIES_STRIP_CANDIDATE_LIMIT : STORIES_STRIP_LIMIT);
 
-  const { results } = await env.ADS_DB.prepare(query).bind(...params).all();
-
-  let ranked = results;
-  if (sub && results.length > STORIES_STRIP_LIMIT) {
-    const windowBucket = Math.floor(now / STORIES_LOOKBACK_MS);
-    ranked = _storiesSeededShuffle(results, sub + ':' + windowBucket);
-  }
-  ranked = [...ownStories, ...ranked.slice(0, STORIES_STRIP_LIMIT)]; // yours first, then up to 12 from others
+  // Own stories lead the strip; followed authors show in Subscribed instead.
+  const skipAuthors = new Set(followedAuthors);
+  if (sub) skipAuthors.add(sub);
+  const eligible = pool.filter(r => !skipAuthors.has(r.author_sub));
 
   let seenSlugs = new Set();
-  if (sub && ranked.length) {
-    const placeholders = ranked.map(() => '?').join(',');
-    const seenRows = await env.ADS_DB.prepare(
-      `SELECT slug FROM story_seen WHERE subscriber_sub = ? AND slug IN (${placeholders})`
-    ).bind(sub, ...ranked.map(r => r.slug)).all();
-    seenSlugs = new Set(seenRows.results.map(r => r.slug));
+  if (sub) {
+    const slugs = [...ownStories, ...eligible].map(r => r.slug);
+    for (let i = 0; i < slugs.length; i += 80) { // D1 caps bound parameters per query
+      const chunk = slugs.slice(i, i + 80);
+      const { results: seenRows } = await env.ADS_DB.prepare(
+        `SELECT slug FROM story_seen WHERE subscriber_sub = ? AND slug IN (${chunk.map(() => '?').join(',')})`
+      ).bind(sub, ...chunk).all();
+      seenRows.forEach(r => seenSlugs.add(r.slug));
+    }
   }
+
+  let others;
+  if (!sub) {
+    others = eligible.slice(0, STORIES_STRIP_LIMIT);
+  } else {
+    const bucket = Math.floor(now / STORIES_STRIP_ROTATE_MS);
+    // Shared picks: same shuffle for everyone, first eligible ones win.
+    const shared = _storiesSeededOrder(pool, 'shared:' + bucket)
+      .filter(r => !skipAuthors.has(r.author_sub))
+      .slice(0, STORIES_STRIP_SHARED);
+    const sharedSlugs = new Set(shared.map(r => r.slug));
+    // Personal picks: unseen first, each group shuffled per viewer.
+    const rest = eligible.filter(r => !sharedSlugs.has(r.slug));
+    const seed = sub + ':' + bucket;
+    const personal = [
+      ..._storiesSeededOrder(rest.filter(r => !seenSlugs.has(r.slug)), seed),
+      ..._storiesSeededOrder(rest.filter(r => seenSlugs.has(r.slug)), seed)
+    ].slice(0, STORIES_STRIP_LIMIT - shared.length);
+    others = [...shared, ...personal];
+  }
+  const ranked = [...ownStories, ...others]; // yours first, then up to 12 from others
 
   // image_url is either STORY_IMAGE_R2_MARKER (image lives in R2, served
   // via GET /stories/image/:slug — see storeStoryImage/handleServeStoryImage),
