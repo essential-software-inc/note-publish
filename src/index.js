@@ -4523,6 +4523,7 @@ main{position:relative;z-index:1;max-width:720px;margin:0 auto;padding:2px 16px 
 .filters{gap:8px;overflow-x:auto;margin:0 -16px 10px;padding:4px 16px 6px;scrollbar-width:none}
 .filters:not([hidden]){display:flex}
 .filters::-webkit-scrollbar{display:none}
+.filters,.qkeys,.recent{-webkit-mask-image:linear-gradient(90deg,transparent 0,#000 var(--fl,0px),#000 calc(100% - var(--fr,0px)),transparent 100%);mask-image:linear-gradient(90deg,transparent 0,#000 var(--fl,0px),#000 calc(100% - var(--fr,0px)),transparent 100%)}
 .sel{position:relative;flex:none}
 .sel .pick{display:block;appearance:none;-webkit-appearance:none;height:38px;padding:0 34px 0 14px;border-radius:19px;border:1px solid var(--line2);background:var(--s1);color:var(--text);font-size:14px;font-weight:600;white-space:nowrap}
 .ptitle{margin:0 0 12px;font-size:17px;font-weight:700;letter-spacing:-.01em}
@@ -4623,16 +4624,26 @@ main{position:relative;z-index:1;max-width:720px;margin:0 auto;padding:2px 16px 
 .sec-t:empty{display:none}
 .tr-card{padding:14px 14px 16px}
 .tr-card .filters{margin:0 -14px 8px;padding:2px 14px 4px}
+#trbk{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;overflow:visible;margin:0 0 10px;padding:2px 0 4px}
+#trbk .key{width:100%;justify-content:center;padding:0 4px}
 .tr-nav{display:flex;align-items:center;gap:8px;margin:4px 0 8px}
 .tr-btn{width:40px;height:40px;flex:none;border:0;border-radius:12px;background:var(--well);color:var(--text);display:grid;place-items:center}
 .tr-btn:active{background:var(--s2)}
-.tr-btn:disabled{opacity:.3}
+.tr-btn[aria-disabled=true]{opacity:.3}
 .tr-btn.flip .ico{transform:scaleX(-1)}
 .tr-rg{flex:1;min-width:0;text-align:center;font-size:15px;font-weight:650;line-height:1.25}
 .tr-rg small{display:block;margin-top:2px;font-size:12px;font-weight:500;color:var(--muted)}
 .tr-nav2{display:flex;align-items:center;gap:8px;margin:0 0 10px}
-.tr-date{flex:1;min-width:0;height:40px;padding:0 12px;color-scheme:dark}
+.tr-date{flex:1;min-width:0;height:40px;padding:0 12px;color-scheme:dark;display:flex;align-items:center;text-align:left;-webkit-appearance:none;appearance:none}
+.tr-date::-webkit-date-and-time-value{text-align:left;margin:0;min-height:0}
+.tr-date::-webkit-datetime-edit{padding:0}
+.tr-date::-webkit-datetime-edit-fields-wrapper{padding:0}
+.tr-date::-webkit-calendar-picker-indicator{margin:0;padding:0}
 .tr-nav2 .btn{height:40px;flex:none}
+.tr-win{display:flex;align-items:center;gap:8px;margin:0 0 10px;font-size:13px;color:var(--muted)}
+.tr-win span{flex:none}
+.tr-win .filters{flex:1;min-width:0;margin:0;padding:0}
+.tr-win .key{height:32px;padding:0 12px;font-size:13px}
 .tr-head{display:flex;align-items:baseline;flex-wrap:wrap;gap:4px 10px;margin:8px 2px 0}
 .tr-head b{font-size:32px;line-height:1.1;font-weight:750;letter-spacing:-.02em;font-variant-numeric:tabular-nums}
 .tr-dl{font-size:13.5px;font-weight:650;white-space:nowrap}
@@ -4730,6 +4741,7 @@ main{position:relative;z-index:1;max-width:720px;margin:0 auto;padding:2px 16px 
 .tab{--tc:var(--muted);min-width:0;position:relative;z-index:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;border:0;background:none;color:var(--tc);font-size:11.5px;font-weight:650}
 .tab[aria-current=page]{--tc:var(--accent)}
 .ico-wrap{position:relative;display:grid;place-items:center}
+.tab .ico{width:24px;height:24px}
 .nb{--nbg:var(--accent);--nfg:var(--accent-ink);position:absolute;top:-8px;left:12px;min-width:19px;height:19px;padding:0 5px;border-radius:10px;background:var(--nbg);color:var(--nfg);font-size:11px;font-weight:750;place-items:center;line-height:1;box-shadow:0 0 0 3px rgba(27,30,66,.95)}
 .nb:not([hidden]){display:grid}
 .nb.hot{--nbg:#FF4D6D;--nfg:#fff}
@@ -4798,6 +4810,7 @@ body[data-auth=out] #msg{bottom:calc(24px + env(safe-area-inset-bottom,0px))}
           <button type="button" class="btn" id="trnow" hidden>Latest</button>
         </div>
         <div class="filters" id="trmet"></div>
+        <div class="tr-win"><span id="trwlab">Show</span><div class="filters" id="trwin"></div></div>
         <div class="filters" id="trmode">
           <button type="button" class="key sev-ad" data-m="flow" aria-pressed="true"><span>Per period</span></button>
           <button type="button" class="key sev-ad" data-m="total" aria-pressed="false"><span>Running total</span></button>
@@ -4917,13 +4930,13 @@ var ICON={
   alert:svg('<path d="M12 4.5 3.8 18.5h16.4L12 4.5Z"/><path d="M12 10v4"/><path d="M12 16.6v.1"/>'),
   ban:svg('<circle cx="12" cy="12" r="8.5"/><path d="m6 6 12 12"/>'),
   dots:svg('<circle cx="6.5" cy="12" r="1.3"/><circle cx="12" cy="12" r="1.3"/><circle cx="17.5" cy="12" r="1.3"/>'),
-  reports:svg('<path d="M5.5 21V4.5"/><path d="M5.5 4.5h12l-2.5 4 2.5 4h-12"/>'),
-  search:svg('<circle cx="11" cy="11" r="6.5"/><path d="m20 20-4.2-4.2"/>'),
+  reports:svg('<path d="M6 20V4"/><path d="M6 4.5h11.5L15 8.5l2.5 4H6"/>'),
+  search:svg('<circle cx="10.5" cy="10.5" r="6.5"/><path d="m20 20-4.9-4.9"/>'),
   copy:svg('<rect x="9" y="9" width="11" height="11" rx="2.5"/><path d="M15 9V6.5A2.5 2.5 0 0 0 12.5 4h-6A2.5 2.5 0 0 0 4 6.5v6A2.5 2.5 0 0 0 6.5 15H9"/>'),
-  ads:svg('<path d="M4 14v-4l10-4v12L4 14Z"/><path d="M17.5 9.5a3.5 3.5 0 0 1 0 5"/><path d="m6.5 14.5 1.5 4.5h2.5l-1-3.7"/>'),
-  audit:svg('<circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/>'),
-  tools:svg('<path d="M4 7h8M17 7h3M4 17h3M12 17h8"/><circle cx="14.5" cy="7" r="2.3"/><circle cx="9.5" cy="17" r="2.3"/>'),
-  chart:svg('<path d="M5 20V11"/><path d="M12 20V5"/><path d="M19 20v-7"/>'),
+  ads:svg('<path d="M4 13.5v-4l10-4.5v13l-10-4.5Z"/><path d="M17.5 9.5a3.5 3.5 0 0 1 0 5"/><path d="m6.5 14.5 1.5 4.5h2.5l-1-3.7"/>'),
+  audit:svg('<circle cx="12" cy="12" r="8"/><path d="M12 7.6V12l2.9 1.9"/>'),
+  tools:svg('<path d="M4 7h8M17 7h3M4 17h3M12 17h8"/><circle cx="14.5" cy="7" r="2.5"/><circle cx="9.5" cy="17" r="2.5"/>'),
+  chart:svg('<path d="M5 20v-9"/><path d="M12 20V4"/><path d="M19 20v-6"/>'),
   check:svg('<circle cx="12" cy="12" r="9"/><path d="m8 12.5 3 3 5-6"/>'),
   heart:svg('<path d="M12 18.9s-7.3-4.4-7.3-9.9A4.2 4.2 0 0 1 12 6.5a4.2 4.2 0 0 1 7.3 2.5c0 5.5-7.3 9.9-7.3 9.9Z"/>'),
   users:svg('<circle cx="9" cy="8.5" r="3.2"/><path d="M3.5 19c.5-3.2 2.8-5 5.5-5s5 1.8 5.5 5"/><path d="M16 5.5a3.2 3.2 0 0 1 0 6"/><path d="M17.5 14.2c1.8.5 3 2.3 3.3 4.8"/>'),
@@ -5163,13 +5176,25 @@ function navRec(s,push){
   if(push)history.pushState(s,'',hashOf(s));else history.replaceState(s,'',hashOf(s));
   navChrome()
 }
+/* Scroll position per history entry. curY is tracked on every scroll event because a screen's content can
+   shrink (and the browser clamp the scroll offset) before navPush runs, so window.scrollY may already be wrong. */
+var navY={},curY=window.scrollY||0,navRT=0;
+window.addEventListener('scroll',function(){curY=window.scrollY},{passive:true});
+['touchstart','wheel','keydown'].forEach(function(ev){window.addEventListener(ev,function(){navRT++},{passive:true})});
+function navRestore(y){
+  var id=++navRT,n=0;window.scrollTo(0,y);
+  (function again(){if(id!==navRT||Math.abs(window.scrollY-y)<2||n++>14)return;setTimeout(function(){if(id!==navRT)return;window.scrollTo(0,y);again()},80)})()
+}
 function navPush(){
   var s=state(),c=navLog[navI];
   if(c&&c.t===s.t&&c.slug===s.slug&&c.o===s.o)return;
-  navI++;navLog.length=navI;navRec(s,true)
+  navY[navI]=curY;
+  navI++;navLog.length=navI;
+  Object.keys(navY).forEach(function(k){if(+k>=navI)delete navY[k]});
+  navRec(s,true)
 }
 function navSync(){navRec(state(),false)}
-function applyNav(s){
+function applyNav(s,y){
   if(s.t==='lookup'){lkSlug=s.slug||'';lkOwner=!!s.o}
   showTab(s.t);
   if(s.t==='lookup'){
@@ -5178,7 +5203,7 @@ function applyNav(s){
     else if(lkShown===lkSlug){if(lkOwner){if(!$('lkowner').firstChild)loadOwner(lkSlug)}else $('lkowner').textContent=''}
     else doLookup(lkSlug,lkOwner)
   }
-  window.scrollTo(0,0)
+  if(y!=null)navRestore(y);else window.scrollTo(0,0)
 }
 /* Sheets take one history entry while open, so the device Back button closes the sheet instead of leaving the page behind it */
 function sheetOpen(){if(!sheetH){history.pushState(Object.assign({},history.state||{},{sh:1}),'',location.href);sheetH=true}}
@@ -5189,13 +5214,19 @@ window.addEventListener('popstate',function(e){
   if(document.body.dataset.auth!=='in')return;
   var s=e.state;
   if(!s||s.t==null){s=parseNav(location.hash);if(!s)return;navI++;navLog.length=navI;applyNav(s);navSync();return}
+  navY[navI]=curY;
   navI=s.i||0;navLog[navI]=s;navSave(s);
-  applyNav(s);navChrome()
+  applyNav(s,navY[navI]);navChrome()
 });
 function setSub(){
   var s=cur==='reports'?repSub:(cur==='lookup'&&lkSlug)?'/'+lkSlug:SUBS[cur]||'';
   $('sub').textContent=s
 }
+function xHint(e){var l=e.scrollLeft,m=e.scrollWidth-e.clientWidth;e.style.setProperty('--fl',l>4?'28px':'0px');e.style.setProperty('--fr',m-l>4?'28px':'0px')}
+function xHintAll(){[].forEach.call(document.querySelectorAll('.filters,.qkeys,.recent'),function(e){
+  if(!e._xh){e._xh=1;e.addEventListener('scroll',function(){xHint(e)},{passive:true});if(window.MutationObserver)new MutationObserver(function(){requestAnimationFrame(function(){xHint(e)})}).observe(e,{childList:true,subtree:true})}
+  xHint(e)})}
+window.addEventListener('resize',xHintAll);
 function showTab(t){
   cur=t;
   TABS.forEach(function(n){$('p-'+n).classList.toggle('on',n===t)});
@@ -5207,7 +5238,8 @@ function showTab(t){
   setSub();
   if(t==='overview'&&!ovS.loaded){ovS.loaded=true;loadOverview();ovList(true)}
   if(t==='ads'&&!$('adlist').firstChild)loadAds(true);
-  if(t==='audit'&&!auAll.length&&!$('aulist').firstChild)loadAudit(true)
+  if(t==='audit'&&!auAll.length&&!$('aulist').firstChild)loadAudit(true);
+  requestAnimationFrame(xHintAll)
 }
 function goTab(t){showTab(t);navPush();window.scrollTo(0,0)}
 function goBack(){if(navI>0)history.back()}
@@ -5780,7 +5812,7 @@ function ovList(reset){
 }
 
 /* ---------- Trends: growth and decline over time ---------- */
-var trWIN={day:30,week:12,month:12,year:5},trUNIT={day:'days',week:'weeks',month:'months',year:'years'},trOFF=-new Date().getTimezoneOffset()*60000,trMIN=Date.UTC(2015,0,1);
+var trWIN={day:30,week:12,month:12,year:5},trOPT={day:[7,14,30,90],week:[4,8,12,26],month:[3,6,12,24],year:[2,3,5,10]},trMINV='30 Sep 2026',trUNIT={day:'days',week:'weeks',month:'months',year:'years'},trOFF=-new Date().getTimezoneOffset()*60000,trMIN=Date.UTC(2015,0,1);
 var trRL={csam:'Child safety',abuse:'Abuse',copyright:'Copyright',spam:'Spam',other:'Other'},trRO=['csam','abuse','copyright','spam','other'],trRC={csam:'#FF4D6D',abuse:'#FF9A5C',copyright:'#F7C35B',spam:'#97A3F0',other:'#46D6C8'};
 var trM=[
   {k:'signups',l:'New accounts',t:'Accounts',c:'#8B9BFF',cum:1,good:1},
@@ -5925,8 +5957,8 @@ function trInit(){
   });
   [].forEach.call($('trbk').children,function(b){b.onclick=function(){var v=b.getAttribute('data-b');if(trS.bk===v)return;trS.bk=v;trLoad()}});
   [].forEach.call($('trmode').children,function(b){b.onclick=function(){trS.mode=b.getAttribute('data-m');trMetSync();if(trS.M)trChartRender()}});
-  $('trprev').onclick=function(){var p=trPlan();trS.end=trNext(p.bk,p.starts[2*p.N-1],-p.N);trLoad()};
-  $('trnext').onclick=function(){var p=trPlan(),c=trNext(p.bk,p.starts[2*p.N-1],p.N);trS.end=c>=trStart(p.bk,Date.now()+trOFF)?null:c;trLoad()};
+  $('trprev').onclick=function(){if(this.getAttribute('aria-disabled')==='true'){msg('No earlier data. Trends start on '+trMINV+'.','ok');return}var p=trPlan();trS.end=trNext(p.bk,p.starts[2*p.N-1],-p.N);trLoad()};
+  $('trnext').onclick=function(){if(this.getAttribute('aria-disabled')==='true'){msg('Already showing the latest '+trS.bk+'.','ok');return}var p=trPlan(),c=trNext(p.bk,p.starts[2*p.N-1],p.N);trS.end=c>=trStart(p.bk,Date.now()+trOFF)?null:c;trLoad()};
   $('trnow').onclick=function(){trS.end=null;trLoad()};
   $('trjump').onchange=function(){
     var v=$('trjump').value;if(!v)return;
@@ -5940,7 +5972,15 @@ function trMetSync(){
   [].forEach.call($('trmet').children,function(b){b.setAttribute('aria-pressed',b.getAttribute('data-k')===trS.metric?'true':'false')});
   [].forEach.call($('trbk').children,function(b){b.setAttribute('aria-pressed',b.getAttribute('data-b')===trS.bk?'true':'false')});
   [].forEach.call($('trmode').children,function(b){b.setAttribute('aria-pressed',b.getAttribute('data-m')===trS.mode?'true':'false')});
-  $('trmode').hidden=!x.cum
+  $('trmode').hidden=!x.cum;
+  var bk=trS.bk,w=$('trwin'),os=trOPT[bk],u=trUNIT[bk];
+  if(w.getAttribute('data-bk')!==bk){
+    w.textContent='';w.setAttribute('data-bk',bk);
+    os.forEach(function(n){var b=el('button','key sev-ad');b.type='button';b.setAttribute('data-n',n);b.appendChild(el('span',null,String(n)));
+      b.onclick=function(){if(trWIN[bk]===n)return;trWIN[bk]=n;trLoad()};w.appendChild(b)})
+  }
+  $('trwlab').textContent='Last '+(bk==='day'?'days':u);
+  [].forEach.call(w.children,function(b){b.setAttribute('aria-pressed',+b.getAttribute('data-n')===trWIN[bk]?'true':'false')})
 }
 function trLoad(){
   trInit();
@@ -5957,9 +5997,11 @@ function trLoad(){
 function trNavSync(){
   var p=trS.plan,N=p.N;
   $('trrange').textContent=trLab(p.bk,p.starts[N],true)+(N>1?' - '+trLab(p.bk,p.starts[2*N-1],true):'');
-  $('trcmp').textContent='vs '+trLab(p.bk,p.starts[0],true)+(N>1?' - '+trLab(p.bk,p.starts[N-1],true):'');
-  $('trprev').disabled=p.starts[0]-N*864e5<=trMIN||(trS.data&&p.from<=trS.data.epoch);
-  $('trnext').disabled=p.live;
+  var ep=trS.data&&trS.data.epoch,noData=ep&&p.from<ep;
+  $('trcmp').textContent='Compared with the previous '+N+' '+(N===1?trUNIT[p.bk].replace(/s$/,''):trUNIT[p.bk])+': '+trLab(p.bk,p.starts[0],true)+(N>1?' - '+trLab(p.bk,p.starts[N-1],true):'')+(noData?' (no data before '+trMINV+')':'');
+  var offP=p.starts[0]-N*864e5<=trMIN||(trS.data&&p.from<=trS.data.epoch);
+  $('trprev').setAttribute('aria-disabled',offP?'true':'false');
+  $('trnext').setAttribute('aria-disabled',p.live?'true':'false');
   $('trnow').hidden=p.live;
   var j=$('trjump');j.max=new Date(Date.now()+trOFF).toISOString().slice(0,10);
   j.value=new Date(p.ends[2*N-1]-864e5).toISOString().slice(0,10)
