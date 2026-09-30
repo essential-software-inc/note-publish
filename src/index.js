@@ -240,7 +240,7 @@ async function putUser(env, sub, user) {
 //   CREATE INDEX presence_kind_seen ON presence (kind, last_seen);
 // id is 'u:<sub>' for accounts and 'g:<deviceId>' for guests. Nothing here can fail a request.
 const ONLINE_WINDOW_MS = 5 * 60 * 1000;
-const PRESENCE_TOUCH_MIN_MS = 60 * 1000;
+const PRESENCE_TOUCH_MIN_MS = 3 * 60 * 1000; // must stay well under ONLINE_WINDOW_MS
 const PRESENCE_RETENTION_MS = 90 * 24 * 60 * 60 * 1000;
 let presenceReady = null;
 const presenceLast = new Map();
@@ -272,19 +272,42 @@ async function prunePresence(env) {
     await env.ADS_DB.prepare('DELETE FROM presence WHERE last_seen < ?').bind(Date.now() - PRESENCE_RETENTION_MS).run();
   } catch (e) { /* reporting-only; swallow */ }
 }
+function presenceDeviceId(body) {
+  return typeof body?.deviceId === 'string' ? body.deviceId.trim().slice(0, MAX_VIEWER_ID_LEN) : '';
+}
+// Flip a device between guest and signed-in the moment it signs in or out, rather than waiting for the
+// next /presence beacon (app restart). Signing out takes the account out of "online" right away (it
+// still counts as active in the 24h/7d windows) and makes the device a guest; signing in does the reverse.
+async function presenceSwitch(env, deviceId, sub, signedIn) {
+  try {
+    await ensurePresence(env);
+    if (signedIn) {
+      if (sub) { presenceLast.delete('u:' + sub); await touchPresence(env, 'u', sub); }
+      if (deviceId) {
+        presenceLast.delete('g:' + deviceId);
+        await env.ADS_DB.prepare('DELETE FROM presence WHERE id = ?').bind('g:' + deviceId).run();
+      }
+    } else {
+      if (sub) {
+        presenceLast.delete('u:' + sub);
+        await env.ADS_DB.prepare('UPDATE presence SET last_seen = MIN(last_seen, ?) WHERE id = ?')
+          .bind(Date.now() - ONLINE_WINDOW_MS - 1, 'u:' + sub).run();
+      }
+      if (deviceId) { presenceLast.delete('g:' + deviceId); await touchPresence(env, 'g', deviceId); }
+    }
+  } catch (e) { /* reporting-only; swallow */ }
+}
 // POST /presence {deviceId}: the app's "I'm open" beacon. A valid session marks the account
 // online (via requireSession); otherwise the device counts as a guest. A device that has since
 // signed in stops counting as a guest.
 async function handlePresence(env, request) {
   let body;
   try { body = await request.json(); } catch (e) { body = {}; }
-  const deviceId = typeof body?.deviceId === 'string' ? body.deviceId.trim().slice(0, MAX_VIEWER_ID_LEN) : '';
+  const deviceId = presenceDeviceId(body);
   const sub = await requireSession(env, request);
   if (!deviceId) return json({ ok: true });
   if (!sub) await touchPresence(env, 'g', deviceId);
-  else {
-    try { await ensurePresence(env); await env.ADS_DB.prepare('DELETE FROM presence WHERE id = ?').bind('g:' + deviceId).run(); } catch (e) { /* swallow */ }
-  }
+  else await presenceSwitch(env, deviceId, sub, true);
   return json({ ok: true });
 }
 
@@ -484,6 +507,7 @@ async function handleGoogleAuth(env, request) {
   user.lastSignInAt = now;
   await putUser(env, identity.sub, user);
   const sessionToken = await createSession(env, identity.sub);
+  await presenceSwitch(env, presenceDeviceId(body), identity.sub, true);
   return json({ sessionToken, sub: identity.sub, email: identity.email, authorId: await authorIdFor(env, identity.sub), deletionCancelled });
 }
 
@@ -495,15 +519,17 @@ async function handleSignOut(env, request) {
   let body;
   try { body = await request.json(); } catch (e) { body = {}; }
   const token = body && body.sessionToken;
+  let sub = null;
   if (typeof token === 'string' && token) {
     const tokenHash = await sha256Hex(token);
     try {
       const raw = await env.ACCOUNTS.get('session:' + tokenHash);
       const sess = raw ? JSON.parse(raw) : null;
-      if (sess && sess.sub) await env.ACCOUNTS.delete('usess:' + sess.sub + ':' + tokenHash);
+      if (sess && sess.sub) { sub = sess.sub; await env.ACCOUNTS.delete('usess:' + sess.sub + ':' + tokenHash); }
     } catch (e) { /* index entry just expires on its own */ }
     await env.ACCOUNTS.delete('session:' + tokenHash);
   }
+  await presenceSwitch(env, presenceDeviceId(body), sub, false);
   return json({ ok: true });
 }
 
@@ -2296,7 +2322,9 @@ async function handleReport(env, request, slug, ctx) {
   if (!(await getMeta(env, slug))) return textError(404, 'page not found');
 
   const record = { slug, reason, details, isCsam, reportedAt: Date.now() };
-  await env.REPORTS.put(makeReportKey(slug, record.reportedAt), JSON.stringify(record));
+  const reportKey = makeReportKey(slug, record.reportedAt);
+  await env.REPORTS.put(reportKey, JSON.stringify(record));
+  await mirrorReport(env, reportKey, record);
   // CSAM report: snapshot the page, and hold this slug's deleted/ snapshots (and root object)
   // out of the purge job for CSAM_RETENTION_MS. Kept in its own key so it survives the slug's KV metadata being
   // purged. A newer report re-arms the full window.
@@ -3037,6 +3065,153 @@ async function adminAuthOk(env, request, providedOverride) {
   return 'denied';
 }
 
+// D1 mirror of report records. KV stays the source of truth (details, dismissal, TTLs); this table
+// only carries what the admin list needs to count, filter and sort past the KV list limits (slug,
+// reason, csam flag, time, dismissed). It is written best-effort when a report is filed, dismissed or
+// undismissed, and backfilled by POST /admin/reports/reindex in small chunks (subrequest caps). Until
+// the backfill has finished (REPORT_INDEX_FLAG in REPORTS) the list keeps using the KV walk below.
+const REPORT_INDEX_FLAG = 'admin:reportindex:v1';
+const REPORT_INDEX_PAGE = 30;
+const REPORT_REINDEX_CHUNK = 20;
+let reportIndexReady = null;
+let reportIndexFlag = false;
+function ensureReportIndex(env) {
+  if (!reportIndexReady) {
+    reportIndexReady = env.ADS_DB.batch([
+      env.ADS_DB.prepare('CREATE TABLE IF NOT EXISTS report_index (key TEXT PRIMARY KEY, slug TEXT NOT NULL, reason TEXT, is_csam INTEGER NOT NULL DEFAULT 0, reported_at INTEGER NOT NULL, dismissed_at INTEGER)'),
+      env.ADS_DB.prepare('CREATE INDEX IF NOT EXISTS report_index_time ON report_index (dismissed_at, reported_at, key)'),
+      env.ADS_DB.prepare('CREATE INDEX IF NOT EXISTS report_index_slug ON report_index (slug)'),
+      env.ADS_DB.prepare('CREATE INDEX IF NOT EXISTS report_index_reason ON report_index (reason)')
+    ]).catch((e) => { reportIndexReady = null; throw e; });
+  }
+  return reportIndexReady;
+}
+async function reportIndexOn(env) {
+  if (reportIndexFlag) return true;
+  try { if ((await env.REPORTS.get(REPORT_INDEX_FLAG)) === '1') reportIndexFlag = true; } catch (e) {}
+  return reportIndexFlag;
+}
+function reportIndexStmt(env, key, rec) {
+  const m = key.match(REPORT_KEY_RE), l = key.match(REPORT_LEGACY_KEY_RE);
+  if (!m && !l) return null;
+  const slug = m ? m[2] : l[1];
+  const ts = m ? REPORT_TS_MAX - parseInt(m[1], 10) : parseInt(l[2], 10);
+  return env.ADS_DB.prepare('INSERT OR REPLACE INTO report_index (key, slug, reason, is_csam, reported_at, dismissed_at) VALUES (?, ?, ?, ?, ?, ?)')
+    .bind(key, slug, (rec && rec.reason) || null, rec && rec.isCsam ? 1 : 0, ts, (rec && rec.dismissedAt) || null);
+}
+async function mirrorReport(env, key, rec) {
+  try {
+    await ensureReportIndex(env);
+    const st = reportIndexStmt(env, key, rec);
+    if (st) await st.run();
+  } catch (e) {}
+}
+async function unmirrorReport(env, key) {
+  try {
+    await ensureReportIndex(env);
+    await env.ADS_DB.prepare('DELETE FROM report_index WHERE key = ?').bind(key).run();
+  } catch (e) {}
+}
+
+// POST /admin/reports/reindex {cursor}: copies one small chunk of KV report records into report_index
+// (idempotent upserts) and returns the cursor for the next chunk; done:true sets the flag that switches
+// the list over to D1. The admin page drives it automatically the first time it sees the KV list.
+async function handleAdminReportsReindex(env, request) {
+  const g = await adminGate(env, request); if (g) return g;
+  const body = await adminBody(request);
+  let phase = 'n', kvCursor;
+  const cm = typeof body.cursor === 'string' ? body.cursor.match(/^([nl]):(.*)$/s) : null;
+  if (cm) { phase = cm[1]; kvCursor = cm[2] || undefined; }
+  await ensureReportIndex(env);
+  const page = await env.REPORTS.list({ prefix: phase === 'n' ? REPORT_KEY_PREFIX : 'report:', cursor: kvCursor, limit: REPORT_REINDEX_CHUNK });
+  const stmts = (await Promise.all(page.keys.map(async (k) => {
+    if (!REPORT_KEY_RE.test(k.name) && !REPORT_LEGACY_KEY_RE.test(k.name)) return null;
+    let raw = null;
+    try { raw = await env.REPORTS.get(k.name); } catch (e) { return null; }
+    if (raw === null) return null;
+    let rec = null;
+    try { rec = JSON.parse(raw); } catch (e) {}
+    return reportIndexStmt(env, k.name, rec);
+  }))).filter(Boolean);
+  if (stmts.length) await env.ADS_DB.batch(stmts);
+  let done = false;
+  if (page.list_complete) { if (phase === 'n') { phase = 'l'; kvCursor = undefined; } else done = true; }
+  else kvCursor = page.cursor;
+  if (done) { await env.REPORTS.put(REPORT_INDEX_FLAG, '1'); reportIndexFlag = true; }
+  return json({ ok: true, done, cursor: done ? null : phase + ':' + (kvCursor || ''), indexed: stmts.length });
+}
+
+// D1-backed report list. Filters (dismissed, reason, slug substring) and the sort run in SQL; the first
+// page also returns exact aggregates (agg) so the counts no longer depend on how much is loaded. Status
+// (live / taken down / ...) lives in KV metadata, so that one filter stays client-side. Returns null on
+// any D1 failure so the caller can fall back to the KV walk.
+async function handleAdminReportsIndexed(env, url) {
+  try {
+    await ensureReportIndex(env);
+    const sp = url.searchParams;
+    const dis = sp.get('dismissed') === '1';
+    const reason = (sp.get('reason') || '').slice(0, 40);
+    const q = (sp.get('q') || '').toLowerCase().replace(/[^a-z0-9-]/g, '').slice(0, 48);
+    const sp2 = sp.get('sort');
+    const sort = sp2 === 'old' || sp2 === 'most' ? sp2 : 'new';
+    const cursorRaw = sp.get('cursor') || '';
+    const off = sort === 'most' ? Math.min(100000, Math.max(0, parseInt(cursorRaw, 10) || 0)) : 0;
+    const cur = sort === 'most' ? null : parseAdminCursor(cursorRaw);
+    const dClause = dis ? 'dismissed_at IS NOT NULL' : 'dismissed_at IS NULL';
+    const base = [dClause], bb = [];
+    if (q) { base.push('instr(slug, ?) > 0'); bb.push(q); }
+    const where = base.slice(), wb = bb.slice();
+    if (reason) { where.push('reason = ?'); wb.push(reason); }
+    if (cur) { where.push(sort === 'old' ? '(reported_at, key) > (?, ?)' : '(reported_at, key) < (?, ?)'); wb.push(cur.key, cur.id); }
+    const order = sort === 'most'
+      ? '(SELECT COUNT(*) FROM report_index r2 WHERE r2.slug = report_index.slug AND r2.' + dClause + ') DESC, slug ASC, reported_at DESC, key DESC'
+      : sort === 'old' ? 'reported_at ASC, key ASC' : 'reported_at DESC, key DESC';
+    const stmts = [
+      env.ADS_DB.prepare('SELECT key, slug, reason, is_csam, reported_at FROM report_index WHERE ' + where.join(' AND ') + ' ORDER BY ' + order + ' LIMIT ?' + (sort === 'most' ? ' OFFSET ?' : ''))
+        .bind(...wb, REPORT_INDEX_PAGE + 1, ...(sort === 'most' ? [off] : []))
+    ];
+    const first = !cursorRaw;
+    if (first) {
+      stmts.unshift(
+        env.ADS_DB.prepare('SELECT COUNT(DISTINCT slug) AS pages, COUNT(DISTINCT CASE WHEN is_csam = 1 THEN slug END) AS csam FROM report_index WHERE ' + dClause),
+        env.ADS_DB.prepare('SELECT reason, COUNT(*) AS n FROM report_index WHERE ' + base.join(' AND ') + ' GROUP BY reason').bind(...bb)
+      );
+    }
+    const res = await env.ADS_DB.batch(stmts);
+    const rows = res[res.length - 1].results || [];
+    const more = rows.length > REPORT_INDEX_PAGE;
+    if (more) rows.pop();
+    const last = rows[rows.length - 1];
+    const nextCursor = more && last ? (sort === 'most' ? String(off + REPORT_INDEX_PAGE) : last.reported_at + '|' + last.key) : null;
+    const metas = new Map();
+    const out = await Promise.all(rows.map(async (r) => {
+      const raw = await env.REPORTS.get(r.key);
+      if (raw === null) { await unmirrorReport(env, r.key); return null; } // record expired or removed elsewhere
+      let rec = null;
+      try { rec = JSON.parse(raw); } catch (e) {}
+      if (!!(rec && rec.dismissedAt) !== dis) { await mirrorReport(env, r.key, rec); return null; } // mirror drifted: repair, skip
+      if (!metas.has(r.slug)) metas.set(r.slug, getMeta(env, r.slug));
+      const meta = await metas.get(r.slug);
+      return {
+        key: r.key, slug: r.slug, reportedAt: r.reported_at,
+        reason: rec ? rec.reason : '?', details: rec ? rec.details : '',
+        isCsam: !!(rec && rec.isCsam),
+        dismissedAt: rec ? rec.dismissedAt || null : null,
+        ncmec: (rec && rec.isCsam) ? ((await getNcmec(env, r.slug)).slice(-1)[0] || null) : null,
+        status: !meta ? 'missing' : meta.adminLocked ? 'taken down' : meta.deletedAt ? 'unpublished' : 'live'
+      };
+    }));
+    const body = { reports: out.filter(Boolean), nextCursor, indexed: true };
+    if (first) {
+      const p = (res[0].results || [])[0] || {};
+      const byReason = {}; let total = 0;
+      (res[1].results || []).forEach((x) => { byReason[x.reason || '?'] = x.n; total += x.n; });
+      body.agg = { total, byReason, pages: p.pages || 0, csam: p.csam || 0 };
+    }
+    return json(body);
+  } catch (e) { return null; }
+}
+
 // Cursor format: "<phase>:<kv cursor>" where phase "n" walks the current
 // "rpt:" keys (already newest-first) and "l" then walks legacy "report:" keys.
 // Empty/absent = start. Dismissed records are skipped, so a page can come
@@ -3046,6 +3221,8 @@ async function handleAdminReports(env, request, url) {
   const auth = await adminAuthOk(env, request);
   if (auth === 'limited') return textError(429, 'too many failed attempts, try again in 5 minutes');
   if (auth !== 'ok') return textError(403, 'invalid admin token');
+  const indexOn = await reportIndexOn(env);
+  if (indexOn) { const viaD1 = await handleAdminReportsIndexed(env, url); if (viaD1) return viaD1; }
   let phase = 'n', kvCursor;
   const cursorParam = url.searchParams.get('cursor') || '';
   if (cursorParam) {
@@ -3092,7 +3269,7 @@ async function handleAdminReports(env, request, url) {
       status: !meta ? 'missing' : meta.adminLocked ? 'taken down' : meta.deletedAt ? 'unpublished' : 'live'
     };
   }));
-  return json({ reports: rows.filter(Boolean), nextCursor });
+  return json(indexOn ? { reports: rows.filter(Boolean), nextCursor } : { reports: rows.filter(Boolean), nextCursor, indexed: false });
 }
 
 // POST /admin/dismiss {key}: clears a handled/bogus report from the list.
@@ -3116,8 +3293,10 @@ async function handleAdminDismiss(env, request) {
   if (rec && rec.isCsam) {
     rec.dismissedAt = Date.now();
     await env.REPORTS.put(key, JSON.stringify(rec), { expirationTtl: REPORT_DISMISSED_CSAM_TTL_S });
+    await mirrorReport(env, key, rec);
   } else {
     await env.REPORTS.delete(key);
+    await unmirrorReport(env, key);
   }
   const km = key.match(REPORT_KEY_RE);
   await audit(env, 'dismiss', km ? km[2] : ((key.match(REPORT_LEGACY_KEY_RE) || [])[1] || null));
@@ -3376,13 +3555,14 @@ async function handleAdminLookup(env, request, url) {
     env.SLUGS.get(CSAM_HOLD_PREFIX + slug),
     getNcmec(env, slug)
   ]);
+  const ownerAuthorId = meta.ownerSub ? ((await authorIdsFor(env, [meta.ownerSub]))[meta.ownerSub] || null) : null;
   return json({
     found: true, slug,
     status: meta.adminLocked ? 'taken down' : meta.deletedAt ? 'unpublished' : 'live',
     title: meta.title || null, createdAt: meta.createdAt || null, updatedAt: meta.updatedAt || null,
     deletedAt: meta.deletedAt || null,
     sizeBytes: head ? head.size : (meta.sizeBytes || null),
-    hasOwner: !!meta.ownerSub, ownerEmail: user ? user.email : null,
+    hasOwner: !!meta.ownerSub, ownerEmail: user ? user.email : null, ownerAuthorId,
     showInStories: !!meta.showInStories, storyBlocked: !!meta.storyBlocked,
     desc: (story ? story.description : meta.desc) || '',
     tags: story ? parseStoryTags(story.tags) : (Array.isArray(meta.tags) ? meta.tags.filter(x => typeof x === 'string') : []),
@@ -3493,7 +3673,9 @@ async function handleAdminOwner(env, request, url) {
     }
     cursor = (page.list_complete || pages.length >= 100) ? undefined : page.cursor;
   } while (cursor);
+  const authorId = (await authorIdsFor(env, [sub]))[sub] || null;
   return json({
+    authorId,
     email: user ? user.email : null, createdAt: user ? user.createdAt || null : null,
     displayName: user ? user.profileName || null : null, hasProfileImage: !!(user && user.hasProfileImage),
     ledger: ((ledgerRows && ledgerRows.results) || []).map(r => ({ delta: r.delta, reason: r.reason, slug: r.slug || null, at: r.created_at })),
@@ -3565,31 +3747,37 @@ async function handleAdminStory(env, request) {
   return json({ ok: true });
 }
 
-// GET /admin/ads?status=&offset=: ads across all accounts, newest first.
+// GET /admin/ads?status=&cursor=: ads across all accounts, newest first, keyset-paginated.
 const ADMIN_ADS_PAGE = 30;
 async function handleAdminAds(env, request, url) {
   const g = await adminGate(env, request); if (g) return g;
+  await ensureAdminIndexes(env);
   const status = url.searchParams.get('status') || '';
-  const offset = Math.max(0, parseInt(url.searchParams.get('offset') || '0', 10) || 0);
+  const cur = parseAdminCursor(url.searchParams.get('cursor'));
   const filter = ['active', 'paused', 'exhausted', 'unpublished'].includes(status);
-  const w = filter ? 'WHERE a.status = ? ' : '';
-  const b = filter ? [status] : [];
-  // LIMIT+1 tells us whether another page exists without a second query; total feeds the "of N" count.
-  const [tot, page] = await env.ADS_DB.batch([
-    env.ADS_DB.prepare('SELECT COUNT(*) AS t FROM ads a ' + w).bind(...b),
+  const where = [], b = [];
+  if (filter) { where.push('a.status = ?'); b.push(status); }
+  const w = where.length ? ' WHERE ' + where.join(' AND ') : '';
+  const curSql = cur ? (where.length ? ' AND ' : ' WHERE ') + '(a.created_at, a.slug) < (?, ?)' : '';
+  // LIMIT+1 tells us whether another page exists without a second query; the total (first page only)
+  // feeds the "of N" count.
+  const stmts = [
     env.ADS_DB.prepare(
       'SELECT a.slug, a.owner_sub, a.views_total, a.views_used, a.status, a.created_at, ' +
       '(SELECT COUNT(*) FROM ad_viewers v WHERE v.slug = a.slug) AS unique_viewers ' +
-      'FROM ads a ' + w + 'ORDER BY a.created_at DESC LIMIT ? OFFSET ?'
-    ).bind(...b, ADMIN_ADS_PAGE + 1, offset)
-  ]);
-  const rows = page.results || [];
+      'FROM ads a' + w + curSql + ' ORDER BY a.created_at DESC, a.slug DESC LIMIT ?'
+    ).bind(...b, ...(cur ? [cur.key, cur.id] : []), ADMIN_ADS_PAGE + 1)
+  ];
+  if (!cur) stmts.unshift(env.ADS_DB.prepare('SELECT COUNT(*) AS t FROM ads a' + w).bind(...b));
+  const res = await env.ADS_DB.batch(stmts);
+  const rows = res[res.length - 1].results || [];
   const more = rows.length > ADMIN_ADS_PAGE;
   if (more) rows.pop();
+  const last = rows[rows.length - 1];
   const emails = {};
   await Promise.all([...new Set(rows.map(r => r.owner_sub))].map(async (sub) => {
     let u = null;
-    try { u = await getUser(env, sub); } catch (e) {}
+    try { u = await getUserCached(env, sub); } catch (e) {}
     emails[sub] = u ? u.email : null;
   }));
   return json({
@@ -3597,8 +3785,8 @@ async function handleAdminAds(env, request, url) {
       slug: r.slug, ownerEmail: emails[r.owner_sub], viewsTotal: r.views_total, viewsUsed: r.views_used,
       status: r.status, createdAt: r.created_at, uniqueViewers: r.unique_viewers
     })),
-    total: tot.results[0].t,
-    nextOffset: more ? offset + ADMIN_ADS_PAGE : null
+    total: cur ? null : res[0].results[0].t,
+    next: more && last ? last.created_at + '|' + last.slug : null
   });
 }
 
@@ -3682,6 +3870,7 @@ async function handleAdminUndismiss(env, request) {
   if (!rec || !rec.dismissedAt) return json({ ok: true });
   delete rec.dismissedAt;
   await env.REPORTS.put(key, JSON.stringify(rec));
+  await mirrorReport(env, key, rec);
   await audit(env, 'undismiss', rec.slug || null);
   return json({ ok: true });
 }
@@ -3700,8 +3889,13 @@ async function handleAdminAudit(env, request, url) {
 // Users come from the authors table (one row per account that has ever signed in); online, active
 // and guest figures come from presence (see above); notes are published_notes, i.e. signed-in
 // publishers only (anonymous pages have no row to count).
+// The scans below grow with the presence table (one row per guest device), so the result is cached
+// per isolate for a short while; the admin Refresh button can be up to STATS_TTL_MS behind.
+const STATS_TTL_MS = 60 * 1000;
+let statsCache = null;
 async function handleAdminStats(env, request) {
   const g = await adminGate(env, request); if (g) return g;
+  if (statsCache && Date.now() - statsCache.at < STATS_TTL_MS) return json(statsCache.body);
   await ensurePresence(env);
   const now = Date.now(), DAY = 24 * 60 * 60 * 1000;
   const on = now - ONLINE_WINDOW_MS, d1 = now - DAY, d7 = now - 7 * DAY, d30 = now - 30 * DAY;
@@ -3723,7 +3917,7 @@ async function handleAdminStats(env, request) {
   (r[6].results || []).forEach((x) => { ads[x.status] = x; });
   const since = [pu.since, pg.since].filter(Boolean);
   const u = first(0), n = first(2);
-  return json({
+  const body = {
     stats: {
       users: u.t || 0, usersNew1d: u.n1 || 0, usersNew7d: u.n7 || 0, usersNew30d: u.n30 || 0,
       usersOnline: pu.o || 0, usersActive24h: pu.a1 || 0, usersActive7d: pu.a7 || 0,
@@ -3737,39 +3931,96 @@ async function handleAdminStats(env, request) {
     onlineWindowMin: ONLINE_WINDOW_MS / 60000,
     trackingSince: since.length ? Math.min(...since) : null,
     at: now
-  });
+  };
+  statsCache = { at: now, body };
+  return json(body);
 }
 
-// GET /admin/users?offset=&q=&sort=new|old|active&f=online|active24: accounts, offset-paginated
-// with a running total. q matches the start of the account id or author id (emails live in KV, so
-// they can't be searched, only shown).
+// GET /admin/users?cursor=&q=&sort=new|old|active&f=online|active24: accounts, keyset-paginated (no
+// OFFSET, so deep pages cost the same as the first). The total is only computed on the first page
+// (no cursor); the client keeps it. q matches the start of the account id or author id (emails live
+// in KV, so they can't be searched, only shown).
 const ADMIN_DIR_PAGE = 30;
+// Indexes the admin lists lean on. Created lazily (IF NOT EXISTS) from the handlers that already query
+// these tables, and each one is independent and swallowed on failure so a missing table or column can
+// never break a request. The NOCASE ones let the case-insensitive prefix LIKE searches use an index.
+let adminIndexesReady = null;
+function ensureAdminIndexes(env) {
+  if (!adminIndexesReady) {
+    const ix = [
+      'CREATE INDEX IF NOT EXISTS admin_authors_created ON authors (created_at, sub)',
+      'CREATE INDEX IF NOT EXISTS admin_authors_sub_nc ON authors (sub COLLATE NOCASE)',
+      'CREATE INDEX IF NOT EXISTS admin_authors_aid_nc ON authors (author_id COLLATE NOCASE)',
+      'CREATE INDEX IF NOT EXISTS admin_notes_author ON published_notes (author_sub)',
+      'CREATE INDEX IF NOT EXISTS admin_notes_created ON published_notes (created_at, slug)',
+      'CREATE INDEX IF NOT EXISTS admin_notes_slug_nc ON published_notes (slug COLLATE NOCASE)',
+      'CREATE INDEX IF NOT EXISTS admin_ads_created ON ads (created_at, slug)',
+      'CREATE INDEX IF NOT EXISTS admin_ads_status_created ON ads (status, created_at, slug)',
+      'CREATE INDEX IF NOT EXISTS admin_ads_owner ON ads (owner_sub)',
+      'CREATE INDEX IF NOT EXISTS admin_ads_rotation ON ads (status, rotation_order)',
+      'CREATE INDEX IF NOT EXISTS admin_viewers_slug ON ad_viewers (slug)'
+    ];
+    adminIndexesReady = Promise.all(ix.map((sql) => env.ADS_DB.prepare(sql).run().catch(() => null)));
+  }
+  return adminIndexesReady;
+}
+// Short-lived per-isolate cache of KV user records for the admin lists, so paging back and forth (or
+// reloading) doesn't pay one KV read per row every time.
+const ADMIN_USER_TTL_MS = 30 * 1000;
+const adminUserCache = new Map();
+async function getUserCached(env, sub) {
+  const hit = adminUserCache.get(sub), now = Date.now();
+  if (hit && now - hit.at < ADMIN_USER_TTL_MS) return hit.u;
+  const u = await getUser(env, sub);
+  if (adminUserCache.size > 500) adminUserCache.clear();
+  adminUserCache.set(sub, { at: now, u });
+  return u;
+}
+// cursor = "<sort key>|<id>"; returns null when malformed so a bad cursor just restarts the list.
+function parseAdminCursor(raw) {
+  const i = typeof raw === 'string' ? raw.indexOf('|') : -1;
+  if (i < 1) return null;
+  const key = Number(raw.slice(0, i));
+  const id = raw.slice(i + 1).slice(0, 200);
+  return Number.isFinite(key) && id ? { key, id } : null;
+}
 async function handleAdminUsers(env, request, url) {
   const g = await adminGate(env, request); if (g) return g;
   await ensurePresence(env);
+  await ensureAdminIndexes(env);
   const sp = url.searchParams, now = Date.now();
-  const offset = Math.max(0, parseInt(sp.get('offset') || '0', 10) || 0);
-  const q = (sp.get('q') || '').trim().slice(0, 64).replace(/[%_\\]/g, '');
+  const cur = parseAdminCursor(sp.get('cursor'));
+  // Escape (don't strip) LIKE wildcards: author IDs are "a_<32 hex>", so removing '_' made every
+  // pasted author ID match nothing.
+  const q = (sp.get('q') || '').trim().slice(0, 64).replace(/[%_\\]/g, (c) => '\\' + c);
   const f = sp.get('f'), sort = sp.get('sort');
   const where = [], bind = [];
-  if (q) { where.push('(a.sub LIKE ? OR a.author_id LIKE ?)'); bind.push(q + '%', q + '%'); }
+  if (q) { where.push("(a.sub LIKE ? ESCAPE '\\' OR a.author_id LIKE ? ESCAPE '\\')"); bind.push(q + '%', q + '%'); }
   if (f === 'online') { where.push('p.last_seen >= ?'); bind.push(now - ONLINE_WINDOW_MS); }
   else if (f === 'active24') { where.push('p.last_seen >= ?'); bind.push(now - 24 * 60 * 60 * 1000); }
-  const from = " FROM authors a LEFT JOIN presence p ON p.id = 'u:' || a.sub" + (where.length ? ' WHERE ' + where.join(' AND ') : '');
-  const order = sort === 'old' ? 'a.created_at ASC' : sort === 'active' ? 'p.last_seen DESC, a.created_at DESC' : 'a.created_at DESC';
-  const [tot, page] = await env.ADS_DB.batch([
-    env.ADS_DB.prepare('SELECT COUNT(*) AS t' + from).bind(...bind),
+  const from = " FROM authors a LEFT JOIN presence p ON p.id = 'u:' || a.sub";
+  const whereSql = where.length ? ' WHERE ' + where.join(' AND ') : '';
+  const asc = sort === 'old';
+  const keyExpr = sort === 'active' ? 'COALESCE(p.last_seen, 0)' : 'a.created_at';
+  const order = keyExpr + (asc ? ' ASC' : ' DESC') + ', a.sub' + (asc ? ' ASC' : ' DESC');
+  const curSql = cur ? (where.length ? ' AND ' : ' WHERE ') + '(' + keyExpr + ', a.sub) ' + (asc ? '>' : '<') + ' (?, ?)' : '';
+  const stmts = [
     env.ADS_DB.prepare(
       'SELECT a.sub, a.author_id, a.created_at, p.last_seen, (SELECT COUNT(*) FROM published_notes n WHERE n.author_sub = a.sub) AS notes' +
-      from + ' ORDER BY ' + order + ' LIMIT ? OFFSET ?'
-    ).bind(...bind, ADMIN_DIR_PAGE + 1, offset)
-  ]);
-  const rows = page.results || [];
+      from + whereSql + curSql + ' ORDER BY ' + order + ' LIMIT ?'
+    ).bind(...bind, ...(cur ? [cur.key, cur.id] : []), ADMIN_DIR_PAGE + 1)
+  ];
+  if (!cur) stmts.unshift(env.ADS_DB.prepare('SELECT COUNT(*) AS t' + from + whereSql).bind(...bind));
+  const res = await env.ADS_DB.batch(stmts);
+  const total = cur ? null : res[0].results[0].t;
+  const rows = res[res.length - 1].results || [];
   const more = rows.length > ADMIN_DIR_PAGE;
   if (more) rows.pop();
+  const last = rows[rows.length - 1];
+  const next = more && last ? (sort === 'active' ? (last.last_seen || 0) : last.created_at) + '|' + last.sub : null;
   const users = await Promise.all(rows.map(async (r) => {
     let u = null;
-    try { u = await getUser(env, r.sub); } catch (e) {}
+    try { u = await getUserCached(env, r.sub); } catch (e) {}
     return {
       authorId: r.author_id || null,
       email: u ? u.email || null : null, name: u ? u.profileName || null : null, lastSignInAt: u ? u.lastSignInAt || null : null,
@@ -3778,30 +4029,35 @@ async function handleAdminUsers(env, request, url) {
       suspended: !!(u && u.suspended && !u.pendingDeletionAt), deleting: !!(u && u.pendingDeletionAt)
     };
   }));
-  return json({ users, total: tot.results[0].t, nextOffset: more ? offset + ADMIN_DIR_PAGE : null });
+  return json({ users, total, next });
 }
 
-// GET /admin/notes?offset=&q=: published notes (signed-in publishers), newest first, with a running
-// total. q matches the start of the slug.
+// GET /admin/notes?cursor=&q=: published notes (signed-in publishers), newest first, keyset-paginated;
+// total on the first page only. q matches the start of the slug.
 async function handleAdminNotes(env, request, url) {
   const g = await adminGate(env, request); if (g) return g;
+  await ensureAdminIndexes(env);
   const sp = url.searchParams;
-  const offset = Math.max(0, parseInt(sp.get('offset') || '0', 10) || 0);
+  const cur = parseAdminCursor(sp.get('cursor'));
   const q = (sp.get('q') || '').toLowerCase().replace(/[^a-z0-9-]/g, '').slice(0, 48);
-  const from = ' FROM published_notes n LEFT JOIN stories s ON s.slug = n.slug' + (q ? ' WHERE n.slug LIKE ?' : '');
+  const from = ' FROM published_notes n LEFT JOIN stories s ON s.slug = n.slug';
+  const whereSql = q ? ' WHERE n.slug LIKE ?' : '';
   const bind = q ? [q + '%'] : [];
-  const [tot, page] = await env.ADS_DB.batch([
-    env.ADS_DB.prepare('SELECT COUNT(*) AS t' + from).bind(...bind),
-    env.ADS_DB.prepare('SELECT n.slug, n.created_at, s.title, (s.slug IS NOT NULL) AS story' + from + ' ORDER BY n.created_at DESC LIMIT ? OFFSET ?')
-      .bind(...bind, ADMIN_DIR_PAGE + 1, offset)
-  ]);
-  const rows = page.results || [];
+  const curSql = cur ? (q ? ' AND ' : ' WHERE ') + '(n.created_at, n.slug) < (?, ?)' : '';
+  const stmts = [
+    env.ADS_DB.prepare('SELECT n.slug, n.created_at, s.title, (s.slug IS NOT NULL) AS story' + from + whereSql + curSql + ' ORDER BY n.created_at DESC, n.slug DESC LIMIT ?')
+      .bind(...bind, ...(cur ? [cur.key, cur.id] : []), ADMIN_DIR_PAGE + 1)
+  ];
+  if (!cur) stmts.unshift(env.ADS_DB.prepare('SELECT COUNT(*) AS t' + from + whereSql).bind(...bind));
+  const res = await env.ADS_DB.batch(stmts);
+  const rows = res[res.length - 1].results || [];
   const more = rows.length > ADMIN_DIR_PAGE;
   if (more) rows.pop();
+  const last = rows[rows.length - 1];
   return json({
     notes: rows.map(r => ({ slug: r.slug, title: r.title || null, createdAt: r.created_at, story: !!r.story })),
-    total: tot.results[0].t,
-    nextOffset: more ? offset + ADMIN_DIR_PAGE : null
+    total: cur ? null : res[0].results[0].t,
+    next: more && last ? last.created_at + '|' + last.slug : null
   });
 }
 
@@ -4018,11 +4274,14 @@ main{position:relative;z-index:1;max-width:720px;margin:0 auto;padding:2px 16px 
 .sec-t:empty{display:none}
 .pgrow{--slug-fs:15.5px;appearance:none;-webkit-appearance:none;display:grid;grid-template-columns:minmax(0,1fr) auto;gap:12px;align-items:center;width:100%;padding:12px 14px;margin:0 0 8px;border:0;border-radius:14px;background:var(--well);text-align:left;color:inherit}
 .pgrow:active{background:var(--s2)}
-.pgrow small{display:block;margin-top:3px;font-size:13px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.pgrow small.aid{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;color:var(--faint);white-space:normal;overflow-wrap:anywhere}
+.pgrow small{display:block;margin-top:3px;font-size:13px;color:var(--muted);overflow-wrap:anywhere}
+.pgrow small.aid{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;color:var(--faint)}
 .pgrow .pm{display:flex;align-items:center;gap:6px;flex-wrap:wrap;justify-content:flex-end}
-.pgrow .lk{display:inline-flex;align-items:center;gap:4px;font-size:13px;font-weight:650;color:var(--muted)}
-.pgrow .lk .ico{width:16px;height:16px}
+.pgrow .lk{display:inline-flex;align-items:center;gap:4px;font-size:13px;line-height:1;font-weight:650;color:var(--muted);font-variant-numeric:tabular-nums}
+.pgrow .lk .ico{width:16px;height:16px;flex:none;display:block}
+.pgrow .lk .ico svg{display:block}
+.pgrow .lk .n{display:block;line-height:1}
+@supports (text-box:trim-both cap alphabetic){.pgrow .lk .n{text-box:trim-both cap alphabetic}}
 
 .snaps{margin-top:14px;padding:2px 14px;border-radius:14px;background:var(--well)}
 .snap-row{padding:12px 0;border-top:1px solid var(--line)}
@@ -4240,7 +4499,7 @@ var ICON={
   tools:svg('<path d="M4 7h8M17 7h3M4 17h3M12 17h8"/><circle cx="14.5" cy="7" r="2.3"/><circle cx="9.5" cy="17" r="2.3"/>'),
   chart:svg('<path d="M5 20V11"/><path d="M12 20V5"/><path d="M19 20v-7"/>'),
   check:svg('<circle cx="12" cy="12" r="9"/><path d="m8 12.5 3 3 5-6"/>'),
-  heart:svg('<path d="M12 19.8s-7.3-4.4-7.3-9.9A4.2 4.2 0 0 1 12 7.4a4.2 4.2 0 0 1 7.3 2.5c0 5.5-7.3 9.9-7.3 9.9Z"/>'),
+  heart:svg('<path d="M12 18.9s-7.3-4.4-7.3-9.9A4.2 4.2 0 0 1 12 6.5a4.2 4.2 0 0 1 7.3 2.5c0 5.5-7.3 9.9-7.3 9.9Z"/>'),
   users:svg('<circle cx="9" cy="8.5" r="3.2"/><path d="M3.5 19c.5-3.2 2.8-5 5.5-5s5 1.8 5.5 5"/><path d="M16 5.5a3.2 3.2 0 0 1 0 6"/><path d="M17.5 14.2c1.8.5 3 2.3 3.3 4.8"/>'),
   image:svg('<rect x="4" y="5" width="16" height="14" rx="3"/><circle cx="9" cy="10" r="1.6"/><path d="m5 17 4.5-4.5 3 3L15 13l4 4"/>'),
   trash:svg('<path d="M5 7h14"/><path d="M9.5 7V5h5v2"/><path d="M7 7l.8 12h8.4L17 7"/>'),
@@ -4285,7 +4544,7 @@ function setFrame(f,t){var g=f._g=(f._g||0)+1;f._t=t;buildDoc(t).then(function(d
 function refreshFrames(){document.querySelectorAll('iframe').forEach(function(f){if(f._t!=null)setFrame(f,f._t)})}
 
 /* ---------- Core state and helpers ---------- */
-var tok=sessionStorage.getItem('adm')||'',next=null,all=[],cur='reports',adOff=0,auNext=null,auAll=[],auFilter='',lkSlug='',stack=[],openSet={},mt=null,recents=[],curSheet=null,repSub='';
+var tok=sessionStorage.getItem('adm')||'',next=null,all=[],cur='reports',adCur='',adTotal=0,auNext=null,auAll=[],auFilter='',lkSlug='',stack=[],openSet={},mt=null,recents=[],curSheet=null,repSub='',fullBusy=false,rIdx=false,rAgg=null,rGen=0,reindexing=false,qT=null;
 var TABS=['overview','reports','lookup','ads','audit','tools'];
 var TITLES={overview:'Overview',reports:'Reports',lookup:'Lookup',ads:'Ads',audit:'Audit',tools:'Tools'};
 var SUBS={overview:'Totals, live activity and directories',lookup:'Find a page, its owner and history',ads:'Campaigns running on published pages',audit:'Every admin action, newest first',tools:'Previews and maintenance'};
@@ -4310,6 +4569,7 @@ function api(path,o){o=o||{};var h={'X-Admin-Token':tok};if(o.body)h['Content-Ty
 function btn(label,cls,fn){var b=document.createElement('button');b.type='button';b.className='btn'+(cls?' '+cls:'');b.textContent=label;b.onclick=function(){fn(b)};return b}
 function link(label,href){var a=el('a','btn',label);a.href=href;a.target='_blank';a.rel='noopener';return a}
 function chip(text,cls){return el('span','chip'+(cls?' '+cls:''),text)}
+function aidRow(c,id){if(!id)return;var d=el('div','kv');d.appendChild(el('b',null,'Author ID'));var v=el('span','aid',id);v.style.cssText='font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:13px;cursor:pointer';v.onclick=function(){try{navigator.clipboard.writeText(id).then(function(){msg('Author ID copied')},function(){msg(id)})}catch(e){msg(id)}};d.appendChild(v);c.appendChild(d)}
 function kv(c,k,v){var d=el('div','kv');d.appendChild(el('b',null,k));d.appendChild(el('span',null,v));c.appendChild(d)}
 function slugFrom(v){v=(v||'').trim().toLowerCase();var q=v.indexOf('?');if(q>-1)v=v.slice(0,q);var p=v.split('/').filter(Boolean);v=p.length?p[p.length-1]:'';return v.charAt(0)==='@'?v.slice(1):v}
 function slugEl(s){var d=el('div','slug');d.appendChild(el('span','sl','/'));d.appendChild(document.createTextNode(s));return d}
@@ -4483,27 +4743,57 @@ function loggedIn(ok){
 function bad(o){if(o.s===403||o.s===429){sessionStorage.removeItem('adm');loggedIn(false)}msg(o.j.error||'failed ('+o.s+')')}
 
 /* ---------- Reports ---------- */
+function fqv(){return $('fq').value.trim().toLowerCase().replace(/^\\/?@?/,'')}
+function repQuery(){
+  var p=[];
+  if($('fdis').checked)p.push('dismissed=1');
+  if(rIdx){
+    var r=$('freason').value,q=fqv(),so=$('fsort').value;
+    if(r)p.push('reason='+encodeURIComponent(r));
+    if(q)p.push('q='+encodeURIComponent(q));
+    if(so&&so!=='new')p.push('sort='+so)
+  }
+  if(next)p.push('cursor='+encodeURIComponent(next));
+  return p.join('&')
+}
+function repFilter(){if(rIdx)loadReports(true);else renderAll()}
+function startReindex(){
+  if(reindexing)return;reindexing=true;msg('Indexing reports for search');
+  (function step(c){
+    api('/admin/reports/reindex',{method:'POST',body:{cursor:c}}).then(function(o){
+      if(!o.ok){reindexing=false;bad(o);return}
+      if(o.j.done){reindexing=false;msg('');loadReports(true);return}
+      step(o.j.cursor)
+    }).catch(function(){reindexing=false;msg('network error')})
+  })('')
+}
 function loadReports(reset){
-  var L=$('list');
-  if(reset){all=[];next=null;L.textContent='';skel(L,3)}else moreBusy($('more'),true);
-  return api('/admin/reports?'+($('fdis').checked?'dismissed=1&':'')+(next?'cursor='+encodeURIComponent(next):'')).then(function(o){
+  var L=$('list'),g;
+  if(reset){g=++rGen;all=[];next=null;L.textContent='';skel(L,3)}else{g=rGen;moreBusy($('more'),true)}
+  return api('/admin/reports?'+repQuery()).then(function(o){
+    if(g!==rGen)return;
     unskel(L);moreBusy($('more'),false);
     if(!o.ok){bad(o);return}
     sessionStorage.setItem('adm',tok);if(document.body.dataset.auth!=='in'){msg('');loggedIn(true)}
+    rIdx=o.j.indexed===true;
+    if(o.j.agg||reset)rAgg=o.j.agg||null;
     all=all.concat(o.j.reports);next=o.j.nextCursor;
     $('more').hidden=!next;
+    if(o.j.indexed===false)startReindex();
     if(!o.j.reports.length&&next){return loadReports(false)}
     renderAll()
-  }).catch(function(){unskel(L);moreBusy($('more'),false);msg('network error')})
+  }).catch(function(){if(g!==rGen)return;unskel(L);moreBusy($('more'),false);msg('network error')})
 }
-function setBadge(n,hot){var b=$('nb-reports');if(!n){b.hidden=true;return}b.hidden=false;b.textContent=(n>99?'99+':String(n))+(next?'+':'');b.className='nb'+(hot?' hot':'')}
+function setBadge(n,hot,exact){var b=$('nb-reports');if(!n){b.hidden=true;return}b.hidden=false;b.textContent=n>99?'99+':String(n)+(next&&!exact?'+':'');b.className='nb'+(hot?' hot':'')}
 function hasCsam(g){return g.items.some(function(x){return x.isCsam})}
 function renderQueue(base){
-  var q=$('queue');q.hidden=!all.length;if(!all.length)return;
-  var cnt={},order=[];
-  base.forEach(function(r){if(cnt[r.reason]==null){cnt[r.reason]=0;order.push(r.reason)}cnt[r.reason]++});
+  var q=$('queue'),useAgg=!!(rIdx&&rAgg&&!$('fstatus').value);
+  q.hidden=useAgg?!rAgg.total:!all.length;if(q.hidden)return;
+  var cnt={},order=[],tot=base.length;
+  if(useAgg){tot=rAgg.total;Object.keys(rAgg.byReason).forEach(function(k){cnt[k]=rAgg.byReason[k];order.push(k)})}
+  else base.forEach(function(r){if(cnt[r.reason]==null){cnt[r.reason]=0;order.push(r.reason)}cnt[r.reason]++});
   order.sort(function(a,b){var x=KNOWN.indexOf(a),y=KNOWN.indexOf(b);if(x<0)x=50;if(y<0)y=50;return x-y||(a<b?-1:1)});
-  $('qn').textContent=num(base.length)+(base.length===1?' report':' reports');
+  $('qn').textContent=num(tot)+(!useAgg&&next?'+':'')+(tot===1&&(useAgg||!next)?' report':' reports');
   var bar=$('qbar');bar.textContent='';
   order.forEach(function(r){var s=el('i','sev-'+sevOf(r));s.style.flexGrow=cnt[r];s.onclick=function(){msg(r+': '+cnt[r])};bar.appendChild(s)});
   var keys=$('qkeys');keys.textContent='';
@@ -4512,9 +4802,9 @@ function renderQueue(base){
     var b=el('button','key'+(sev?' sev-'+sev:''));b.type='button';b.setAttribute('aria-pressed',sel===v?'true':'false');
     if(sev)b.appendChild(el('i'));
     b.appendChild(el('span',null,label));b.appendChild(el('b',null,String(n)));
-    b.onclick=function(){$('freason').value=v;renderAll()};keys.appendChild(b)
+    b.onclick=function(){$('freason').value=v;repFilter()};keys.appendChild(b)
   }
-  key('','All',base.length,'');
+  key('','All',tot,'');
   if(sel&&order.indexOf(sel)<0)order.push(sel);
   order.forEach(function(r){key(r,LABEL[r]||r,cnt[r]||0,sevOf(r))})
 }
@@ -4536,12 +4826,20 @@ function renderAll(){
   var n=groups.length,nc=groups.filter(hasCsam).length;
   repSub=n?(num(n)+(n===1?' page ':' pages ')+(dis?'dismissed':'to review')+(nc&&!dis?', '+nc+' with a CSAM report':'')+(next?'. More to load':'')):'';
   if(!n){
-    if(all.length)L.appendChild(empty('Nothing matches','Change the filters above to see more reports.','search'));
+    if(all.length||(rIdx&&(fr||fq)))L.appendChild(empty('Nothing matches','Change the filters above to see more reports.','search'));
     else L.appendChild(empty(dis?'No dismissed reports':'All clear',dis?'Dismissed reports show up here.':'There are no open reports.','check'))
   }
-  if(!dis){var s={},h=false;all.forEach(function(r){s[r.slug]=1;if(r.isCsam)h=true});setBadge(Object.keys(s).length,h);document.body.dataset.alert=h?'csam':''}
+  if(!dis){var s={},h=false;all.forEach(function(r){s[r.slug]=1;if(r.isCsam)h=true});
+    if(rIdx&&rAgg){h=rAgg.csam>0;setBadge(rAgg.pages,h,true)}else setBadge(Object.keys(s).length,h);
+    document.body.dataset.alert=h?'csam':''}
   else{setBadge(0);document.body.dataset.alert=''}
-  if(cur==='reports')setSub()
+  if(cur==='reports')setSub();
+  // Filters, the reason chips and "Most reported" only see what's loaded, so pull the remaining pages
+  // (up to 1000 reports) before they apply. Stops if a page fails to load or adds nothing.
+  if(next&&!fullBusy&&all.length<1000&&(fs||(!rIdx&&(fr||fq||so==='most')))){
+    var n0=all.length;fullBusy=true;
+    loadReports(false).then(function(){fullBusy=false;if(next&&all.length>n0)renderAll()})
+  }
 }
 function setSlugStatus(slug,st){all.forEach(function(r){if(r.slug===slug)r.status=st});renderAll()}
 function renderGroup(g){
@@ -4715,6 +5013,7 @@ function renderLookup(d){
   if(d.deletedAt)kv(k,'Went offline',fmt(d.deletedAt));
   kv(k,'Size',d.sizeBytes!=null?Math.round(d.sizeBytes/1024)+' KB':'-');
   kv(k,'Owner',d.hasOwner?(d.ownerEmail||'account missing'):'anonymous (no account)');
+  aidRow(k,d.ownerAuthorId);
   kv(k,'Stories',(d.showInStories?'showing':'not showing')+(d.storyBlocked?' (blocked by admin)':''));
   if(d.story)kv(k,'Story',(d.story.title||'untitled')+' ('+fmt(d.story.createdAt)+')');
   kv(k,'Likes',num(d.likes));
@@ -4764,6 +5063,7 @@ function loadOwner(slug){
     [['Subscribers',d.subscribers],['Likes',d.likes],['Live pages',d.pages.length]].forEach(function(x){var s=el('div','stat');s.appendChild(el('b',null,x[1]==null?'-':num(x[1])));s.appendChild(el('span',null,x[0]));st.appendChild(s)});
     c.appendChild(st);
     var k=el('div','kvs');c.appendChild(k);
+    aidRow(k,d.authorId);
     kv(k,'Signed up',fmt(d.createdAt));kv(k,'Last sign-in',fmt(d.lastSignInAt));kv(k,'Ads',String(d.ads));kv(k,'Credit balance',num(d.creditBalance));
     kv(k,'Display name',d.displayName||'-');
     kv(k,'Backup',d.backup?num(d.backup.images)+(d.backup.imagesMore?'+':'')+' images - '+Math.round(d.backup.sizeBytes/1024)+' KB - '+ago(d.backup.updatedAt):'none');
@@ -4780,7 +5080,7 @@ function loadOwner(slug){
         l.appendChild(el('small',null,(p.title||'Untitled')+(p.updatedAt?' - updated '+ago(p.updatedAt):'')));
         r.appendChild(l);
         var m=el('div','pm');
-        if(p.likes!=null){var lk=el('span','lk');lk.appendChild(ico('heart'));lk.appendChild(document.createTextNode(num(p.likes)));m.appendChild(lk)}
+        if(p.likes!=null){var lk=el('span','lk');lk.appendChild(ico('heart'));lk.appendChild(el('span','n',num(p.likes)));m.appendChild(lk)}
         if(p.reports)m.appendChild(chip(p.reports+(p.reports===1?' report':' reports'),'bad'));
         if(p.showInStories)m.appendChild(chip('story'));
         r.appendChild(m);c.appendChild(r)
@@ -4818,13 +5118,13 @@ function takedownAll(pages,done){
 /* ---------- Ads ---------- */
 function loadAds(reset){
   var L=$('adlist');
-  if(reset){adOff=0;L.textContent='';skel(L,3)}else moreBusy($('admore'),true);
-  return api('/admin/ads?status='+encodeURIComponent($('adst').value)+'&offset='+adOff).then(function(o){
+  if(reset){adCur='';adTotal=0;L.textContent='';skel(L,3)}else moreBusy($('admore'),true);
+  return api('/admin/ads?status='+encodeURIComponent($('adst').value)+'&cursor='+encodeURIComponent(adCur)).then(function(o){
     unskel(L);moreBusy($('admore'),false);
     if(!o.ok){bad(o);return}
-    SUBS.ads=num(o.j.total)+(o.j.total===1?' campaign':' campaigns')+($('adst').value?' - '+$('adst').textContent.toLowerCase():'');if(cur==='ads')setSub();
+    if(o.j.total!=null)adTotal=o.j.total;SUBS.ads=num(adTotal)+(adTotal===1?' campaign':' campaigns')+($('adst').value?' - '+$('adst').textContent.toLowerCase():'');if(cur==='ads')setSub();
     o.j.ads.forEach(renderAd);
-    adOff=o.j.nextOffset;$('admore').hidden=adOff==null;
+    adCur=o.j.next;$('admore').hidden=adCur==null;
     if(!L.firstChild)L.appendChild(empty('No ads','No ads match this filter.','ads'))
   }).catch(function(){unskel(L);moreBusy($('admore'),false);msg('network error')})
 }
@@ -4899,7 +5199,7 @@ var OV=[
   ['Content',[['notes','Published notes'],['notesNew1d','New today'],['notesNew7d','New this week'],['publishers','Publishers'],['stories','In stories'],['likes','Likes']]],
   ['Ads and follows',[['adsActive','Active ads'],['adsPaused','Paused ads'],['adViewsUsed','Ad views used'],['adsExhausted','Used up'],['adsUnpublished','Taken down'],['subscriptions','Subscriptions']]]
 ];
-var ovS={view:'users',off:0,shown:0,gen:0,loaded:false,fil:'',sort:'new',q:'',t:null};
+var ovS={view:'users',cur:'',total:0,shown:0,gen:0,loaded:false,fil:'',sort:'new',q:'',t:null};
 function ovShell(){
   var C=$('ovstats');C.textContent='';
   OV.forEach(function(sec){
@@ -4951,18 +5251,18 @@ function ovNote(n){
 }
 function ovList(reset){
   var L=$('ovlist'),m=$('ovmore'),users=ovS.view==='users',g=++ovS.gen;
-  if(reset){ovS.off=0;ovS.shown=0;L.textContent='';moreBusy(m,false);m.hidden=true;$('ovcount').textContent='';skel(L,4,'row')}
+  if(reset){ovS.cur='';ovS.total=0;ovS.shown=0;L.textContent='';moreBusy(m,false);m.hidden=true;$('ovcount').textContent='';skel(L,4,'row')}
   else moreBusy(m,true);
-  var qs='offset='+ovS.off+'&q='+encodeURIComponent(ovS.q)+(users?'&sort='+ovS.sort+'&f='+ovS.fil:'');
+  var qs='cursor='+encodeURIComponent(ovS.cur)+'&q='+encodeURIComponent(ovS.q)+(users?'&sort='+ovS.sort+'&f='+ovS.fil:'');
   return api('/admin/'+ovS.view+'?'+qs).then(function(o){
     if(g!==ovS.gen)return;
     unskel(L);moreBusy(m,false);
     if(!o.ok){bad(o);return}
     var rows=users?o.j.users:o.j.notes;
     rows.forEach(users?ovUser:ovNote);
-    ovS.off=o.j.nextOffset;ovS.shown+=rows.length;
-    m.hidden=ovS.off==null;
-    $('ovcount').textContent=o.j.total?'Showing '+num(ovS.shown)+' of '+num(o.j.total):'';
+    ovS.cur=o.j.next;if(o.j.total!=null)ovS.total=o.j.total;ovS.shown+=rows.length;
+    m.hidden=ovS.cur==null;
+    $('ovcount').textContent=ovS.total?'Showing '+num(ovS.shown)+' of '+num(ovS.total):'';
     if(!L.firstChild)L.appendChild(empty(users?'No users':'No notes','Nothing matches this search.',users?'users':'reports'))
   }).catch(function(){if(g!==ovS.gen)return;unskel(L);moreBusy(m,false);msg('network error')})
 }
@@ -4979,7 +5279,7 @@ $('rf').onclick=function(){
   else if(cur==='audit')loadAudit(true)
 };
 $('so').onclick=function(){
-  sessionStorage.removeItem('adm');tok='';all=[];next=null;stack=[];lkSlug='';cur='reports';openSet={};auAll=[];auFilter='';recents=[];repSub='';
+  sessionStorage.removeItem('adm');tok='';all=[];next=null;rIdx=false;rAgg=null;rGen++;stack=[];lkSlug='';cur='reports';openSet={};auAll=[];auFilter='';recents=[];repSub='';
   ['list','lkowner','adlist','aulist','aukeys','qbar','qkeys','ovstats','ovlist'].forEach(function(i){$(i).textContent=''});
   ovS.loaded=false;ovS.view='users';ovS.q='';ovS.fil='';ovS.sort='new';ovS.gen++;$('ovq').value='';pickSet('ovsort','new');pickSet('ovfilter','');$('ovcount').textContent='';$('ovnote').textContent='';ovSync();
   $('queue').hidden=true;$('freason').value='';$('fq').value='';
@@ -5003,9 +5303,9 @@ $('ovq').oninput=function(){clearTimeout(ovS.t);ovS.t=setTimeout(function(){ovS.
 [].forEach.call($('ovseg').children,function(b){b.onclick=function(){var v=b.getAttribute('data-v');if(ovS.view===v)return;ovS.view=v;ovS.q='';$('ovq').value='';ovSync();ovList(true)}});
 $('adst').onclick=function(){pick('adst',function(){loadAds(true)})};
 $('fstatus').onclick=function(){pick('fstatus',renderAll)};
-$('fsort').onclick=function(){pick('fsort',renderAll)};
+$('fsort').onclick=function(){pick('fsort',repFilter)};
 $('fgroup').onchange=renderAll;
-$('fq').oninput=renderAll;
+$('fq').oninput=function(){renderAll();if(rIdx){clearTimeout(qT);qT=setTimeout(function(){loadReports(true)},300)}};
 $('fdis').onchange=function(){loadReports(true)};
 $('lkgo').onclick=function(){doLookup($('lkslug').value)};
 $('lkslug').onkeydown=function(e){if(e.key==='Enter')doLookup($('lkslug').value)};
@@ -5198,6 +5498,7 @@ export default {
       }
       if (method === 'GET' && pathname === '/admin') return handleAdminPage();
       if (method === 'GET' && pathname === '/admin/reports') return handleAdminReports(env, request, url);
+      if (method === 'POST' && pathname === '/admin/reports/reindex') return handleAdminReportsReindex(env, request);
       if (method === 'GET' && pathname === '/admin/img') return handleAdminImage(env, request, url);
       if (method === 'GET' && pathname === '/admin/lookup') return handleAdminLookup(env, request, url);
       if (method === 'GET' && pathname === '/admin/owner') return handleAdminOwner(env, request, url);
