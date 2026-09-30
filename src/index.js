@@ -40,7 +40,7 @@
  *                   indexed here for the queries that need it.
  *   REVENUECAT_WEBHOOK_SECRET (secret) - must match the "Authorization Header
  *                   value" configured on the RevenueCat project's webhook
- *                   (Project settings → Integrations → Webhooks) — see
+ *                   (Project settings > Integrations > Webhooks) — see
  *                   handleRevenueCatWebhook. Without this set the webhook
  *                   endpoint refuses everything (fail closed).
  *
@@ -3760,7 +3760,7 @@ async function handleAdminUsers(env, request, url) {
   const [tot, page] = await env.ADS_DB.batch([
     env.ADS_DB.prepare('SELECT COUNT(*) AS t' + from).bind(...bind),
     env.ADS_DB.prepare(
-      'SELECT a.sub, a.created_at, p.last_seen, (SELECT COUNT(*) FROM published_notes n WHERE n.author_sub = a.sub) AS notes' +
+      'SELECT a.sub, a.author_id, a.created_at, p.last_seen, (SELECT COUNT(*) FROM published_notes n WHERE n.author_sub = a.sub) AS notes' +
       from + ' ORDER BY ' + order + ' LIMIT ? OFFSET ?'
     ).bind(...bind, ADMIN_DIR_PAGE + 1, offset)
   ]);
@@ -3771,6 +3771,7 @@ async function handleAdminUsers(env, request, url) {
     let u = null;
     try { u = await getUser(env, r.sub); } catch (e) {}
     return {
+      authorId: r.author_id || null,
       email: u ? u.email || null : null, name: u ? u.profileName || null : null, lastSignInAt: u ? u.lastSignInAt || null : null,
       createdAt: r.created_at, lastSeen: r.last_seen || null, notes: r.notes,
       online: !!(r.last_seen && now - r.last_seen < ONLINE_WINDOW_MS),
@@ -3912,11 +3913,15 @@ main{position:relative;z-index:1;max-width:720px;margin:0 auto;padding:2px 16px 
 .field-wrap .ico{position:absolute;left:15px;top:15px;width:20px;height:20px;color:var(--muted);pointer-events:none}
 .field-wrap .field{padding-left:44px}
 
-.filters{display:flex;gap:8px;overflow-x:auto;margin:0 -16px 14px;padding:0 16px 2px;scrollbar-width:none}
+.filters{display:flex;gap:8px;overflow-x:auto;margin:0 -16px 10px;padding:4px 16px 6px;scrollbar-width:none}
 .filters::-webkit-scrollbar{display:none}
 .sel{position:relative;flex:none}
-.sel select{appearance:none;-webkit-appearance:none;height:38px;padding:0 34px 0 14px;border-radius:19px;border:1px solid var(--line2);background:var(--s1);font-size:14px;font-weight:600}
-.sel select option{background:var(--s1);color:var(--text)}
+.sel .pick{display:block;appearance:none;-webkit-appearance:none;height:38px;padding:0 34px 0 14px;border-radius:19px;border:1px solid var(--line2);background:var(--s1);color:var(--text);font-size:14px;font-weight:600;white-space:nowrap}
+.ptitle{margin:0 0 12px;font-size:17px;font-weight:700;letter-spacing:-.01em}
+.plist{display:grid;gap:6px;margin:0 0 14px}
+.popt{display:flex;align-items:center;justify-content:space-between;gap:12px;width:100%;min-height:48px;padding:0 16px;border-radius:14px;border:1px solid var(--line);background:transparent;color:var(--text);font-size:15px;font-weight:600;text-align:left;cursor:pointer}
+.popt[aria-selected=true]{border-color:var(--accent);background:var(--accent-bg)}
+.popt[aria-selected=true]::after{content:"\\2713";color:var(--accent);font-weight:800}
 .sel .ico{position:absolute;right:10px;top:10px;width:18px;height:18px;color:var(--muted);pointer-events:none}
 .pillck{position:relative;flex:none}
 .pillck input{position:absolute;inset:0;width:100%;height:100%;opacity:0;margin:0;cursor:pointer}
@@ -4012,6 +4017,7 @@ main{position:relative;z-index:1;max-width:720px;margin:0 auto;padding:2px 16px 
 .pgrow{--slug-fs:15.5px;appearance:none;-webkit-appearance:none;display:grid;grid-template-columns:minmax(0,1fr) auto;gap:12px;align-items:center;width:100%;padding:12px 14px;margin:0 0 8px;border:0;border-radius:14px;background:var(--well);text-align:left;color:inherit}
 .pgrow:active{background:var(--s2)}
 .pgrow small{display:block;margin-top:3px;font-size:13px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.pgrow small.aid{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;color:var(--faint);white-space:normal;overflow-wrap:anywhere}
 .pgrow .pm{display:flex;align-items:center;gap:6px;flex-wrap:wrap;justify-content:flex-end}
 .pgrow .lk{display:inline-flex;align-items:center;gap:4px;font-size:13px;font-weight:650;color:var(--muted)}
 .pgrow .lk .ico{width:16px;height:16px}
@@ -4063,8 +4069,8 @@ main{position:relative;z-index:1;max-width:720px;margin:0 auto;padding:2px 16px 
 /* floating dock */
 .dock{position:fixed;left:0;right:0;bottom:0;z-index:20;padding:0 12px calc(10px + env(safe-area-inset-bottom,0px));pointer-events:none}
 .nav{position:relative;pointer-events:auto;max-width:480px;height:68px;margin:0 auto;display:grid;grid-template-columns:repeat(6,minmax(0,1fr));border-radius:28px;background:rgba(27,30,66,.8);-webkit-backdrop-filter:blur(22px) saturate(1.4);backdrop-filter:blur(22px) saturate(1.4);border:1px solid var(--line2);box-shadow:0 18px 40px -10px rgba(2,3,18,.85),inset 0 1px 0 rgba(255,255,255,.07)}
-.pill{position:absolute;top:0;bottom:0;left:0;width:16.6667%;display:grid;place-items:center;pointer-events:none;transition:transform .34s cubic-bezier(.3,.9,.3,1)}
-.pill::before{content:"";width:64px;height:54px;border-radius:20px;background:var(--accent-bg);box-shadow:inset 0 0 0 1px rgba(139,155,255,.3)}
+.pill{position:absolute;top:0;bottom:0;left:0;width:16.6667%;display:flex;align-items:center;justify-content:center;pointer-events:none;transition:transform .34s cubic-bezier(.3,.9,.3,1)}
+.pill::before{content:"";flex:none;width:min(64px,calc(100% - 6px));height:54px;border-radius:20px;background:var(--accent-bg);box-shadow:inset 0 0 0 1px rgba(139,155,255,.3)}
 .tab{--tc:var(--muted);min-width:0;position:relative;z-index:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;border:0;background:none;color:var(--tc);font-size:11.5px;font-weight:650}
 .tab[aria-current=page]{--tc:var(--accent)}
 .ico-wrap{position:relative;display:grid;place-items:center}
@@ -4126,8 +4132,8 @@ body[data-auth=out] #msg{bottom:calc(24px + env(safe-area-inset-bottom,0px))}
       </div>
       <div class="search"><div class="field-wrap"><span class="ico" data-i="search"></span><input class="field" id="ovq" placeholder="Search by author ID" autocomplete="off" autocapitalize="off" spellcheck="false"></div></div>
       <div class="filters" id="ovfil">
-        <label class="sel"><select id="ovsort" aria-label="Sort"><option value="new">Newest first</option><option value="old">Oldest first</option><option value="active">Last active</option></select><span class="ico" data-i="chev"></span></label>
-        <label class="sel"><select id="ovfilter" aria-label="Show"><option value="">All users</option><option value="online">Online now</option><option value="active24">Active 24h</option></select><span class="ico" data-i="chev"></span></label>
+        <span class="sel"><button type="button" class="pick" id="ovsort" aria-label="Sort" aria-haspopup="listbox" value="new">Newest first</button><span class="ico" data-i="chev"></span></span>
+        <span class="sel"><button type="button" class="pick" id="ovfilter" aria-label="Show" aria-haspopup="listbox" value="">All users</button><span class="ico" data-i="chev"></span></span>
       </div>
       <div class="sec-t" id="ovcount"></div>
       <div id="ovlist"></div>
@@ -4143,8 +4149,8 @@ body[data-auth=out] #msg{bottom:calc(24px + env(safe-area-inset-bottom,0px))}
       <input type="hidden" id="freason" value="">
       <div class="search"><div class="field-wrap"><span class="ico" data-i="search"></span><input class="field" id="fq" placeholder="Filter by slug" autocomplete="off" autocapitalize="off" spellcheck="false"></div></div>
       <div class="filters">
-        <label class="sel"><select id="fstatus" aria-label="Status"><option value="">Any status</option><option>live</option><option>taken down</option><option>unpublished</option><option>missing</option></select><span class="ico" data-i="chev"></span></label>
-        <label class="sel"><select id="fsort" aria-label="Sort"><option value="new">Newest first</option><option value="most">Most reported</option><option value="old">Oldest first</option></select><span class="ico" data-i="chev"></span></label>
+        <span class="sel"><button type="button" class="pick" id="fstatus" aria-label="Status" aria-haspopup="listbox" value="">Any status</button><span class="ico" data-i="chev"></span></span>
+        <span class="sel"><button type="button" class="pick" id="fsort" aria-label="Sort" aria-haspopup="listbox" value="new">Newest first</button><span class="ico" data-i="chev"></span></span>
         <label class="pillck"><input type="checkbox" id="fgroup" checked><span>Group by slug</span></label>
         <label class="pillck"><input type="checkbox" id="fdis"><span>Dismissed</span></label>
       </div>
@@ -4164,7 +4170,7 @@ body[data-auth=out] #msg{bottom:calc(24px + env(safe-area-inset-bottom,0px))}
 
     <div id="p-ads" class="pnl">
       <div class="filters">
-        <label class="sel"><select id="adst" aria-label="Ad status"><option value="">All ads</option><option value="active">Active</option><option value="paused">Paused</option><option value="exhausted">Used up</option><option value="unpublished">Down</option></select><span class="ico" data-i="chev"></span></label>
+        <span class="sel"><button type="button" class="pick" id="adst" aria-label="Ad status" aria-haspopup="listbox" value="">All ads</button><span class="ico" data-i="chev"></span></span>
       </div>
       <div id="adlist"></div>
       <button class="btn block more" id="admore" style="display:none">Load more</button>
@@ -4225,6 +4231,7 @@ var ICON={
   dots:svg('<circle cx="6.5" cy="12" r="1.3"/><circle cx="12" cy="12" r="1.3"/><circle cx="17.5" cy="12" r="1.3"/>'),
   reports:svg('<path d="M5.5 21V4.5"/><path d="M5.5 4.5h12l-2.5 4 2.5 4h-12"/>'),
   search:svg('<circle cx="11" cy="11" r="6.5"/><path d="m20 20-4.2-4.2"/>'),
+  copy:svg('<rect x="9" y="9" width="11" height="11" rx="2.5"/><path d="M15 9V6.5A2.5 2.5 0 0 0 12.5 4h-6A2.5 2.5 0 0 0 4 6.5v6A2.5 2.5 0 0 0 6.5 15H9"/>'),
   ads:svg('<path d="M4 14v-4l10-4v12L4 14Z"/><path d="M17.5 9.5a3.5 3.5 0 0 1 0 5"/><path d="m6.5 14.5 1.5 4.5h2.5l-1-3.7"/>'),
   audit:svg('<circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/>'),
   tools:svg('<path d="M4 7h8M17 7h3M4 17h3M12 17h8"/><circle cx="14.5" cy="7" r="2.3"/><circle cx="9.5" cy="17" r="2.3"/>'),
@@ -4384,6 +4391,39 @@ function ask(o){
     document.addEventListener('keydown',kd);
     requestAnimationFrame(function(){back.classList.add('open');(inputs[0]||cb).focus()})
   })
+}
+
+var PICKS={ovsort:[['new', 'Newest first'], ['old', 'Oldest first'], ['active', 'Last active']],ovfilter:[['', 'All users'], ['online', 'Online now'], ['active24', 'Active 24h']],fstatus:[['', 'Any status'], ['live', 'live'], ['taken down', 'taken down'], ['unpublished', 'unpublished'], ['missing', 'missing']],fsort:[['new', 'Newest first'], ['most', 'Most reported'], ['old', 'Oldest first']],adst:[['', 'All ads'], ['active', 'Active'], ['paused', 'Paused'], ['exhausted', 'Used up'], ['unpublished', 'Down']]};
+function pickSet(id,v){
+  var b=$(id),o=PICKS[id].filter(function(x){return x[0]===v})[0]||PICKS[id][0];
+  b.value=o[0];b.textContent=o[1]
+}
+function pick(id,fn){
+  if(curSheet)curSheet.done(false);
+  var b=$(id),back=el('div','sheet-back'),sh=el('div','sheet'),list=el('div','plist');
+  sh.setAttribute('role','dialog');sh.setAttribute('aria-modal','true');sh.setAttribute('aria-label',b.getAttribute('aria-label'));
+  sh.appendChild(el('div','grab'));
+  sh.appendChild(el('div','ptitle',b.getAttribute('aria-label')));
+  PICKS[id].forEach(function(o){
+    var ob=el('button','popt',o[1]);ob.type='button';ob.setAttribute('role','option');
+    ob.setAttribute('aria-selected',o[0]===b.value?'true':'false');
+    ob.onclick=function(){var ch=o[0]!==b.value;fin();if(ch){pickSet(id,o[0]);fn()}};
+    list.appendChild(ob)
+  });
+  sh.appendChild(list);
+  sh.appendChild(btn('Cancel','quiet block',function(){fin()}));
+  back.appendChild(sh);document.body.appendChild(back);
+  function kd(e){if(e.key==='Escape')fin()}
+  function fin(){
+    if(curSheet!==me)return;
+    curSheet=null;document.removeEventListener('keydown',kd);
+    back.classList.remove('open');setTimeout(function(){back.remove()},240);
+    try{b.focus()}catch(e){}
+  }
+  var me={done:fin};curSheet=me;
+  back.onclick=function(e){if(e.target===back)fin()};
+  document.addEventListener('keydown',kd);
+  requestAnimationFrame(function(){back.classList.add('open')})
 }
 
 /* collapsible card */
@@ -4779,7 +4819,7 @@ function loadAds(reset){
   return api('/admin/ads?status='+encodeURIComponent($('adst').value)+'&offset='+adOff).then(function(o){
     unskel(L);moreBusy($('admore'),false);
     if(!o.ok){bad(o);return}
-    SUBS.ads=num(o.j.total)+(o.j.total===1?' campaign':' campaigns')+($('adst').value?' - '+$('adst').options[$('adst').selectedIndex].text.toLowerCase():'');if(cur==='ads')setSub();
+    SUBS.ads=num(o.j.total)+(o.j.total===1?' campaign':' campaigns')+($('adst').value?' - '+$('adst').textContent.toLowerCase():'');if(cur==='ads')setSub();
     o.j.ads.forEach(renderAd);
     adOff=o.j.nextOffset;$('admore').style.display=adOff!=null?'':'none';
     if(!L.firstChild)L.appendChild(empty('No ads','No ads match this filter.','ads'))
@@ -4885,11 +4925,14 @@ function ovSync(){
   $('ovq').placeholder=users?'Search by author ID':'Search by slug'
 }
 function ovUser(u){
-  var r=el('div','pgrow'),l=el('div');
+  var r=el('button','pgrow'),l=el('div');r.type='button';
+  r.onclick=function(){if(!u.authorId)return;try{navigator.clipboard.writeText(u.authorId).then(function(){msg('Author ID copied')},function(){msg(u.authorId)})}catch(e){msg(u.authorId)}};
   l.appendChild(el('div','slug',u.email||'Account missing'));
   l.appendChild(el('small',null,(u.name?u.name+' - ':'')+'Joined '+ago(u.createdAt)+' - '+num(u.notes)+(u.notes===1?' note':' notes')+' - '+(u.lastSeen?'seen '+ago(u.lastSeen):'not seen yet')+(u.lastSignInAt?' - signed in '+ago(u.lastSignInAt):'')));
+  if(u.authorId)l.appendChild(el('small','aid',u.authorId));
   r.appendChild(l);
   var m=el('div','pm');
+  if(u.authorId){var cp=el('span','lk');cp.setAttribute('aria-label','Copy author ID');cp.appendChild(ico('copy'));m.appendChild(cp)}
   if(u.online)m.appendChild(chip('online','st good'));
   if(u.suspended)m.appendChild(chip('suspended','bad'));
   if(u.deleting)m.appendChild(chip('deleting','warn'));
@@ -4935,7 +4978,7 @@ $('rf').onclick=function(){
 $('so').onclick=function(){
   sessionStorage.removeItem('adm');tok='';all=[];next=null;stack=[];lkSlug='';cur='reports';openSet={};auAll=[];auFilter='';recents=[];repSub='';
   ['list','lkowner','adlist','aulist','aukeys','qbar','qkeys','ovstats','ovlist'].forEach(function(i){$(i).textContent=''});
-  ovS.loaded=false;ovS.view='users';ovS.q='';ovS.fil='';ovS.sort='new';ovS.gen++;$('ovq').value='';$('ovsort').value='new';$('ovfilter').value='';$('ovcount').textContent='';$('ovnote').textContent='';ovSync();
+  ovS.loaded=false;ovS.view='users';ovS.q='';ovS.fil='';ovS.sort='new';ovS.gen++;$('ovq').value='';pickSet('ovsort','new');pickSet('ovfilter','');$('ovcount').textContent='';$('ovnote').textContent='';ovSync();
   $('queue').hidden=true;$('freason').value='';$('fq').value='';
   lookupHint();renderRecents();setBadge(0);document.body.dataset.alert='';$('tok').value='';
   loggedIn(false);msg('Signed out','ok')
@@ -4951,12 +4994,14 @@ $('more').onclick=function(){loadReports(false)};
 $('admore').onclick=function(){loadAds(false)};
 $('aumore').onclick=function(){loadAudit(false)};
 $('ovmore').onclick=function(){ovList(false)};
-$('ovsort').onchange=function(){ovS.sort=this.value;ovList(true)};
-$('ovfilter').onchange=function(){ovS.fil=this.value;ovList(true)};
+$('ovsort').onclick=function(){pick('ovsort',function(){ovS.sort=$('ovsort').value;ovList(true)})};
+$('ovfilter').onclick=function(){pick('ovfilter',function(){ovS.fil=$('ovfilter').value;ovList(true)})};
 $('ovq').oninput=function(){clearTimeout(ovS.t);ovS.t=setTimeout(function(){ovS.q=$('ovq').value.trim().toLowerCase();ovList(true)},300)};
 [].forEach.call($('ovseg').children,function(b){b.onclick=function(){var v=b.getAttribute('data-v');if(ovS.view===v)return;ovS.view=v;ovS.q='';$('ovq').value='';ovSync();ovList(true)}});
-$('adst').onchange=function(){loadAds(true)};
-$('fstatus').onchange=$('fsort').onchange=$('fgroup').onchange=renderAll;
+$('adst').onclick=function(){pick('adst',function(){loadAds(true)})};
+$('fstatus').onclick=function(){pick('fstatus',renderAll)};
+$('fsort').onclick=function(){pick('fsort',renderAll)};
+$('fgroup').onchange=renderAll;
 $('fq').oninput=renderAll;
 $('fdis').onchange=function(){loadReports(true)};
 $('lkgo').onclick=function(){doLookup($('lkslug').value)};
