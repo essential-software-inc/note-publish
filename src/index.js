@@ -4519,6 +4519,16 @@ main{position:relative;z-index:1;max-width:720px;margin:0 auto;padding:2px 16px 
 .field-wrap{position:relative;flex:1;min-width:0}
 .field-wrap .ico{position:absolute;left:15px;top:15px;width:20px;height:20px;color:var(--muted);pointer-events:none}
 .field-wrap .field{padding-left:44px}
+.clr{position:relative;flex:1;min-width:0}
+.clr>.field.has-clr,.field-wrap>.field.has-clr{padding-right:46px}
+.clr-x{position:absolute;right:5.25px;top:50%;width:40px;height:40px;margin:-20px 0 0;padding:0;border:0;background:none;color:var(--muted);display:none;place-items:center;border-radius:50%}
+.clr-x.on{display:grid}
+.field-wrap .clr-x{right:6.5px}
+.clr-x svg{width:22px;height:22px;display:block;pointer-events:none}
+.clr-x:active{color:var(--text)}
+.login-card .clr{margin-bottom:12px;animation:rise .55s cubic-bezier(.2,.8,.2,1) both;animation-delay:calc(var(--i,0)*70ms)}
+.login-card .clr .field{margin-bottom:0}
+.sheet-field .clr{display:block}
 
 .filters{gap:8px;overflow-x:auto;margin:0 -16px 10px;padding:4px 16px 6px;scrollbar-width:none}
 .filters:not([hidden]){display:flex}
@@ -4920,6 +4930,7 @@ var P='fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="roun
 function svg(b){return '<svg viewBox="0 0 24 24" '+P+'>'+b+'</svg>'}
 var ICON={
   back:svg('<path d="m14.5 5.5-6.5 6.5 6.5 6.5"/>'),
+  clear:svg('<circle cx="12" cy="12" r="9" fill="currentColor" fill-opacity=".22" stroke="none"/><path d="m9 9 6 6M15 9l-6 6"/>'),
   chev:svg('<path d="m6 9.5 6 6 6-6"/>'),
   refresh:svg('<g transform="translate(12 12) scale(.8) translate(-12 -12)" stroke-width="2.25"><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/><polyline points="23 4 23 10 17 10"/></g>'),
   lock:svg('<rect x="5" y="10.5" width="14" height="10" rx="2.5"/><path d="M8.5 10.5V8a3.5 3.5 0 0 1 7 0v2.5"/>'),
@@ -4946,6 +4957,23 @@ var ICON={
 };
 function ico(n,c){var s=document.createElement('span');s.className='ico'+(c?' '+c:'');s.innerHTML=ICON[n];return s}
 [].forEach.call(document.querySelectorAll('[data-i]'),function(n){n.innerHTML=ICON[n.getAttribute('data-i')]});
+/* Clear (x) button for text fields: shows while the field has text, also when code sets .value, and fires 'input' so existing handlers run */
+var VALD=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value');
+function clearable(i){
+  if(!i||i._clr)return;i._clr=1;
+  var host=i.parentNode;
+  if(!host.classList.contains('field-wrap')){var w=el('div','clr');if(i.hasAttribute('style')){w.setAttribute('style',i.getAttribute('style'));i.removeAttribute('style')}host.insertBefore(w,i);w.appendChild(i);host=w}
+  i.classList.add('has-clr');
+  var b=document.createElement('button');b.type='button';b.className='clr-x';b.tabIndex=-1;b.setAttribute('aria-label','Clear');b.innerHTML=ICON.clear;
+  host.appendChild(b);
+  function sync(){b.classList.toggle('on',!!VALD.get.call(i))}
+  Object.defineProperty(i,'value',{configurable:true,get:function(){return VALD.get.call(i)},set:function(v){VALD.set.call(i,v);sync()}});
+  i.addEventListener('input',sync);
+  b.onmousedown=function(e){e.preventDefault()};
+  b.onclick=function(){VALD.set.call(i,'');sync();i.dispatchEvent(new Event('input',{bubbles:true}));i.focus()};
+  sync()
+}
+function clearableAll(){['tok','ovq','fq','lkslug','relslug'].forEach(function(id){clearable($(id))})}
 
 /* ---------- Snapshot preview (sandboxed) ---------- */
 function toDataUrl(b){return new Promise(function(res){var r=new FileReader();r.onload=function(){res(r.result)};r.onerror=function(){res(null)};r.readAsDataURL(b)})}
@@ -5084,7 +5112,7 @@ function ask(o){
     (o.fields||[]).forEach(function(f){
       var l=el('label','sheet-field');l.appendChild(el('span',null,f.label));
       var i=el('input','field');i.placeholder=f.ph||'';i.autocomplete='off';if(f.max)i.maxLength=f.max;
-      l.appendChild(i);sb.appendChild(l);inputs.push(i)
+      l.appendChild(i);sb.appendChild(l);clearable(i);inputs.push(i)
     });
     var acts=el('div','sheet-actions');
     var okb=btn(o.ok||'Confirm',o.danger?'destroy block':'primary block',function(){fin(inputs.length?inputs.map(function(i){return i.value}):true)});
@@ -6122,6 +6150,7 @@ $('go').onclick=function(){
   tok=v;var b=$('go');b.disabled=true;b.textContent='Checking';
   loadReports(true).then(function(){b.disabled=false;b.textContent='Sign in'})
 };
+clearableAll();
 $('tok').onkeydown=function(e){if(e.key==='Enter')$('go').onclick()};
 $('more').onclick=function(){loadReports(false)};
 $('admore').onclick=function(){loadAds(false)};
