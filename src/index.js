@@ -38,6 +38,8 @@
  *                   do. Page HTML/slugs/tokens stay in SLUGS/NOTES_BUCKET as
  *                   before — a story or an ad IS a published page, just also
  *                   indexed here for the queries that need it.
+ *                   Also holds alerts (created on first use by ensureAlerts): automatic
+ *                   notices to an account — see createAlert / GET /alerts.
  *   REVENUECAT_WEBHOOK_SECRET (secret) - must match the "Authorization Header
  *                   value" configured on the RevenueCat project's webhook
  *                   (Project settings > Integrations > Webhooks) — see
@@ -264,6 +266,7 @@ async function touchPresence(env, kind, key) {
     await env.ADS_DB.prepare(
       'INSERT INTO presence (id, kind, first_seen, last_seen) VALUES (?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET last_seen = excluded.last_seen'
     ).bind(id, kind, now, now).run();
+    await recordActivityDay(env, id, now);
   } catch (e) { /* reporting-only; swallow */ }
 }
 async function prunePresence(env) {
@@ -272,6 +275,37 @@ async function prunePresence(env) {
     await env.ADS_DB.prepare('DELETE FROM presence WHERE last_seen < ?').bind(Date.now() - PRESENCE_RETENTION_MS).run();
   } catch (e) { /* reporting-only; swallow */ }
 }
+// Daily-active ledger for the admin trend charts. One row per (UTC day, id) the first time an id is
+// seen that day in an isolate, so distinct counts over any day/week/month/year range are exact from
+// the day this shipped (older activity can't be reconstructed: presence only keeps last_seen).
+//   CREATE TABLE activity_daily (day INTEGER NOT NULL, id TEXT NOT NULL, PRIMARY KEY (day, id)) WITHOUT ROWID;
+// id is 'u:<sub>' for accounts and 'g:<deviceId>' for guests, same as presence.
+const ACTIVITY_RETENTION_DAYS = 800;
+let activityReady = null;
+const activityLastDay = new Map();
+function ensureActivity(env) {
+  if (!activityReady) {
+    activityReady = env.ADS_DB.batch([
+      env.ADS_DB.prepare('CREATE TABLE IF NOT EXISTS activity_daily (day INTEGER NOT NULL, id TEXT NOT NULL, PRIMARY KEY (day, id)) WITHOUT ROWID')
+    ]).catch((e) => { activityReady = null; throw e; });
+  }
+  return activityReady;
+}
+async function recordActivityDay(env, id, now) {
+  const day = Math.floor(now / 86400000);
+  if (activityLastDay.get(id) === day) return;
+  await ensureActivity(env);
+  await env.ADS_DB.prepare('INSERT OR IGNORE INTO activity_daily (day, id) VALUES (?, ?)').bind(day, id).run();
+  if (activityLastDay.size > 5000) activityLastDay.clear();
+  activityLastDay.set(id, day);
+}
+async function pruneActivity(env) {
+  try {
+    await ensureActivity(env);
+    await env.ADS_DB.prepare('DELETE FROM activity_daily WHERE day < ?').bind(Math.floor(Date.now() / 86400000) - ACTIVITY_RETENTION_DAYS).run();
+  } catch (e) { /* reporting-only; swallow */ }
+}
+
 function presenceDeviceId(body) {
   return typeof body?.deviceId === 'string' ? body.deviceId.trim().slice(0, MAX_VIEWER_ID_LEN) : '';
 }
@@ -1099,6 +1133,7 @@ async function handleUnpublish(env, request, slug) {
     if (auth === 'limited') return textError(429, 'too many failed attempts, try again in 5 minutes');
     if (auth !== 'ok') return textError(403, 'invalid admin token');
     if (release === true) isAdminRelease = true; else isAdminTakedown = true;
+    if (isAdminTakedown && !adminReasonOf(body)) return textError(400, 'reason required');
   } else {
     if (typeof token !== 'string' || !token) return textError(401, 'missing token');
     const tokenHash = await sha256Hex(token);
@@ -1133,6 +1168,7 @@ async function handleUnpublish(env, request, slug) {
   if (isAdminTakedown) meta.adminLocked = true;
   await putMeta(env, slug, meta);
   if (isAdminTakedown || isAdminRelease) await audit(env, isAdminRelease ? 'release' : 'takedown', slug);
+  if (isAdminTakedown) await createAlert(env, meta.ownerSub, 'takedown', 'Your note ' + alertNoteName(meta, slug) + ' was taken down. ' + alertReason(adminReasonOf(body)) + ' Its address can\u2019t be reused. ' + ALERT_REPEAT_NOTE);
   // Drop this slug out of its owner's GET /my/pages listing either way —
   // an admin takedown shouldn't keep showing up in the owner's own page
   // list any more than a normal unpublish would.
@@ -2319,7 +2355,8 @@ async function handleReport(env, request, slug, ctx) {
   // Reject reports for slugs that were never published, so junk records and
   // alerts can't be generated for made-up slugs. (Unpublished and
   // taken-down slugs keep their metadata and stay reportable.)
-  if (!(await getMeta(env, slug))) return textError(404, 'page not found');
+  const reportedMeta = await getMeta(env, slug);
+  if (!reportedMeta) return textError(404, 'page not found');
 
   const record = { slug, reason, details, isCsam, reportedAt: Date.now() };
   const reportKey = makeReportKey(slug, record.reportedAt);
@@ -2353,6 +2390,9 @@ async function handleReport(env, request, slug, ctx) {
       JSON.stringify({ until: record.reportedAt + CSAM_RETENTION_MS, etag }),
       { expirationTtl: Math.ceil(CSAM_RETENTION_MS / 1000) });
   }
+
+  // Tell the page's owner (anonymous pages have no account to tell).
+  await createAlert(env, reportedMeta.ownerSub, 'report', reportAlertText(reportedMeta, slug, reason), { ref: slug + ':' + reason, dedupeMs: ALERT_REPORT_DEDUPE_MS });
 
   if (env.REPORT_WEBHOOK_URL) {
     // Off the reporter's critical path: the response doesn't wait on Slack.
@@ -2554,6 +2594,7 @@ async function purgeAccountData(env, sub) {
   await revokeAllSessions(env, sub);
   await env.ACCOUNTS.delete('user:' + sub);
   await env.ACCOUNTS.delete('syncmeta:' + sub);
+  await env.ACCOUNTS.delete(ALERTS_SEEN_PREFIX + sub);
   await env.NOTES_BUCKET.delete('sync/' + sub + '/notes.json');
   let imgCursor;
   do {
@@ -2582,6 +2623,8 @@ async function purgeAccountData(env, sub) {
     env.ADS_DB.prepare('DELETE FROM ads WHERE owner_sub = ?').bind(sub),
     env.ADS_DB.prepare('DELETE FROM view_credits_ledger WHERE owner_sub = ?').bind(sub)
   ]);
+  await ensureAlerts(env);
+  await env.ADS_DB.prepare('DELETE FROM alerts WHERE sub = ?').bind(sub).run();
 }
 
 /* ---------------- Publish as Ad ---------------- */
@@ -3043,6 +3086,128 @@ async function handleAdView(env, request, slug) {
   // slug, or a race with another view landing the exact same moment) isn't
   // an error worth surfacing to the editor — the view simply isn't counted.
   return json({ ok: true, counted: !!row, ...(row || {}) });
+}
+
+/* ---------------- Alerts ---------------- */
+// Automatic, read-only notices shown to the account under Library > Alerts (reports against their
+// notes, a profile picture or name removed, takedowns, story/ad actions, suspension changes). Nothing
+// here is written by hand: every message is built at the event that causes it. D1 table `alerts`
+// (created on first use, like report_index). The person can delete an alert from their own list,
+// which only sets dismissed_at; the row stays so the admin page can still show what was sent.
+const ALERTS_PAGE = 30;
+const ALERT_MAX_LEN = 600;
+const ALERT_RETENTION_MS = 365 * 24 * 60 * 60 * 1000;
+const ALERT_REPORT_DEDUPE_MS = 24 * 60 * 60 * 1000; // same note + same reason: one alert a day, so a pile of reports can't flood the list
+const ALERT_SUSPENSION_NOTE = 'Multiple reports can lead to your account being suspended.';
+const ALERT_REPEAT_NOTE = 'Repeated violations can lead to your account being suspended.';
+// A "strike" is an enforcement notice sent to an account: takedown, story removal, profile picture or
+// name removal, suspension, and an ad being paused or taken down. Reports alone are not strikes, and
+// neither are lifts/resumes/refunds. Derived from the alerts table so it also covers past alerts.
+const STRIKE_SQL = "kind IN ('takedown','story','profile_picture','profile_name','suspended') OR (kind = 'ad' AND (message LIKE '%was paused%' OR message LIKE '%was taken down%'))";
+const STRIKE_KINDS = new Set(['takedown', 'story', 'profile_picture', 'profile_name', 'suspended']);
+function isStrikeAlert(kind, message) {
+  if (STRIKE_KINDS.has(kind)) return true;
+  return kind === 'ad' && /was paused|was taken down/.test(String(message || ''));
+}
+let alertsReady = null;
+function ensureAlerts(env) {
+  if (!alertsReady) {
+    alertsReady = env.ADS_DB.batch([
+      env.ADS_DB.prepare('CREATE TABLE IF NOT EXISTS alerts (id TEXT PRIMARY KEY, sub TEXT NOT NULL, kind TEXT NOT NULL, message TEXT NOT NULL, ref TEXT, created_at INTEGER NOT NULL, dismissed_at INTEGER)'),
+      env.ADS_DB.prepare('CREATE INDEX IF NOT EXISTS alerts_sub_time ON alerts (sub, dismissed_at, created_at, id)')
+    ]).catch((e) => { alertsReady = null; throw e; });
+  }
+  return alertsReady;
+}
+// Best-effort: an alert failing to save must never fail the action that caused it.
+async function createAlert(env, sub, kind, message, opts) {
+  if (!sub) return;
+  try {
+    await ensureAlerts(env);
+    const now = Date.now();
+    const ref = (opts && opts.ref) || null;
+    if (ref && opts.dedupeMs) {
+      const dup = await env.ADS_DB.prepare('SELECT 1 AS x FROM alerts WHERE sub = ? AND kind = ? AND ref = ? AND created_at > ? LIMIT 1')
+        .bind(sub, kind, ref, now - opts.dedupeMs).first();
+      if (dup) return;
+    }
+    await env.ADS_DB.prepare('INSERT INTO alerts (id, sub, kind, message, ref, created_at) VALUES (?, ?, ?, ?, ?, ?)')
+      .bind(crypto.randomUUID(), sub, kind, String(message).slice(0, ALERT_MAX_LEN), ref, now).run();
+  } catch (e) { console.log('alert failed: ' + (e && e.message)); }
+}
+function alertNoteName(meta, slug) {
+  const t = meta && typeof meta.title === 'string' ? meta.title.trim().slice(0, 40) : '';
+  return t ? '\u201c' + t + '\u201d' : '/' + slug;
+}
+// Every alert states what happened and why: "<Action>. Reason: <reason>." For reports the reason is the
+// reporter's category (their free-text details are never passed on); for admin actions it's what the
+// admin typed, which the admin endpoints require.
+const ALERT_REPORT_REASONS = { spam: 'Spam', copyright: 'Copyright', abuse: 'Abuse', csam: 'Child safety concerns', other: 'Other' };
+function alertReason(text) { return 'Reason: ' + String(text).trim().replace(/[.\s]+$/, '') + '.'; }
+function adminReasonOf(body) { return typeof (body && body.reason) === 'string' ? body.reason.trim().slice(0, 200) : ''; }
+function reportAlertText(meta, slug, reason) {
+  return 'Your note ' + alertNoteName(meta, slug) + ' was reported. ' + alertReason(ALERT_REPORT_REASONS[reason] || 'Other') + ' ' + ALERT_SUSPENSION_NOTE;
+}
+async function pruneAlerts(env) {
+  try { await ensureAlerts(env); await env.ADS_DB.prepare('DELETE FROM alerts WHERE created_at < ?').bind(Date.now() - ALERT_RETENTION_MS).run(); }
+  catch (e) { console.log('alert prune failed: ' + (e && e.message)); }
+}
+
+// GET /alerts?cursor=: the signed-in account's own alerts, newest first, keyset-paginated; total on the first page.
+async function handleAlertsList(env, request, url) {
+  const sub = await requireSession(env, request);
+  if (!sub) return textError(401, 'sign-in required');
+  await ensureAlerts(env);
+  const cur = parseAdminCursor(url.searchParams.get('cursor'));
+  const stmts = [
+    env.ADS_DB.prepare('SELECT id, kind, message, created_at FROM alerts WHERE sub = ? AND dismissed_at IS NULL' + (cur ? ' AND (created_at, id) < (?, ?)' : '') + ' ORDER BY created_at DESC, id DESC LIMIT ?')
+      .bind(sub, ...(cur ? [cur.key, cur.id] : []), ALERTS_PAGE + 1)
+  ];
+  if (!cur) stmts.unshift(env.ADS_DB.prepare('SELECT COUNT(*) AS t FROM alerts WHERE sub = ? AND dismissed_at IS NULL').bind(sub));
+  const res = await env.ADS_DB.batch(stmts);
+  const rows = res[res.length - 1].results || [];
+  const more = rows.length > ALERTS_PAGE;
+  if (more) rows.pop();
+  const last = rows[rows.length - 1];
+  return json({
+    alerts: rows.map(r => ({ id: r.id, kind: r.kind, message: r.message, createdAt: r.created_at })),
+    total: cur ? null : res[0].results[0].t,
+    nextCursor: more && last ? last.created_at + '|' + last.id : null
+  });
+}
+// GET /alerts/unread: how many of the account's alerts arrived since it last opened Alerts (drives the pill's badge), plus the
+// total still on the list (the app only shows the Alerts pill while there is at least one).
+// POST /alerts/seen: marks alerts up to {upTo} (or now) as seen. The marker is one KV key per account.
+const ALERTS_SEEN_PREFIX = 'alertsseen:';
+async function handleAlertsUnread(env, request) {
+  const sub = await requireSession(env, request);
+  if (!sub) return textError(401, 'sign-in required');
+  await ensureAlerts(env);
+  const seen = parseInt((await env.ACCOUNTS.get(ALERTS_SEEN_PREFIX + sub)) || '0', 10) || 0;
+  const row = await env.ADS_DB.prepare('SELECT COUNT(*) AS t, COALESCE(SUM(CASE WHEN created_at > ? THEN 1 ELSE 0 END), 0) AS n FROM alerts WHERE sub = ? AND dismissed_at IS NULL').bind(seen, sub).first();
+  return json({ count: row ? row.n : 0, total: row ? row.t : 0 });
+}
+async function handleAlertsSeen(env, request) {
+  const sub = await requireSession(env, request);
+  if (!sub) return textError(401, 'sign-in required');
+  // Body {upTo}: the newest alert (created_at, ms) the app actually showed. The marker only moves forward and never
+  // past now, so an alert that arrived after the list was fetched stays unread. No body (older app): mark up to now.
+  let upTo = 0;
+  try { const b = await request.json(); upTo = Number(b && b.upTo) || 0; } catch (e) { /* no body */ }
+  const now = Date.now();
+  const prev = parseInt((await env.ACCOUNTS.get(ALERTS_SEEN_PREFIX + sub)) || '0', 10) || 0;
+  const next = upTo > 0 ? Math.max(prev, Math.min(upTo, now)) : now;
+  await env.ACCOUNTS.put(ALERTS_SEEN_PREFIX + sub, String(next));
+  return json({ ok: true });
+}
+// DELETE /alerts/:id: removes it from the account's list (the row is kept for the admin record). Idempotent.
+async function handleAlertDelete(env, request, id) {
+  const sub = await requireSession(env, request);
+  if (!sub) return textError(401, 'sign-in required');
+  if (!/^[0-9a-f-]{36}$/.test(id)) return textError(400, 'invalid alert id');
+  await ensureAlerts(env);
+  await env.ADS_DB.prepare('UPDATE alerts SET dismissed_at = ? WHERE id = ? AND sub = ? AND dismissed_at IS NULL').bind(Date.now(), id, sub).run();
+  return json({ ok: true });
 }
 
 /* ---------------- Admin takedown UI ---------------- */
@@ -3661,12 +3826,14 @@ async function handleAdminOwner(env, request, url) {
   for (const n of likesBySlug.values()) likesTotal += n;
   const prefix = 'owner:' + sub + ':';
   const pages = [];
+  const allSlugs = []; // live or not, for the report totals below
   let cursor;
   do {
     const page = await env.SLUGS.list({ prefix, cursor });
     for (const k of page.keys) {
       if (pages.length >= 100) break;
       const s = k.name.slice(prefix.length);
+      if (allSlugs.length < 400) allSlugs.push(s);
       const m = await getMeta(env, s);
       if (!m || m.deletedAt) continue;
       pages.push({ slug: s, title: m.title || null, updatedAt: m.updatedAt || null, showInStories: !!m.showInStories, reports: counts.get(s) || 0, likes: likesBySlug.get(s) || 0 });
@@ -3674,8 +3841,27 @@ async function handleAdminOwner(env, request, url) {
     cursor = (page.list_complete || pages.length >= 100) ? undefined : page.cursor;
   } while (cursor);
   const authorId = (await authorIdsFor(env, [sub]))[sub] || null;
+  const reportStats = await ownerReportStats(env, sub, allSlugs);
+  // Every alert ever sent to this account, including ones the person has since deleted from their list.
+  let alertRows = [], strikeRows = [], alertTotal = 0;
+  try {
+    await ensureAlerts(env);
+    const ar = await env.ADS_DB.batch([
+      env.ADS_DB.prepare('SELECT kind, message, created_at, dismissed_at FROM alerts WHERE sub = ? AND created_at >= ? ORDER BY created_at DESC, id DESC LIMIT 300').bind(sub, TREND_EPOCH),
+      env.ADS_DB.prepare('SELECT kind, message, created_at, dismissed_at FROM alerts WHERE sub = ? AND created_at >= ? AND (' + STRIKE_SQL + ') ORDER BY created_at ASC, id ASC LIMIT 300').bind(sub, TREND_EPOCH),
+      env.ADS_DB.prepare('SELECT COUNT(*) AS n FROM alerts WHERE sub = ? AND created_at >= ?').bind(sub, TREND_EPOCH)
+    ]);
+    alertRows = ar[0].results || [];
+    strikeRows = ar[1].results || [];
+    alertTotal = ((ar[2].results || [])[0] || {}).n || 0;
+  } catch (e) { console.log('admin alerts failed: ' + (e && e.message)); }
   return json({
     authorId,
+    alerts: alertRows.map(r => ({ kind: r.kind, message: r.message, at: r.created_at, dismissedAt: r.dismissed_at || null, strike: isStrikeAlert(r.kind, r.message) })),
+    alertTotal,
+    strikes: strikeRows.map(r => ({ kind: r.kind, message: r.message, at: r.created_at, dismissedAt: r.dismissed_at || null })),
+    strikeCount: strikeRows.length,
+    reportStats,
     email: user ? user.email : null, createdAt: user ? user.createdAt || null : null,
     displayName: user ? user.profileName || null : null, hasProfileImage: !!(user && user.hasProfileImage),
     ledger: ((ledgerRows && ledgerRows.results) || []).map(r => ({ delta: r.delta, reason: r.reason, slug: r.slug || null, at: r.created_at })),
@@ -3702,6 +3888,9 @@ async function handleAdminOwnerAction(env, request) {
   const user = await getUser(env, sub);
   if (!user) return textError(404, 'account not found');
   const action = body.action;
+  const wasAdminDeleted = !!user.adminDeleted;
+  const reason = adminReasonOf(body);
+  if (['suspend', 'clear-name', 'clear-picture'].includes(action) && !reason) return textError(400, 'reason required');
   if (action === 'suspend') user.suspended = true;
   else if (action === 'unsuspend') delete user.suspended;
   else if (action === 'clear-name') user.profileName = null;
@@ -3714,6 +3903,14 @@ async function handleAdminOwnerAction(env, request) {
   await putUser(env, sub, user);
   if (action === 'suspend' || action === 'delete') await revokeAllSessions(env, sub);
   await audit(env, 'owner_' + action, slug);
+  const ownerAlert = {
+    'clear-picture': ['profile_picture', 'Your profile picture was removed. ' + alertReason(reason) + ' You can upload a new one. ' + ALERT_REPEAT_NOTE],
+    'clear-name': ['profile_name', 'Your display name was removed. ' + alertReason(reason) + ' You can set a new one. ' + ALERT_REPEAT_NOTE],
+    'suspend': ['suspended', 'Your account was suspended. ' + alertReason(reason)],
+    'unsuspend': ['unsuspended', 'Your account suspension was lifted. ' + ALERT_REPEAT_NOTE]
+  }[action];
+  if (ownerAlert) await createAlert(env, sub, ownerAlert[0], ownerAlert[1]);
+  else if (action === 'cancel-delete' && !user.adminDeleted && wasAdminDeleted) await createAlert(env, sub, 'unsuspended', 'Your account deletion was cancelled and your account restored. ' + ALERT_REPEAT_NOTE);
   return json({ ok: true, suspended: !!user.suspended, pendingDeletionAt: user.pendingDeletionAt || null });
 }
 
@@ -3726,6 +3923,8 @@ async function handleAdminStory(env, request) {
   if (!SLUG_RE.test(slug)) return textError(400, 'invalid slug');
   const meta = await getMeta(env, slug);
   if (!meta || meta.deletedAt) return textError(404, 'not live');
+  const reason = adminReasonOf(body);
+  if (body.action === 'remove' && !reason) return textError(400, 'reason required');
   if (body.action === 'remove') {
     if (meta.showInStories) {
       await Promise.all([
@@ -3744,6 +3943,9 @@ async function handleAdminStory(env, request) {
   } else return textError(400, 'invalid action');
   await putMeta(env, slug, meta);
   await audit(env, 'story_' + body.action, slug);
+  await createAlert(env, meta.ownerSub, 'story', body.action === 'remove'
+    ? 'Your note ' + alertNoteName(meta, slug) + ' was removed from stories. ' + alertReason(reason) + ' Your note is still published. ' + ALERT_REPEAT_NOTE
+    : 'Your note ' + alertNoteName(meta, slug) + ' can be shown in stories again.');
   return json({ ok: true });
 }
 
@@ -3813,6 +4015,8 @@ async function handleAdminAd(env, request) {
   if (!SLUG_RE.test(slug)) return textError(400, 'invalid slug');
   const ad = await env.ADS_DB.prepare('SELECT owner_sub, views_total, views_used, status FROM ads WHERE slug = ?').bind(slug).first();
   if (!ad) return textError(404, 'ad not found');
+  const reason = adminReasonOf(body);
+  if ((body.action === 'pause' || body.action === 'takedown') && !reason) return textError(400, 'reason required');
   const now = Date.now();
   const set = (from, to) => env.ADS_DB.prepare('UPDATE ads SET status = ?, updated_at = ? WHERE slug = ? AND status = ?').bind(to, now, slug, from).run();
   let refunded = 0;
@@ -3836,6 +4040,14 @@ async function handleAdminAd(env, request) {
     return textError(500, 'ad action failed');
   }
   await audit(env, 'ad_' + body.action, slug, refunded ? 'refunded ' + refunded : null);
+  const adRefund = refunded ? ' ' + refunded + ' unused views were refunded to your balance.' : '';
+  const adAlert = {
+    pause: 'Your ad on /' + slug + ' was paused. ' + alertReason(reason) + ' ' + ALERT_REPEAT_NOTE,
+    resume: 'Your ad on /' + slug + ' is running again.',
+    takedown: 'Your ad on /' + slug + ' was taken down. ' + alertReason(reason) + adRefund + ' ' + ALERT_REPEAT_NOTE,
+    refund: adRefund.trim() ? refunded + ' unused views from your ad on /' + slug + ' were refunded to your balance.' : ''
+  }[body.action];
+  if (adAlert) await createAlert(env, ad.owner_sub, 'ad', adAlert);
   return json({ ok: true, refunded });
 }
 
@@ -3934,6 +4146,142 @@ async function handleAdminStats(env, request) {
   };
   statsCache = { at: now, body };
   return json(body);
+}
+
+/* ---------------- Admin trends: growth and decline over time ---------------- */
+// GET /admin/trends?bucket=day|week|month|year&from=<ms>&to=<ms>&off=<ms>: per-bucket counts for every
+// headline metric between from and to (the page asks for two windows at once so it can show the change
+// against the previous one), the count before `from` (so running totals can start at the right number),
+// reports split by reason, and all-time report totals. `off` is the admin's UTC offset in ms so days,
+// weeks (Monday start), months and years line up with their own calendar. Everything except activity
+// comes straight from created_at columns, so history is complete; totals only count rows that still exist.
+const TREND_MAX_SPAN_MS = 70 * 366 * 86400000;
+// Beta: trends ignore everything before this moment (30 Sep 2026 UTC). Move it earlier to bring older data back.
+const TREND_EPOCH = Date.UTC(2026, 8, 30);
+const TREND_METRICS = [
+  ['signups', 'authors', 'created_at', ''],
+  ['notes', 'published_notes', 'created_at', ''],
+  ['stories', 'stories', 'created_at', ''],
+  ['likes', 'likes', 'created_at', ''],
+  ['subs', 'subscriptions', 'created_at', ''],
+  ['ads', 'ads', 'created_at', ''],
+  ['reports', 'report_index', 'reported_at', ''],
+  ['strikes', 'alerts', 'created_at', STRIKE_SQL],
+  ['alerts', 'alerts', 'created_at', '']
+];
+let trendReady = null;
+function ensureTrendTables(env) {
+  if (!trendReady) {
+    trendReady = (async () => {
+      await Promise.all([ensureAlerts(env), ensureReportIndex(env), ensureActivity(env)].map((p) => p.catch(() => null)));
+      const ix = [
+        'CREATE INDEX IF NOT EXISTS trend_likes_created ON likes (created_at)',
+        'CREATE INDEX IF NOT EXISTS trend_subs_created ON subscriptions (created_at)',
+        'CREATE INDEX IF NOT EXISTS trend_stories_created ON stories (created_at)',
+        'CREATE INDEX IF NOT EXISTS trend_alerts_created ON alerts (created_at)',
+        'CREATE INDEX IF NOT EXISTS trend_reports_at ON report_index (reported_at)'
+      ];
+      await Promise.all(ix.map((sql) => env.ADS_DB.prepare(sql).run().catch(() => null)));
+    })().catch((e) => { trendReady = null; throw e; });
+  }
+  return trendReady;
+}
+// SQL for the bucket a timestamp column falls in. The first bound parameter is the UTC offset.
+// Weeks are numbered from the Monday on/before 1970-01-01 so the page can derive the same key.
+function trendKeySql(bucket, col) {
+  const t = '(' + col + ' + CAST(? AS INTEGER))';
+  if (bucket === 'day') return "strftime('%Y-%m-%d', " + t + " / 1000, 'unixepoch')";
+  if (bucket === 'month') return "strftime('%Y-%m', " + t + " / 1000, 'unixepoch')";
+  if (bucket === 'year') return "strftime('%Y', " + t + " / 1000, 'unixepoch')";
+  return 'CAST((' + t + ' / 86400000 + 3) / 7 AS INTEGER)';
+}
+async function handleAdminTrends(env, request, url) {
+  const g = await adminGate(env, request); if (g) return g;
+  const sp = url.searchParams;
+  const bucket = sp.get('bucket') || 'day';
+  if (!['day', 'week', 'month', 'year'].includes(bucket)) return textError(400, 'invalid bucket');
+  const from = parseInt(sp.get('from') || '', 10), to = parseInt(sp.get('to') || '', 10), off = parseInt(sp.get('off') || '0', 10);
+  if (!Number.isFinite(from) || !Number.isFinite(to) || from < 0 || to <= from || to - from > TREND_MAX_SPAN_MS) return textError(400, 'invalid range');
+  if (!Number.isFinite(off) || Math.abs(off) > 15 * 3600000) return textError(400, 'invalid offset');
+  try {
+    await ensureAdminIndexes(env);
+    await ensureTrendTables(env);
+    const indexed = await reportIndexOn(env);
+    const q = (sql, ...b) => env.ADS_DB.prepare(sql).bind(...b);
+    const lo = Math.max(from, TREND_EPOCH);
+    const names = [], stmts = [];
+    const add = (name, st) => { names.push(name); stmts.push(st); };
+    for (const [name, table, col, where] of TREND_METRICS) {
+      if (name === 'reports' && !indexed) continue;
+      const w = where ? ' AND (' + where + ')' : '';
+      add(name, q('SELECT ' + trendKeySql(bucket, col) + ' AS k, COUNT(*) AS n FROM ' + table + ' WHERE ' + col + ' >= ? AND ' + col + ' < ?' + w + ' GROUP BY k', off, lo, to));
+      add(name + ':before', q('SELECT COUNT(*) AS n FROM ' + table + ' WHERE ' + col + ' >= ? AND ' + col + ' < ?' + w, TREND_EPOCH, lo));
+    }
+    const dFrom = Math.floor(lo / 86400000), dTo = Math.floor(to / 86400000) + 1;
+    for (const [nm, like] of [['active_u', 'u:%'], ['active_g', 'g:%']]) {
+      add(nm, q('SELECT ' + trendKeySql(bucket, '(day * 86400000)') + ' AS k, COUNT(DISTINCT id) AS n FROM activity_daily WHERE day >= ? AND day < ? AND id LIKE ? GROUP BY k', off, dFrom, dTo, like));
+    }
+    add('active_since', q('SELECT MIN(day) AS d FROM activity_daily'));
+    if (indexed) {
+      add('rbr', q('SELECT ' + trendKeySql(bucket, 'reported_at') + ' AS k, reason AS r, COUNT(*) AS n FROM report_index WHERE reported_at >= ? AND reported_at < ? GROUP BY k, r', off, lo, to));
+      add('rtot', q('SELECT reason AS r, COUNT(*) AS t, COALESCE(SUM(dismissed_at IS NULL), 0) AS o FROM report_index WHERE reported_at >= ? GROUP BY r', TREND_EPOCH));
+    }
+    const res = await env.ADS_DB.batch(stmts);
+    const R = {};
+    names.forEach((nm, i) => { R[nm] = (res[i] && res[i].results) || []; });
+    const series = {}, before = {};
+    for (const m of TREND_METRICS) {
+      if (!R[m[0]]) continue;
+      series[m[0]] = R[m[0]].map((r) => [r.k, r.n]);
+      before[m[0]] = ((R[m[0] + ':before'] || [])[0] || {}).n || 0;
+    }
+    series.active_u = R.active_u.map((r) => [r.k, r.n]);
+    series.active_g = R.active_g.map((r) => [r.k, r.n]);
+    const since = (R.active_since[0] || {}).d;
+    return json({
+      bucket, from, to, off, series, before, epoch: TREND_EPOCH,
+      activeSince: since == null ? null : since * 86400000,
+      reportsIndexed: indexed,
+      reportsByReason: indexed ? R.rbr.map((r) => [r.k, r.r, r.n]) : [],
+      reportTotals: indexed ? R.rtot.map((r) => ({ reason: r.r, total: r.t, open: r.o })) : null
+    });
+  } catch (e) {
+    console.log('admin trends failed: ' + (e && e.message));
+    return textError(500, 'trends failed');
+  }
+}
+// Reports filed against an account: its live pages, every page it was ever alerted about, and its
+// published_notes rows. Returns null until the report index has been built.
+async function ownerReportStats(env, sub, slugs0) {
+  try {
+    if (!(await reportIndexOn(env))) return null;
+    await ensureReportIndex(env);
+    await ensureAlerts(env);
+    const set = new Set(slugs0);
+    const [a, n] = await env.ADS_DB.batch([
+      env.ADS_DB.prepare("SELECT DISTINCT ref FROM alerts WHERE sub = ? AND kind = 'report' AND ref IS NOT NULL AND created_at >= ? LIMIT 500").bind(sub, TREND_EPOCH),
+      env.ADS_DB.prepare('SELECT slug FROM published_notes WHERE author_sub = ? LIMIT 500').bind(sub)
+    ]);
+    ((a && a.results) || []).forEach((r) => { const s = String(r.ref).split(':')[0]; if (SLUG_RE.test(s)) set.add(s); });
+    ((n && n.results) || []).forEach((r) => { if (SLUG_RE.test(r.slug)) set.add(r.slug); });
+    const slugs = [...set].slice(0, 400);
+    const out = { total: 0, open: 0, pages: slugs.length, byReason: {} };
+    if (!slugs.length) return out;
+    const stmts = [];
+    for (let i = 0; i < slugs.length; i += 80) {
+      const chunk = slugs.slice(i, i + 80);
+      stmts.push(env.ADS_DB.prepare('SELECT reason AS r, COUNT(*) AS t, COALESCE(SUM(dismissed_at IS NULL), 0) AS o FROM report_index WHERE reported_at >= ? AND slug IN (' + chunk.map(() => '?').join(',') + ') GROUP BY reason').bind(TREND_EPOCH, ...chunk));
+    }
+    const res = await env.ADS_DB.batch(stmts);
+    for (const part of res) {
+      for (const r of (part.results || [])) {
+        const k = ALERT_REPORT_REASONS[r.r] ? r.r : 'other';
+        const cur = out.byReason[k] || (out.byReason[k] = { total: 0, open: 0 });
+        cur.total += r.t; cur.open += r.o; out.total += r.t; out.open += r.o;
+      }
+    }
+    return out;
+  } catch (e) { console.log('owner report stats failed: ' + (e && e.message)); return null; }
 }
 
 // GET /admin/users?cursor=&q=&sort=new|old|active&f=online|active24: accounts, keyset-paginated (no
@@ -4091,6 +4439,7 @@ const ADMIN_PAGE_HTML = `<!doctype html><html lang="en"><head><meta charset="utf
   --halo:0 0 0 0 transparent;
   --lift:inset 0 1px 0 rgba(255,255,255,.06),0 14px 30px -16px rgba(2,3,18,.95);
   --r:20px;
+  --dock:calc(78px + env(safe-area-inset-bottom,0px));
   --font:"Bricolage",system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif
 }
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
@@ -4209,7 +4558,7 @@ main{position:relative;z-index:1;max-width:720px;margin:0 auto;padding:2px 16px 
 .key[aria-pressed=true]{--kb:var(--sev-bg);--kd:var(--sev);--kc:var(--text)}
 
 /* cards */
-.card{--edge:var(--line);--rows:0fr;--vis:hidden;--vd:.26s;--rot:0deg;position:relative;margin:0 0 12px;border-radius:var(--r);background:linear-gradient(180deg,rgba(255,255,255,.05),rgba(255,255,255,.015)),var(--s1);border:1px solid var(--edge);box-shadow:var(--lift),var(--halo);overflow:hidden}
+.card{--edge:var(--line);--rows:0fr;--vis:hidden;--vd:.26s;--rot:0deg;position:relative;margin:0 0 12px;border-radius:var(--r);background:linear-gradient(180deg,rgba(255,255,255,.05),rgba(255,255,255,.015)),var(--s1);border:1px solid var(--edge);box-shadow:var(--lift),var(--halo);overflow:hidden;overflow:clip}
 .card.open{--rows:1fr;--vis:visible;--vd:0s;--rot:180deg}
 .card.urgent{--edge:rgba(255,77,109,.55);--halo:0 0 0 1px rgba(255,77,109,.16),0 0 42px -10px rgba(255,77,109,.5)}
 .card.static{padding:18px}
@@ -4225,9 +4574,9 @@ main{position:relative;z-index:1;max-width:720px;margin:0 auto;padding:2px 16px 
 .trail{display:flex;flex-direction:column;align-items:flex-end;gap:12px;font-size:13px;font-weight:600;color:var(--faint);padding-top:2px}
 .chev{transform:rotate(var(--rot));transition:transform .26s;color:var(--muted)}
 .body{display:grid;grid-template-rows:var(--rows);transition:grid-template-rows .26s ease}
-.inner{min-height:0;overflow:hidden;visibility:var(--vis);transition:visibility 0s var(--vd)}
+.inner{min-height:0;overflow:hidden;overflow:clip;visibility:var(--vis);transition:visibility 0s var(--vd)}
 .pad{padding:0 16px 16px}
-.foot{display:flex;flex-wrap:wrap;gap:8px;padding:12px 16px;background:var(--well);border-top:1px solid var(--line)}
+.foot{position:sticky;bottom:calc(var(--dock) + 8px);z-index:2;display:flex;flex-wrap:wrap;gap:8px;padding:12px 16px;background:linear-gradient(var(--well),var(--well)),var(--s1);border-top:1px solid var(--line);box-shadow:0 -14px 16px -14px rgba(2,3,18,.85)}
 .foot:empty{display:none}
 .foot .btn{flex:1 1 auto}
 .static>.foot{margin:18px -18px -18px}
@@ -4272,6 +4621,51 @@ main{position:relative;z-index:1;max-width:720px;margin:0 auto;padding:2px 16px 
 .stat span{display:block;margin-top:3px;font-size:12.5px;color:var(--muted);font-weight:550}
 .sec-t{margin:18px 2px 8px;font-size:13px;font-weight:650;letter-spacing:.02em;text-transform:uppercase;color:var(--muted)}
 .sec-t:empty{display:none}
+.tr-card{padding:14px 14px 16px}
+.tr-card .filters{margin:0 -14px 8px;padding:2px 14px 4px}
+.tr-nav{display:flex;align-items:center;gap:8px;margin:4px 0 8px}
+.tr-btn{width:40px;height:40px;flex:none;border:0;border-radius:12px;background:var(--well);color:var(--text);display:grid;place-items:center}
+.tr-btn:active{background:var(--s2)}
+.tr-btn:disabled{opacity:.3}
+.tr-btn.flip .ico{transform:scaleX(-1)}
+.tr-rg{flex:1;min-width:0;text-align:center;font-size:15px;font-weight:650;line-height:1.25}
+.tr-rg small{display:block;margin-top:2px;font-size:12px;font-weight:500;color:var(--muted)}
+.tr-nav2{display:flex;align-items:center;gap:8px;margin:0 0 10px}
+.tr-date{flex:1;min-width:0;height:40px;padding:0 12px;color-scheme:dark}
+.tr-nav2 .btn{height:40px;flex:none}
+.tr-head{display:flex;align-items:baseline;flex-wrap:wrap;gap:4px 10px;margin:8px 2px 0}
+.tr-head b{font-size:32px;line-height:1.1;font-weight:750;letter-spacing:-.02em;font-variant-numeric:tabular-nums}
+.tr-dl{font-size:13.5px;font-weight:650;white-space:nowrap}
+.tr-dl.up{color:var(--ok)}.tr-dl.dn{color:var(--danger)}.tr-dl.fl{color:var(--muted)}
+.tr-sub{margin:2px 2px 6px;font-size:13px;color:var(--muted)}
+.tr-chart{position:relative;margin:0 -4px;min-height:60px;transition:opacity .15s}
+.tr-chart.busy{opacity:.45}
+.tr-chart svg{display:block;width:100%;height:auto;touch-action:pan-y;user-select:none;-webkit-user-select:none}
+.tr-g{stroke:var(--line);stroke-width:1}
+.tr-ax{fill:var(--faint);font-size:10px;font-family:var(--font)}
+.tr-cur{stroke:var(--line2);stroke-width:1;stroke-dasharray:3 3}
+.tr-tip{display:none;position:absolute;top:0;z-index:3;min-width:120px;max-width:70%;padding:8px 10px;border-radius:12px;background:var(--s3);border:1px solid var(--line2);box-shadow:0 10px 24px -10px rgba(2,3,18,.9);font-size:12.5px;line-height:1.4;pointer-events:none}
+.tr-tip b{font-weight:700}
+.tr-tip div{display:flex;align-items:center;gap:6px;white-space:nowrap}
+.tr-tip i{width:8px;height:8px;border-radius:50%;flex:none}
+.tr-msg{padding:22px 8px;text-align:center;color:var(--muted);font-size:14px}
+.tr-leg{display:flex;flex-wrap:wrap;gap:6px 12px;margin:6px 2px 0}
+.tr-leg:empty{display:none}
+.tr-leg span{display:inline-flex;align-items:center;gap:6px;font-size:12.5px;color:var(--muted)}
+.tr-leg i{width:8px;height:8px;border-radius:50%}
+.tr-t{font-size:15.5px;font-weight:650}
+.tr-sp{display:block;width:72px;height:24px}
+.tr-sp svg{display:block;width:72px;height:24px}
+.tr-v{font-size:16px;font-weight:750;font-variant-numeric:tabular-nums;min-width:38px;text-align:right}
+.tr-rr{padding:12px 14px;margin:0 0 8px;border-radius:14px;background:var(--well)}
+.tr-rt{display:flex;align-items:center;justify-content:space-between;gap:10px}
+.tr-rn{display:inline-flex;align-items:center;gap:8px;font-size:15px;font-weight:650}
+.tr-rn i{width:9px;height:9px;border-radius:50%;background:var(--sev)}
+.tr-rt b{font-size:18px;font-weight:750;font-variant-numeric:tabular-nums}
+.tr-rr small{display:block;margin-top:3px;font-size:13px;color:var(--muted)}
+.tr-bar{height:7px;margin-top:8px;border-radius:4px;background:var(--s2);overflow:hidden}
+.tr-bar i{display:block;height:100%;border-radius:4px;background:var(--sev)}
+.amsg{font-size:14.5px;line-height:1.4;white-space:pre-wrap;overflow-wrap:anywhere}
 .pgrow{--slug-fs:15.5px;appearance:none;-webkit-appearance:none;display:grid;grid-template-columns:minmax(0,1fr) auto;gap:12px;align-items:center;width:100%;padding:12px 14px;margin:0 0 8px;border:0;border-radius:14px;background:var(--well);text-align:left;color:inherit}
 .pgrow:active{background:var(--s2)}
 .pgrow small{display:block;margin-top:3px;font-size:13px;color:var(--muted);overflow-wrap:anywhere}
@@ -4348,14 +4742,15 @@ body[data-auth=out] #msg{bottom:calc(24px + env(safe-area-inset-bottom,0px))}
 /* sheets */
 .sheet-back{--o:0;--y:36px;position:fixed;inset:0;z-index:60;display:flex;align-items:flex-end;justify-content:center;padding:0 8px calc(8px + env(safe-area-inset-bottom,0px));background:rgba(4,5,20,.64);-webkit-backdrop-filter:blur(6px);backdrop-filter:blur(6px);opacity:var(--o);transition:opacity .22s}
 .sheet-back.open{--o:1;--y:0px}
-.sheet{width:100%;max-width:520px;max-height:88vh;overflow-y:auto;padding:10px 22px 22px;border-radius:30px;border:1px solid var(--line2);background:linear-gradient(180deg,rgba(255,255,255,.06),rgba(255,255,255,.02)),var(--s1);box-shadow:0 30px 70px -10px rgba(2,3,18,.9);transform:translateY(var(--y));transition:transform .3s cubic-bezier(.2,.9,.25,1)}
-.grab{width:38px;height:5px;border-radius:3px;background:var(--s3);margin:0 auto 18px}
+.sheet{display:flex;flex-direction:column;width:100%;max-width:520px;max-height:88vh;max-height:88dvh;padding:10px 22px 22px;border-radius:30px;border:1px solid var(--line2);background:linear-gradient(180deg,rgba(255,255,255,.06),rgba(255,255,255,.02)),var(--s1);box-shadow:0 30px 70px -10px rgba(2,3,18,.9);transform:translateY(var(--y));transition:transform .3s cubic-bezier(.2,.9,.25,1)}
+.grab{flex:none;width:38px;height:5px;border-radius:3px;background:var(--s3);margin:0 auto 18px}
 .sheet .tile{margin-bottom:14px}
 .sheet h2{margin:0;font-size:24px;line-height:1.15;font-weight:750;letter-spacing:-.025em;word-break:break-word}
 .sheet-text{margin:8px 0 20px;color:var(--muted);white-space:pre-wrap;font-size:15px}
 .sheet-field{display:block;margin:0 0 14px}
 .sheet-field span{display:block;margin:0 2px 6px;font-size:13px;font-weight:600;color:var(--muted)}
-.sheet-actions{display:grid;gap:10px}
+.sheet-body{flex:1 1 auto;min-height:0;overflow-y:auto;overscroll-behavior:contain}
+.sheet-actions{display:grid;gap:10px;flex:none;padding-top:6px}
 
 @media (prefers-reduced-motion:reduce){*,*::before,*::after{transition:none;animation:none}}
 </style></head><body data-auth="out">
@@ -4385,6 +4780,37 @@ body[data-auth=out] #msg{bottom:calc(24px + env(safe-area-inset-bottom,0px))}
     <div class="hero"><div class="brand"><span class="ico" data-i="bluebook"></span>Bluebook Admin</div><h1 id="ttl">Reports</h1><p id="sub"></p></div>
 
     <div id="p-overview" class="pnl">
+      <div class="sec-t">Trends</div>
+      <div class="card static tr-card" id="trcard">
+        <div class="filters" id="trbk">
+          <button type="button" class="key sev-ad" data-b="day" aria-pressed="true"><span>Day</span></button>
+          <button type="button" class="key sev-ad" data-b="week" aria-pressed="false"><span>Week</span></button>
+          <button type="button" class="key sev-ad" data-b="month" aria-pressed="false"><span>Month</span></button>
+          <button type="button" class="key sev-ad" data-b="year" aria-pressed="false"><span>Year</span></button>
+        </div>
+        <div class="tr-nav">
+          <button type="button" class="tr-btn" id="trprev" aria-label="Earlier"><span class="ico" data-i="back"></span></button>
+          <div class="tr-rg"><span id="trrange">-</span><small id="trcmp"></small></div>
+          <button type="button" class="tr-btn flip" id="trnext" aria-label="Later"><span class="ico" data-i="back"></span></button>
+        </div>
+        <div class="tr-nav2">
+          <input class="field tr-date" id="trjump" type="date" aria-label="Jump to date">
+          <button type="button" class="btn" id="trnow" hidden>Latest</button>
+        </div>
+        <div class="filters" id="trmet"></div>
+        <div class="filters" id="trmode">
+          <button type="button" class="key sev-ad" data-m="flow" aria-pressed="true"><span>Per period</span></button>
+          <button type="button" class="key sev-ad" data-m="total" aria-pressed="false"><span>Running total</span></button>
+        </div>
+        <div class="tr-head"><b id="trval">-</b><span class="tr-dl fl" id="trdl"></span></div>
+        <div class="tr-sub" id="trsub"></div>
+        <div class="tr-chart" id="trchart"></div>
+        <div class="tr-leg" id="trleg"></div>
+      </div>
+      <div class="sec-t">All metrics, this range vs previous</div>
+      <div id="trrows"></div>
+      <div class="sec-t">Reports by reason</div>
+      <div id="rpbox"></div>
       <div id="ovstats"></div>
       <div class="fine" id="ovnote"></div>
       <div class="sec-t">Directory</div>
@@ -4544,10 +4970,21 @@ function setFrame(f,t){var g=f._g=(f._g||0)+1;f._t=t;buildDoc(t).then(function(d
 function refreshFrames(){document.querySelectorAll('iframe').forEach(function(f){if(f._t!=null)setFrame(f,f._t)})}
 
 /* ---------- Core state and helpers ---------- */
-var tok=sessionStorage.getItem('adm')||'',next=null,all=[],cur='reports',adCur='',adTotal=0,auNext=null,auAll=[],auFilter='',lkSlug='',stack=[],openSet={},mt=null,recents=[],curSheet=null,repSub='',fullBusy=false,rIdx=false,rAgg=null,rGen=0,reindexing=false,qT=null;
+var tok=sessionStorage.getItem('adm')||'',next=null,all=[],cur='reports',adCur='',adTotal=0,auNext=null,auAll=[],auFilter='',lkSlug='',lkOwner=false,lkShown='',lkGen=0,navI=(history.state&&history.state.i)||0,navLog=[],sheetH=false,ignorePop=false,openSet={},mt=null,recents=[],curSheet=null,repSub='',fullBusy=false,rIdx=false,rAgg=null,rGen=0,reindexing=false,qT=null;
 var TABS=['overview','reports','lookup','ads','audit','tools'];
 var TITLES={overview:'Overview',reports:'Reports',lookup:'Lookup',ads:'Ads',audit:'Audit',tools:'Tools'};
-var SUBS={overview:'Totals, live activity and directories',lookup:'Find a page, its owner and history',ads:'Campaigns running on published pages',audit:'Every admin action, newest first',tools:'Previews and maintenance'};
+var SUBS={overview:'Trends over time, totals and directories',lookup:'Find a page, its owner and history',ads:'Campaigns running on published pages',audit:'Every admin action, newest first',tools:'Previews and maintenance'};
+function parseNav(h){
+  h=String(h||'');if(h.charAt(0)==='#')h=h.slice(1);if(h.charAt(0)==='/')h=h.slice(1);
+  var p=h.split('/'),slug='';
+  if(TABS.indexOf(p[0])<0)return null;
+  if(p[0]==='lookup'&&p[1]){try{slug=slugFrom(decodeURIComponent(p[1]))}catch(e){slug=''}}
+  return{t:p[0],slug:slug,o:(slug&&p[2]==='owner')?1:0}
+}
+function hashOf(s){return '#'+s.t+(s.t==='lookup'&&s.slug?'/'+encodeURIComponent(s.slug)+(s.o?'/owner':''):'')}
+var NAV0=parseNav(location.hash)||parseNav(sessionStorage.getItem('admT'))||{t:'reports',slug:'',o:0};
+cur=NAV0.t;lkSlug=NAV0.slug;lkOwner=!!NAV0.o;
+try{history.scrollRestoration='manual'}catch(e){}
 function el(t,c,x){var e=document.createElement(t);if(c)e.className=c;if(x!=null)e.textContent=x;return e}
 function fmt(t){return t?new Date(t).toLocaleString():'-'}
 function num(n){return Number(n||0).toLocaleString()}
@@ -4622,18 +5059,19 @@ function reasonChip(r,isCsam){var s=isCsam?'csam':sevOf(r);return chip(r,'by-sev
 /* ---------- Sheets (replace native confirm/prompt) ---------- */
 function ask(o){
   return new Promise(function(res){
-    if(curSheet)curSheet.done(false);
+    if(curSheet)curSheet.done(false,true);
     var prev=document.activeElement,back=el('div','sheet-back'),sh=el('div','sheet');
     sh.setAttribute('role','dialog');sh.setAttribute('aria-modal','true');sh.setAttribute('aria-label',o.title);
     sh.appendChild(el('div','grab'));
-    sh.appendChild(tile(o.danger?'csam':'ad',o.danger?'alert':'shield'));
-    sh.appendChild(el('h2',null,o.title));
-    if(o.text)sh.appendChild(el('div','sheet-text',o.text));
+    var sb=el('div','sheet-body');sh.appendChild(sb);
+    sb.appendChild(tile(o.danger?'csam':'ad',o.danger?'alert':'shield'));
+    sb.appendChild(el('h2',null,o.title));
+    if(o.text)sb.appendChild(el('div','sheet-text',o.text));
     var inputs=[];
     (o.fields||[]).forEach(function(f){
       var l=el('label','sheet-field');l.appendChild(el('span',null,f.label));
       var i=el('input','field');i.placeholder=f.ph||'';i.autocomplete='off';if(f.max)i.maxLength=f.max;
-      l.appendChild(i);sh.appendChild(l);inputs.push(i)
+      l.appendChild(i);sb.appendChild(l);inputs.push(i)
     });
     var acts=el('div','sheet-actions');
     var okb=btn(o.ok||'Confirm',o.danger?'destroy block':'primary block',function(){fin(inputs.length?inputs.map(function(i){return i.value}):true)});
@@ -4641,15 +5079,16 @@ function ask(o){
     acts.appendChild(okb);acts.appendChild(cb);sh.appendChild(acts);
     back.appendChild(sh);document.body.appendChild(back);
     function kd(e){if(e.key==='Escape')fin(false);else if(e.key==='Enter'&&inputs.length&&e.target.tagName==='INPUT')okb.click()}
-    function fin(v){
+    function fin(v,keep){
       if(curSheet!==api2)return;
       curSheet=null;document.removeEventListener('keydown',kd);
       back.classList.remove('open');
       setTimeout(function(){back.remove()},240);
       if(prev&&prev.focus)try{prev.focus()}catch(e){}
+      sheetClose(keep);
       res(v)
     }
-    var api2={done:fin};curSheet=api2;
+    var api2={done:fin};curSheet=api2;sheetOpen();
     back.onclick=function(e){if(e.target===back)fin(false)};
     document.addEventListener('keydown',kd);
     requestAnimationFrame(function(){back.classList.add('open');(inputs[0]||cb).focus()})
@@ -4662,28 +5101,30 @@ function pickSet(id,v){
   b.value=o[0];b.textContent=o[1]
 }
 function pick(id,fn){
-  if(curSheet)curSheet.done(false);
+  if(curSheet)curSheet.done(false,true);
   var b=$(id),back=el('div','sheet-back'),sh=el('div','sheet'),list=el('div','plist');
   sh.setAttribute('role','dialog');sh.setAttribute('aria-modal','true');sh.setAttribute('aria-label',b.getAttribute('aria-label'));
   sh.appendChild(el('div','grab'));
-  sh.appendChild(el('div','ptitle',b.getAttribute('aria-label')));
+  var sb=el('div','sheet-body');sh.appendChild(sb);
+  sb.appendChild(el('div','ptitle',b.getAttribute('aria-label')));
   PICKS[id].forEach(function(o){
     var ob=el('button','popt',o[1]);ob.type='button';ob.setAttribute('role','option');
     ob.setAttribute('aria-selected',o[0]===b.value?'true':'false');
     ob.onclick=function(){var ch=o[0]!==b.value;fin();if(ch){pickSet(id,o[0]);fn()}};
     list.appendChild(ob)
   });
-  sh.appendChild(list);
-  sh.appendChild(btn('Cancel','quiet block',function(){fin()}));
+  sb.appendChild(list);
+  var acts=el('div','sheet-actions');acts.appendChild(btn('Cancel','quiet block',function(){fin()}));sh.appendChild(acts);
   back.appendChild(sh);document.body.appendChild(back);
   function kd(e){if(e.key==='Escape')fin()}
-  function fin(){
+  function fin(v,keep){
     if(curSheet!==me)return;
     curSheet=null;document.removeEventListener('keydown',kd);
     back.classList.remove('open');setTimeout(function(){back.remove()},240);
     try{b.focus()}catch(e){}
+    sheetClose(keep)
   }
-  var me={done:fin};curSheet=me;
+  var me={done:fin};curSheet=me;sheetOpen();
   back.onclick=function(e){if(e.target===back)fin()};
   document.addEventListener('keydown',kd);
   requestAnimationFrame(function(){back.classList.add('open')})
@@ -4710,7 +5151,47 @@ function mkCard(o){
 }
 
 /* ---------- Navigation ---------- */
-function state(){return{t:cur,slug:cur==='lookup'?lkSlug:''}}
+function state(){return{t:cur,slug:cur==='lookup'?lkSlug:'',o:(cur==='lookup'&&lkSlug&&lkOwner)?1:0}}
+function navChrome(){
+  var p=navI>0?navLog[navI-1]:null;
+  $('back').hidden=navI<=0;
+  $('backl').textContent=p?TITLES[p.t]:'Back'
+}
+function navSave(s){try{sessionStorage.setItem('admT',hashOf(s).slice(1))}catch(e){}}
+function navRec(s,push){
+  s.i=navI;navLog[navI]=s;navSave(s);
+  if(push)history.pushState(s,'',hashOf(s));else history.replaceState(s,'',hashOf(s));
+  navChrome()
+}
+function navPush(){
+  var s=state(),c=navLog[navI];
+  if(c&&c.t===s.t&&c.slug===s.slug&&c.o===s.o)return;
+  navI++;navLog.length=navI;navRec(s,true)
+}
+function navSync(){navRec(state(),false)}
+function applyNav(s){
+  if(s.t==='lookup'){lkSlug=s.slug||'';lkOwner=!!s.o}
+  showTab(s.t);
+  if(s.t==='lookup'){
+    $('lkslug').value=lkSlug;
+    if(!lkSlug){lkShown='';lookupHint();$('lkowner').textContent=''}
+    else if(lkShown===lkSlug){if(lkOwner){if(!$('lkowner').firstChild)loadOwner(lkSlug)}else $('lkowner').textContent=''}
+    else doLookup(lkSlug,lkOwner)
+  }
+  window.scrollTo(0,0)
+}
+/* Sheets take one history entry while open, so the device Back button closes the sheet instead of leaving the page behind it */
+function sheetOpen(){if(!sheetH){history.pushState(Object.assign({},history.state||{},{sh:1}),'',location.href);sheetH=true}}
+function sheetClose(keep){if(sheetH&&!keep){sheetH=false;ignorePop=true;history.back()}}
+window.addEventListener('popstate',function(e){
+  if(ignorePop){ignorePop=false;return}
+  if(curSheet){sheetH=false;curSheet.done(false);return}
+  if(document.body.dataset.auth!=='in')return;
+  var s=e.state;
+  if(!s||s.t==null){s=parseNav(location.hash);if(!s)return;navI++;navLog.length=navI;applyNav(s);navSync();return}
+  navI=s.i||0;navLog[navI]=s;navSave(s);
+  applyNav(s);navChrome()
+});
 function setSub(){
   var s=cur==='reports'?repSub:(cur==='lookup'&&lkSlug)?'/'+lkSlug:SUBS[cur]||'';
   $('sub').textContent=s
@@ -4721,24 +5202,20 @@ function showTab(t){
   [].forEach.call(document.querySelectorAll('.tab'),function(b){if(b.getAttribute('data-t')===t)b.setAttribute('aria-current','page');else b.removeAttribute('aria-current')});
   $('pill').style.transform='translateX('+(TABS.indexOf(t)*100)+'%)';
   $('ttl').textContent=TITLES[t];$('bttl').textContent=TITLES[t];document.title=TITLES[t]+' - Bluebook Admin';
-  var top=stack[stack.length-1];
-  $('back').hidden=!top;if(top)$('backl').textContent=TITLES[top.t];
+  navChrome();
   $('rf').hidden=t==='tools';
   setSub();
   if(t==='overview'&&!ovS.loaded){ovS.loaded=true;loadOverview();ovList(true)}
   if(t==='ads'&&!$('adlist').firstChild)loadAds(true);
   if(t==='audit'&&!auAll.length&&!$('aulist').firstChild)loadAudit(true)
 }
-function goTab(t){stack.push(state());showTab(t);window.scrollTo(0,0)}
-function goBack(){
-  var s=stack.pop();if(!s)return;
-  showTab(s.t);
-  if(s.t==='lookup'&&s.slug){lkSlug=s.slug;$('lkslug').value=s.slug;doLookup(s.slug)}
-  window.scrollTo(0,0)
-}
+function goTab(t){showTab(t);navPush();window.scrollTo(0,0)}
+function goBack(){if(navI>0)history.back()}
 function loggedIn(ok){
   document.body.dataset.auth=ok?'in':'out';
-  if(ok)showTab(cur)
+  if(!ok)return;
+  showTab(cur);navSync();
+  if(cur==='lookup'&&lkSlug){$('lkslug').value=lkSlug;doLookup(lkSlug,lkOwner)}
 }
 function bad(o){if(o.s===403||o.s===429){sessionStorage.removeItem('adm');loggedIn(false)}msg(o.j.error||'failed ('+o.s+')')}
 
@@ -4894,10 +5371,12 @@ function dismissGroup(g,csam,nc,card){
 function undismiss(g,b){b.disabled=true;sendKeys('/admin/undismiss',g.items.map(function(x){return x.key})).then(function(ok){if(ok)loadReports(true);else{b.disabled=false;msg('undo failed')}})}
 
 /* ---------- Actions shared by Reports and Lookup ---------- */
+var REASON_F={label:'Reason (shown to the user)',ph:'e.g. spam, impersonation, hateful content',max:200};
+function reasonOf(v){var r=String(v&&v[0]||'').trim();if(!r)msg('A reason is required');return r}
 function takedown(slug,csam,done){
-  ask({title:'Take down /'+slug+'?',text:csam?'CSAM report: the page is preserved under deleted/ for 18 months. You must still report to NCMEC.':'The slug will be permanently locked.',ok:'Take down',danger:true}).then(function(ok){
-    if(!ok)return;
-    api('/publish/'+encodeURIComponent(slug),{method:'DELETE',body:{adminToken:tok}}).then(function(o){
+  ask({title:'Take down /'+slug+'?',text:csam?'CSAM report: the page is preserved under deleted/ for 18 months. You must still report to NCMEC.':'The slug will be permanently locked.',ok:'Take down',danger:true,fields:[REASON_F]}).then(function(v){
+    if(!v)return;var reason=reasonOf(v);if(!reason)return;
+    api('/publish/'+encodeURIComponent(slug),{method:'DELETE',body:{adminToken:tok,reason:reason}}).then(function(o){
       if(o.ok)done('taken down');else if(o.s===404){msg('/'+slug+' is not live');done('missing')}else msg('takedown failed: '+o.s)}).catch(function(){msg('network error')})
   })
 }
@@ -4975,27 +5454,29 @@ function mkSnaps(slug,status,hitTs,card,csam,done){
 }
 
 /* ---------- Lookup and owner ---------- */
-function lookupHint(){var o=$('lkout');o.textContent='';o.appendChild(empty('Look up a page','Enter a slug or paste a link to see its status, owner and history.','search'))}
+function lookupHint(){lkShown='';var o=$('lkout');o.textContent='';o.appendChild(empty('Look up a page','Enter a slug or paste a link to see its status, owner and history.','search'))}
 function renderRecents(){
   var r=$('lkrec');r.textContent='';
   recents.forEach(function(s){var b=el('button','rc','/'+s);b.type='button';b.onclick=function(){$('lkslug').value=s;doLookup(s)};r.appendChild(b)})
 }
 function openLookup(slug){
-  if(cur!=='lookup'||lkSlug!==slug)stack.push(state());
-  lkSlug=slug;showTab('lookup');$('lkslug').value=slug;window.scrollTo(0,0);doLookup(slug)
+  lkSlug=slug;lkOwner=false;showTab('lookup');navPush();$('lkslug').value=slug;window.scrollTo(0,0);doLookup(slug)
 }
-function doLookup(v){
+function openOwner(slug){lkOwner=true;navPush();loadOwner(slug)}
+function doLookup(v,owner){
   var slug=slugFrom(v);if(!slug){msg('Enter a slug or link');return}
-  lkSlug=slug;setSub();
+  lkSlug=slug;lkOwner=!!owner;setSub();var g=++lkGen;
   api('/admin/lookup?slug='+encodeURIComponent(slug)).then(function(o){
+    if(g!==lkGen)return;
     if(!o.ok){bad(o);return}
     msg('');
     recents=[slug].concat(recents.filter(function(s){return s!==slug})).slice(0,8);renderRecents();
-    renderLookup(o.j)
+    renderLookup(o.j);navSync();
+    if(owner&&o.j.found&&o.j.hasOwner)loadOwner(slug)
   }).catch(function(){msg('network error')})
 }
 function renderLookup(d){
-  var out=$('lkout');out.textContent='';$('lkowner').textContent='';
+  var out=$('lkout');out.textContent='';$('lkowner').textContent='';lkShown=d.slug;
   var sev=d.csamHold?'csam':(d.found?(d.status==='live'?'ad':'spam'):'spam');
   var c=el('div','card static sev-'+sev+(d.csamHold?' urgent':''));
   var hd=el('div','lk-head');hd.appendChild(tile(sev,d.csamHold?'shieldAlert':'search'));
@@ -5026,7 +5507,7 @@ function renderLookup(d){
   var tools=el('div','tools');
   if(d.status==='live')tools.appendChild(link('View page','/@'+d.slug));
   tools.appendChild(mkSnaps(d.slug,d.status,0,c,d.csamHold,refresh));
-  if(d.hasOwner)tools.appendChild(btn('Owner',null,function(){loadOwner(d.slug)}));
+  if(d.hasOwner)tools.appendChild(btn('Owner',null,function(){openOwner(d.slug)}));
   if(d.ad)tools.appendChild(btn('Ads tab',null,function(){goTab('ads')}));
   c.appendChild(tools);
   var foot=el('div','foot');
@@ -5042,9 +5523,9 @@ function renderLookup(d){
 }
 function storyAct(slug,action,done){
   var rm=action==='remove';
-  ask({title:rm?'Remove /'+slug+' from stories?':'Show /'+slug+' in stories again?',text:rm?'The page stays online. The owner cannot turn stories back on until you allow it.':'',ok:rm?'Remove':'Allow',danger:rm}).then(function(ok){
-    if(!ok)return;
-    api('/admin/story',{method:'POST',body:{slug:slug,action:action}}).then(function(o){if(o.ok){msg('');done()}else msg(o.j.error||'failed')})
+  ask({title:rm?'Remove /'+slug+' from stories?':'Show /'+slug+' in stories again?',text:rm?'The page stays online. The owner cannot turn stories back on until you allow it.':'',ok:rm?'Remove':'Allow',danger:rm,fields:rm?[REASON_F]:undefined}).then(function(v){
+    if(!v)return;var reason='';if(rm){reason=reasonOf(v);if(!reason)return}
+    api('/admin/story',{method:'POST',body:{slug:slug,action:action,reason:reason}}).then(function(o){if(o.ok){msg('');done()}else msg(o.j.error||'failed')})
   })
 }
 function loadOwner(slug){
@@ -5060,17 +5541,44 @@ function loadOwner(slug){
     if(d.pendingDeletionAt)cr.appendChild(chip('deletion '+new Date(d.pendingDeletionAt+2592000000).toLocaleDateString(),'bad'));
     hm.appendChild(cr);hd.appendChild(hm);c.appendChild(hd);
     var st=el('div','stats');
-    [['Subscribers',d.subscribers],['Likes',d.likes],['Live pages',d.pages.length]].forEach(function(x){var s=el('div','stat');s.appendChild(el('b',null,x[1]==null?'-':num(x[1])));s.appendChild(el('span',null,x[0]));st.appendChild(s)});
+    [['Subscribers',d.subscribers],['Likes',d.likes],['Live pages',d.pages.length],['Strikes',d.strikeCount],['Reports',d.reportStats?d.reportStats.total:null],['Alerts',d.alertTotal]].forEach(function(x){var s=el('div','stat');s.appendChild(el('b',null,x[1]==null?'-':num(x[1])));s.appendChild(el('span',null,x[0]));st.appendChild(s)});
     c.appendChild(st);
     var k=el('div','kvs');c.appendChild(k);
     aidRow(k,d.authorId);
     kv(k,'Signed up',fmt(d.createdAt));kv(k,'Last sign-in',fmt(d.lastSignInAt));kv(k,'Ads',String(d.ads));kv(k,'Credit balance',num(d.creditBalance));
     kv(k,'Display name',d.displayName||'-');
     kv(k,'Backup',d.backup?num(d.backup.images)+(d.backup.imagesMore?'+':'')+' images - '+Math.round(d.backup.sizeBytes/1024)+' KB - '+ago(d.backup.updatedAt):'none');
+    c.appendChild(el('div','sec-t','Reports against this account'));
+    var rs=d.reportStats;
+    if(!rs)c.appendChild(el('div','fine','Report totals are unavailable until the report index is built (open the Reports tab once).'));
+    else{
+      var rl=el('div','fine',num(rs.total)+(rs.total===1?' report':' reports')+' total - '+num(rs.open)+' open - '+num(rs.total-rs.open)+' dismissed - across '+num(rs.pages)+(rs.pages===1?' page':' pages'));rl.style.margin='0 2px 8px';c.appendChild(rl);
+      var rc=el('div','chips');
+      ['csam','abuse','copyright','spam','other'].forEach(function(k){var v=rs.byReason[k]||{total:0,open:0};rc.appendChild(chip(trRL[k]+' '+num(v.total)+(v.open?' ('+num(v.open)+' open)':''),'by-sev sev-'+k))});
+      c.appendChild(rc)
+    }
+    c.appendChild(el('div','sec-t','Strikes ('+num(d.strikeCount||0)+')'));
+    if(!d.strikes||!d.strikes.length)c.appendChild(el('div','fine','No strikes. Reports alone are not strikes; takedowns, story or ad removals, profile removals and suspensions are.'));
+    else d.strikes.forEach(function(x,i){
+      var r=el('div','pgrow'),l=el('div');
+      l.appendChild(el('div','amsg',x.message));
+      l.appendChild(el('small',null,fmt(x.at)+' - '+ago(x.at)+(x.dismissedAt?' - deleted by user '+ago(x.dismissedAt):'')));
+      r.appendChild(l);var m=el('div','pm');m.appendChild(chip('strike #'+(i+1),'bad'));m.appendChild(chip(x.kind.replace(/_/g,' ')));r.appendChild(m);c.appendChild(r)
+    });
     if(d.hasProfileImage){c.appendChild(el('div','sec-t','Profile picture'));var pw=el('div','media');pw.appendChild(mediaTile('Profile picture',function(){return loadMedia(slug,'profile')},true));c.appendChild(pw)}
     if(d.ledger&&d.ledger.length){
       c.appendChild(el('div','sec-t','Credit ledger'));
       d.ledger.forEach(function(x){var r=el('div','pgrow'),l=el('div');l.appendChild(el('div','slug',(x.delta>0?'+':'')+num(x.delta)+' views'));l.appendChild(el('small',null,x.reason+(x.slug?' - /'+x.slug:'')+' - '+ago(x.at)));r.appendChild(l);c.appendChild(r)})
+    }
+    if(d.alerts&&d.alerts.length){
+      c.appendChild(el('div','sec-t','Alerts sent ('+num(d.alertTotal||d.alerts.length)+')'));
+      if(d.alertTotal>d.alerts.length)c.appendChild(el('div','fine','Showing the latest '+num(d.alerts.length)+'. Word for word what the account received.'));
+      d.alerts.forEach(function(x){
+        var r=el('div','pgrow'),l=el('div');
+        l.appendChild(el('div','amsg',x.message));
+        l.appendChild(el('small',null,fmt(x.at)+' - '+ago(x.at)+(x.dismissedAt?' - deleted by user '+ago(x.dismissedAt):'')));
+        r.appendChild(l);var m=el('div','pm');if(x.strike)m.appendChild(chip('strike','bad'));m.appendChild(chip(x.kind.replace(/_/g,' ')));r.appendChild(m);c.appendChild(r)
+      })
     }
     if(d.pages.length){
       c.appendChild(el('div','sec-t','Live pages'));
@@ -5098,19 +5606,20 @@ function loadOwner(slug){
   })
 }
 function ownerAct(slug,action,title,text,danger,okLabel,done){
-  ask({title:title,text:text,ok:okLabel,danger:danger}).then(function(ok){
-    if(!ok)return;
-    api('/admin/owner/action',{method:'POST',body:{slug:slug,action:action}}).then(function(o){if(o.ok){msg('done');done()}else msg(o.j.error||'failed')})
+  var needs=action==='suspend'||action==='clear-name'||action==='clear-picture';
+  ask({title:title,text:text,ok:okLabel,danger:danger,fields:needs?[REASON_F]:undefined}).then(function(v){
+    if(!v)return;var reason='';if(needs){reason=reasonOf(v);if(!reason)return}
+    api('/admin/owner/action',{method:'POST',body:{slug:slug,action:action,reason:reason}}).then(function(o){if(o.ok){msg('done');done()}else msg(o.j.error||'failed')})
   })
 }
 function takedownAll(pages,done){
-  ask({title:'Take down all '+pages.length+' live pages?',text:'Takes down every live page of this account and permanently locks their slugs.',ok:'Take down all',danger:true}).then(function(ok){
-    if(!ok)return;
+  ask({title:'Take down all '+pages.length+' live pages?',text:'Takes down every live page of this account and permanently locks their slugs.',ok:'Take down all',danger:true,fields:[REASON_F]}).then(function(v){
+    if(!v)return;var reason=reasonOf(v);if(!reason)return;
     var i=0,fails=0;
     (function step(){
       if(i>=pages.length){msg(fails?fails+' takedown(s) failed':'All pages taken down');done();return}
       var s=pages[i++].slug;
-      api('/publish/'+encodeURIComponent(s),{method:'DELETE',body:{adminToken:tok}}).then(function(o){if(!o.ok&&o.s!==404)fails++;step()}).catch(function(){fails++;step()})
+      api('/publish/'+encodeURIComponent(s),{method:'DELETE',body:{adminToken:tok,reason:reason}}).then(function(o){if(!o.ok&&o.s!==404)fails++;step()}).catch(function(){fails++;step()})
     })()
   })
 }
@@ -5130,9 +5639,11 @@ function loadAds(reset){
 }
 function adAct(a,action,refund,o){
   o.ok=o.ok||'Confirm';
-  ask(o).then(function(ok){
-    if(!ok)return;
-    api('/admin/ad',{method:'POST',body:{slug:a.slug,action:action,refund:!!refund}}).then(function(r){
+  var needs=action==='pause'||action==='takedown';
+  if(needs)o.fields=[REASON_F];
+  ask(o).then(function(v){
+    if(!v)return;var reason='';if(needs){reason=reasonOf(v);if(!reason)return}
+    api('/admin/ad',{method:'POST',body:{slug:a.slug,action:action,refund:!!refund,reason:reason}}).then(function(r){
       if(r.ok){msg(r.j.refunded?r.j.refunded+' views refunded':'done');loadAds(true)}else msg(r.j.error||'failed')})
   })
 }
@@ -5210,6 +5721,7 @@ function ovShell(){
   })
 }
 function loadOverview(){
+  trLoad();
   if(!$('ovstats').firstChild)ovShell();
   var S=[].slice.call($('ovstats').querySelectorAll('.stat'));
   S.forEach(function(s){s.classList.add('ld')});
@@ -5267,9 +5779,285 @@ function ovList(reset){
   }).catch(function(){if(g!==ovS.gen)return;unskel(L);moreBusy(m,false);msg('network error')})
 }
 
+/* ---------- Trends: growth and decline over time ---------- */
+var trWIN={day:30,week:12,month:12,year:5},trUNIT={day:'days',week:'weeks',month:'months',year:'years'},trOFF=-new Date().getTimezoneOffset()*60000,trMIN=Date.UTC(2015,0,1);
+var trRL={csam:'Child safety',abuse:'Abuse',copyright:'Copyright',spam:'Spam',other:'Other'},trRO=['csam','abuse','copyright','spam','other'],trRC={csam:'#FF4D6D',abuse:'#FF9A5C',copyright:'#F7C35B',spam:'#97A3F0',other:'#46D6C8'};
+var trM=[
+  {k:'signups',l:'New accounts',t:'Accounts',c:'#8B9BFF',cum:1,good:1},
+  {k:'active_u',l:'Active accounts',c:'#46E0A8',level:1,good:1},
+  {k:'active_g',l:'Active guests',c:'#B69CFF',level:1,good:1},
+  {k:'notes',l:'Notes published',t:'Notes',c:'#46D6C8',cum:1,good:1},
+  {k:'stories',l:'Stories',t:'Stories',c:'#F7C35B',cum:1,good:1},
+  {k:'likes',l:'Likes',t:'Likes',c:'#FF8FB1',cum:1,good:1},
+  {k:'subs',l:'Subscriptions',t:'Subscriptions',c:'#97A3F0',cum:1,good:1},
+  {k:'ads',l:'Ads created',t:'Ads',c:'#B69CFF',cum:1,good:1},
+  {k:'reports',l:'Reports',t:'Reports',c:'#FF9A5C',cum:1,good:0},
+  {k:'strikes',l:'Strikes issued',t:'Strikes',c:'#FF6A86',cum:1,good:0},
+  {k:'alerts',l:'Alerts sent',t:'Alerts',c:'#A3A9DA',cum:1,good:0}
+];
+var trS={bk:'day',end:null,metric:'signups',mode:'flow',data:null,plan:null,M:null,RS:null,gen:0,ready:false};
+function trEsc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
+function trRgba(h,a){var n=parseInt(h.slice(1),16);return 'rgba('+(n>>16&255)+','+(n>>8&255)+','+(n&255)+','+a+')'}
+/* All bucket math runs on "shifted" time (real ms + the admin's UTC offset) read back with UTC getters. */
+function trStart(bk,s){
+  var d=new Date(s);
+  if(bk==='day')return Date.UTC(d.getUTCFullYear(),d.getUTCMonth(),d.getUTCDate());
+  if(bk==='month')return Date.UTC(d.getUTCFullYear(),d.getUTCMonth(),1);
+  if(bk==='year')return Date.UTC(d.getUTCFullYear(),0,1);
+  var day=Math.floor(s/864e5);return (Math.floor((day+3)/7)*7-3)*864e5
+}
+function trNext(bk,s,n){
+  var d=new Date(s);
+  if(bk==='day')return s+n*864e5;
+  if(bk==='week')return s+n*7*864e5;
+  if(bk==='month')return Date.UTC(d.getUTCFullYear(),d.getUTCMonth()+n,1);
+  return Date.UTC(d.getUTCFullYear()+n,0,1)
+}
+function trKey(bk,s){
+  var d=new Date(s);
+  if(bk==='day')return d.toISOString().slice(0,10);
+  if(bk==='month')return d.toISOString().slice(0,7);
+  if(bk==='year')return String(d.getUTCFullYear());
+  return String(Math.floor((Math.floor(s/864e5)+3)/7))
+}
+function trLab(bk,s,full){
+  var o={timeZone:'UTC'},d=new Date(s);
+  if(bk==='year')return String(d.getUTCFullYear());
+  if(bk==='month'){o.month='short';if(full||d.getUTCMonth()===0)o.year='numeric';return d.toLocaleDateString(undefined,o)}
+  o.month='short';o.day='numeric';if(full)o.year='numeric';
+  var t=d.toLocaleDateString(undefined,o);
+  return bk==='week'&&full?'Week of '+t:t
+}
+function trPlan(){
+  var bk=trS.bk,N=trWIN[bk],nowStart=trStart(bk,Date.now()+trOFF);
+  var last=trS.end==null?nowStart:Math.min(trStart(bk,trS.end),nowStart),starts=[],ends=[],i;
+  for(i=-(2*N-1);i<=0;i++){starts.push(trNext(bk,last,i));ends.push(trNext(bk,last,i+1))}
+  return {bk:bk,N:N,starts:starts,ends:ends,live:last===nowStart,from:starts[0]-trOFF,to:ends[2*N-1]-trOFF}
+}
+function trNice(m){if(!(m>0))return 1;var e=Math.pow(10,Math.floor(Math.log10(m))),f=m/e;return (f<=1?1:f<=2?2:f<=5?5:10)*e}
+function trShort(n){n=Math.round(n*10)/10;var a=Math.abs(n);if(a>=1e6)return (n/1e6).toFixed(1).replace('.0','')+'M';if(a>=1e3)return (n/1e3).toFixed(1).replace('.0','')+'k';return String(n)}
+function trSum(a,from,to){var s=0,n=0,i;for(i=from;i<to;i++)if(a[i]!=null){s+=a[i];n++}return {s:s,n:n}}
+function trDelta(cur,prev,good){
+  if(cur==null||prev==null)return {t:'no earlier data',c:'fl'};
+  var diff=cur-prev;
+  if(Math.abs(diff)<1e-9)return {t:'no change',c:'fl'};
+  var sg=diff>0?'+':'-',t=sg+num(Math.round(Math.abs(diff)*10)/10);
+  t+=prev?' ('+sg+(Math.round(Math.abs(diff)/prev*1000)/10)+'%)':' (new)';
+  return {t:t,c:(diff>0)===!!good?'up':'dn'}
+}
+function trSpark(vals,color){
+  var w=72,h=24,a=vals.filter(function(v){return v!=null});
+  if(a.length<2)return '<svg viewBox="0 0 72 24"></svg>';
+  var mn=Math.min.apply(null,a),mx=Math.max.apply(null,a),rg=mx-mn||1,n=vals.length,d='',pen=false;
+  vals.forEach(function(v,i){
+    if(v==null){pen=false;return}
+    var x=2+(w-4)*i/(n-1),y=mx===mn?h/2:h-3-(h-6)*(v-mn)/rg;
+    d+=(pen?'L':'M')+x.toFixed(1)+' '+y.toFixed(1);pen=true
+  });
+  return '<svg viewBox="0 0 72 24"><path d="'+d+'" fill="none" stroke="'+color+'" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>'
+}
+/* Bar or line chart as inline SVG; drag or tap to read a bucket. ser: [{name,color,vals}] (null = no data). */
+function trDraw(host,labels,full,ser,o){
+  o=o||{};
+  var W=340,H=200,L=40,R=10,Tp=12,B=26,iw=W-L-R,ih=H-Tp-B,n=labels.length,stack=!!o.stack,line=o.type==='line',i;
+  var hi=0,lo=o.zoom?Infinity:0;
+  for(i=0;i<n;i++){
+    var tot=0;
+    ser.forEach(function(x){var v=x.vals[i];if(v==null)return;if(stack)tot+=v;else{if(v>hi)hi=v;if(v<lo)lo=v}});
+    if(stack&&tot>hi)hi=tot
+  }
+  if(lo===Infinity)lo=0;
+  var step=Math.max(1,trNice((hi-lo)/4)),base=o.zoom?Math.floor(lo/step)*step:0;
+  var top=base+step*Math.max(1,Math.ceil((hi-base)/step)),ticks=Math.round((top-base)/step);
+  function Y(v){return Tp+ih-(v-base)/(top-base)*ih}
+  var slot=iw/n;function X(k){return L+slot*(k+.5)}
+  var s='<svg viewBox="0 0 '+W+' '+H+'" role="img">';
+  for(i=0;i<=ticks;i++){var gy=Y(base+step*i);s+='<line x1="'+L+'" x2="'+(W-R)+'" y1="'+gy.toFixed(1)+'" y2="'+gy.toFixed(1)+'" class="tr-g"/><text x="'+(L-6)+'" y="'+(gy+3.5).toFixed(1)+'" text-anchor="end" class="tr-ax">'+trShort(base+step*i)+'</text>'}
+  if(!line){
+    var bw=Math.max(2,Math.min(28,slot*.72));
+    for(i=0;i<n;i++){
+      var acc=0;
+      ser.forEach(function(x){
+        var v=x.vals[i];if(v==null||v<=0)return;
+        var y0=Y(acc),y1=Y(acc+v);
+        s+='<rect x="'+(X(i)-bw/2).toFixed(1)+'" y="'+y1.toFixed(1)+'" width="'+bw.toFixed(1)+'" height="'+Math.max(1,y0-y1).toFixed(1)+'" rx="'+Math.min(3,bw/3).toFixed(1)+'" style="fill:'+x.color+'"'+(o.partial&&i===n-1?' opacity=".55"':'')+'/>';
+        if(stack)acc+=v
+      })
+    }
+  }else{
+    ser.forEach(function(x){
+      var d='',pen=false,holes=false,k;
+      for(k=0;k<n;k++){var v=x.vals[k];if(v==null){pen=false;holes=true;continue}d+=(pen?'L':'M')+X(k).toFixed(1)+' '+Y(v).toFixed(1);pen=true}
+      if(!d)return;
+      if(!holes)s+='<path d="'+d+' L'+X(n-1).toFixed(1)+' '+Y(base).toFixed(1)+' L'+X(0).toFixed(1)+' '+Y(base).toFixed(1)+'Z" style="fill:'+x.color+';fill-opacity:.13"/>';
+      s+='<path d="'+d+'" fill="none" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" style="stroke:'+x.color+'"/>';
+      if(n<=31)for(k=0;k<n;k++){var w2=x.vals[k];if(w2!=null)s+='<circle cx="'+X(k).toFixed(1)+'" cy="'+Y(w2).toFixed(1)+'" r="2.4" style="fill:'+x.color+'"/>'}
+    })
+  }
+  var kx=Math.max(1,Math.ceil(n/6));
+  for(i=0;i<n;i+=kx)s+='<text x="'+X(i).toFixed(1)+'" y="'+(H-8)+'" text-anchor="middle" class="tr-ax">'+trEsc(labels[i])+'</text>';
+  s+='<line class="tr-cur" x1="0" x2="0" y1="'+Tp+'" y2="'+(Tp+ih)+'" style="display:none"/></svg><div class="tr-tip"></div>';
+  host.innerHTML=s;
+  var sv=host.firstChild,cur=sv.querySelector('.tr-cur'),tip=host.querySelector('.tr-tip');
+  function hide(){cur.style.display='none';tip.style.display='none'}
+  function hv(e){
+    var r=sv.getBoundingClientRect(),px=(e.clientX-r.left)/r.width*W,idx=Math.floor((px-L)/slot);
+    if(idx<0||idx>=n){hide();return}
+    var cx=X(idx);cur.setAttribute('x1',cx);cur.setAttribute('x2',cx);cur.style.display='';
+    var h='<b>'+trEsc(full[idx])+'</b>',sum=0;
+    ser.forEach(function(x){var v=x.vals[idx];if(v!=null)sum+=v;h+='<div><i style="background:'+x.color+'"></i>'+trEsc(x.name)+' <b>'+(v==null?'-':num(v))+'</b></div>'});
+    if(stack&&ser.length>1)h+='<div>Total <b>'+num(sum)+'</b></div>';
+    tip.innerHTML=h;tip.style.display='block';
+    tip.style.left=Math.min(Math.max(cx/W*100,24),76)+'%';tip.style.transform='translateX(-50%)'
+  }
+  sv.addEventListener('pointerdown',hv);sv.addEventListener('pointermove',hv);sv.addEventListener('pointerleave',hide)
+}
+function trMetric(k){return trM.filter(function(m){return m.k===k})[0]}
+function trInit(){
+  if(trS.ready)return;trS.ready=true;
+  var box=$('trmet');
+  trM.forEach(function(x){
+    var b=el('button','key');b.type='button';b.setAttribute('data-k',x.k);b.setAttribute('aria-pressed','false');
+    b.style.setProperty('--sev',x.c);b.style.setProperty('--sev-bg',trRgba(x.c,.17));
+    b.appendChild(document.createElement('i'));b.appendChild(el('span',null,x.l));
+    b.onclick=function(){trS.metric=x.k;if(!x.cum)trS.mode='flow';trMetSync();if(trS.M)trChartRender()};
+    box.appendChild(b)
+  });
+  [].forEach.call($('trbk').children,function(b){b.onclick=function(){var v=b.getAttribute('data-b');if(trS.bk===v)return;trS.bk=v;trLoad()}});
+  [].forEach.call($('trmode').children,function(b){b.onclick=function(){trS.mode=b.getAttribute('data-m');trMetSync();if(trS.M)trChartRender()}});
+  $('trprev').onclick=function(){var p=trPlan();trS.end=trNext(p.bk,p.starts[2*p.N-1],-p.N);trLoad()};
+  $('trnext').onclick=function(){var p=trPlan(),c=trNext(p.bk,p.starts[2*p.N-1],p.N);trS.end=c>=trStart(p.bk,Date.now()+trOFF)?null:c;trLoad()};
+  $('trnow').onclick=function(){trS.end=null;trLoad()};
+  $('trjump').onchange=function(){
+    var v=$('trjump').value;if(!v)return;
+    var a=v.split('-'),s=Date.UTC(+a[0],+a[1]-1,+a[2]);
+    trS.end=s>=trStart(trS.bk,Date.now()+trOFF)?null:s;trLoad()
+  };
+  trMetSync()
+}
+function trMetSync(){
+  var x=trMetric(trS.metric);
+  [].forEach.call($('trmet').children,function(b){b.setAttribute('aria-pressed',b.getAttribute('data-k')===trS.metric?'true':'false')});
+  [].forEach.call($('trbk').children,function(b){b.setAttribute('aria-pressed',b.getAttribute('data-b')===trS.bk?'true':'false')});
+  [].forEach.call($('trmode').children,function(b){b.setAttribute('aria-pressed',b.getAttribute('data-m')===trS.mode?'true':'false')});
+  $('trmode').hidden=!x.cum
+}
+function trLoad(){
+  trInit();
+  var g=++trS.gen,p=trPlan();
+  trS.plan=p;trNavSync();trMetSync();
+  $('trchart').classList.add('busy');
+  return api('/admin/trends?bucket='+p.bk+'&from='+p.from+'&to='+p.to+'&off='+trOFF).then(function(o){
+    if(g!==trS.gen)return;
+    $('trchart').classList.remove('busy');
+    if(!o.ok){bad(o);return}
+    trS.data=o.j;trBuild();trRender()
+  }).catch(function(){if(g!==trS.gen)return;$('trchart').classList.remove('busy');msg('network error')})
+}
+function trNavSync(){
+  var p=trS.plan,N=p.N;
+  $('trrange').textContent=trLab(p.bk,p.starts[N],true)+(N>1?' - '+trLab(p.bk,p.starts[2*N-1],true):'');
+  $('trcmp').textContent='vs '+trLab(p.bk,p.starts[0],true)+(N>1?' - '+trLab(p.bk,p.starts[N-1],true):'');
+  $('trprev').disabled=p.starts[0]-N*864e5<=trMIN||(trS.data&&p.from<=trS.data.epoch);
+  $('trnext').disabled=p.live;
+  $('trnow').hidden=p.live;
+  var j=$('trjump');j.max=new Date(Date.now()+trOFF).toISOString().slice(0,10);
+  j.value=new Date(p.ends[2*N-1]-864e5).toISOString().slice(0,10)
+}
+function trBuild(){
+  var d=trS.data,p=trS.plan,keys=p.starts.map(function(s){return trKey(p.bk,s)}),M={},RS={},kix={};
+  keys.forEach(function(k,i){kix[k]=i});
+  var ep=(d.epoch||0)+trOFF;
+  function pre(i){return p.ends[i]<=ep}
+  function col(name){var m={};(d.series[name]||[]).forEach(function(r){m[String(r[0])]=r[1]});return keys.map(function(k,i){return pre(i)?null:(m[k]||0)})}
+  trM.forEach(function(x){
+    if(x.level){
+      var a=col(x.k),since=d.activeSince;
+      M[x.k]={flow:a.map(function(v,i){return v==null||since==null||p.ends[i]-trOFF<=since?null:v})};return
+    }
+    if(x.k==='reports'&&!d.reportsIndexed){M[x.k]=null;return}
+    var f=col(x.k),run=(d.before||{})[x.k]||0;
+    M[x.k]={flow:f,cum:f.map(function(v){if(v==null)return null;run+=v;return run})}
+  });
+  trRO.forEach(function(r){RS[r]=keys.map(function(k,i){return pre(i)?null:0})});
+  (d.reportsByReason||[]).forEach(function(r){var i=kix[String(r[0])];if(i==null)return;var k=RS[r[1]]?r[1]:'other';if(RS[k][i]!=null)RS[k][i]+=r[2]});
+  trS.M=M;trS.RS=RS
+}
+function trRender(){
+  trNavSync();trMetSync();trChartRender();trRowsRender();rpRender();
+}
+function trChartRender(){
+  var x=trMetric(trS.metric),Mx=trS.M[x.k],p=trS.plan,N=p.N,host=$('trchart'),leg=$('trleg');
+  host.textContent='';leg.textContent='';
+  if(!Mx){
+    $('trval').textContent='-';$('trdl').textContent='';$('trsub').textContent='';
+    host.appendChild(el('div','tr-msg','Reports are still being indexed. Open the Reports tab once, then refresh.'));return
+  }
+  var total=trS.mode==='total'&&!!x.cum,labels=p.starts.slice(N).map(function(s){return trLab(p.bk,s,false)}),full=p.starts.slice(N).map(function(s){return trLab(p.bk,s,true)});
+  var val,dl,sub,ser,o={partial:p.live};
+  if(total){
+    var endV=Mx.cum[2*N-1],startV=Mx.cum[N-1];
+    val=endV==null?'-':num(endV);dl=trDelta(endV,startV,x.good);sub='Total at end of range, change across the range';
+    ser=[{name:x.t||x.l,color:x.c,vals:Mx.cum.slice(N)}];o.type='line';o.zoom=true
+  }else if(x.level){
+    var c=trSum(Mx.flow,N,2*N),pv=trSum(Mx.flow,0,N),ca=c.n?c.s/c.n:null,pa=pv.n?pv.s/pv.n:null;
+    val=ca==null?'-':num(Math.round(ca*10)/10);dl=trDelta(ca,pa,x.good);sub='Average per '+p.bk+', vs previous '+N+' '+trUNIT[p.bk];
+    ser=[{name:x.l,color:x.c,vals:Mx.flow.slice(N)}];o.type='line'
+  }else{
+    var cq=trSum(Mx.flow,N,2*N),pq=trSum(Mx.flow,0,N),cs=cq.n?cq.s:null,ps=pq.n?pq.s:null;
+    val=cs==null?'-':num(cs);dl=trDelta(cs,ps,x.good);sub=x.l+' in this range, vs previous '+N+' '+trUNIT[p.bk];
+    if(x.k==='reports'){
+      ser=trRO.map(function(r){return {name:trRL[r],color:trRC[r],vals:trS.RS[r].slice(N)}});o.stack=true;
+      trRO.forEach(function(r){var s=el('span');var i=document.createElement('i');i.style.background=trRC[r];s.appendChild(i);s.appendChild(document.createTextNode(trRL[r]));leg.appendChild(s)})
+    }else ser=[{name:x.l,color:x.c,vals:Mx.flow.slice(N)}];
+    o.type='bar'
+  }
+  $('trval').textContent=val;$('trdl').textContent=dl.t;$('trdl').className='tr-dl '+dl.c;$('trsub').textContent=sub;
+  trDraw(host,labels,full,ser,o)
+}
+function trRowsRender(){
+  var C=$('trrows'),p=trS.plan,N=p.N;C.textContent='';
+  trM.forEach(function(x){
+    var Mx=trS.M[x.k],r=el('button','pgrow'),l=el('div'),m=el('div','pm');r.type='button';
+    l.appendChild(el('div','tr-t',x.l));
+    var sm=el('small'),v,dl,vals;
+    if(!Mx){sm.textContent='Waiting for the report index';v='-';vals=[]}
+    else if(x.level){
+      var c=trSum(Mx.flow,N,2*N),pv=trSum(Mx.flow,0,N),ca=c.n?c.s/c.n:null,pa=pv.n?pv.s/pv.n:null;
+      dl=trDelta(ca,pa,x.good);v=ca==null?'-':num(Math.round(ca*10)/10);vals=Mx.flow.slice(N)
+    }else{
+      var cq=trSum(Mx.flow,N,2*N),pq=trSum(Mx.flow,0,N),cs=cq.n?cq.s:null,ps=pq.n?pq.s:null;
+      dl=trDelta(cs,ps,x.good);v=cs==null?'-':num(cs);vals=Mx.flow.slice(N)
+    }
+    if(dl){sm.appendChild(el('span','tr-dl '+dl.c,dl.t));sm.appendChild(document.createTextNode(' vs previous'))}
+    l.appendChild(sm);r.appendChild(l);
+    var sk=el('span','tr-sp');sk.innerHTML=trSpark(vals,x.c);m.appendChild(sk);m.appendChild(el('b','tr-v',v));r.appendChild(m);
+    r.onclick=function(){trS.metric=x.k;if(!x.cum)trS.mode='flow';trMetSync();trChartRender();$('trcard').scrollIntoView({behavior:'smooth',block:'start'})};
+    C.appendChild(r)
+  })
+}
+function rpRender(){
+  var d=trS.data,C=$('rpbox'),p=trS.plan,N=p.N;C.textContent='';
+  if(!d.reportsIndexed){C.appendChild(el('div','fine','Report totals need the report index, which is still being built. Open the Reports tab once, then refresh.'));return}
+  var tot={},open={},all=0,op=0;
+  (d.reportTotals||[]).forEach(function(r){var k=trRL[r.reason]?r.reason:'other';tot[k]=(tot[k]||0)+r.total;open[k]=(open[k]||0)+r.open;all+=r.total;op+=r.open});
+  var st=el('div','stats');
+  [['Total reports',all],['Open',op],['Dismissed',all-op]].forEach(function(x){var s=el('div','stat');s.appendChild(el('b',null,num(x[1])));s.appendChild(el('span',null,x[0]));st.appendChild(s)});
+  C.appendChild(st);
+  var gap=el('div');gap.style.height='10px';C.appendChild(gap);
+  trRO.forEach(function(k){
+    var t=tot[k]||0,o=open[k]||0,inR=trSum(trS.RS[k],N,2*N).s;
+    var r=el('div','tr-rr sev-'+k),h=el('div','tr-rt'),n=el('span','tr-rn');
+    n.appendChild(document.createElement('i'));n.appendChild(document.createTextNode(trRL[k]));h.appendChild(n);h.appendChild(el('b',null,num(t)));r.appendChild(h);
+    r.appendChild(el('small',null,num(o)+' open - '+num(t-o)+' dismissed - '+num(inR)+' in this range'));
+    var bar=el('div','tr-bar'),fi=document.createElement('i');fi.style.width=(all?Math.round(t/all*100):0)+'%';bar.appendChild(fi);r.appendChild(bar);
+    C.appendChild(r)
+  })
+}
+
 /* ---------- Wiring ---------- */
 window.addEventListener('scroll',function(){var b=$('bar');if(window.scrollY>36)b.setAttribute('data-solid','');else b.removeAttribute('data-solid')},{passive:true});
-[].forEach.call(document.querySelectorAll('.tab'),function(b){b.onclick=function(){stack=[];showTab(b.getAttribute('data-t'));window.scrollTo(0,0)}});
+[].forEach.call(document.querySelectorAll('.tab'),function(b){b.onclick=function(){showTab(b.getAttribute('data-t'));navPush();window.scrollTo(0,0)}});
 $('back').onclick=goBack;
 $('rf').onclick=function(){
   if(cur==='overview'){loadOverview();ovList(true)}
@@ -5279,12 +6067,12 @@ $('rf').onclick=function(){
   else if(cur==='audit')loadAudit(true)
 };
 $('so').onclick=function(){
-  sessionStorage.removeItem('adm');tok='';all=[];next=null;rIdx=false;rAgg=null;rGen++;stack=[];lkSlug='';cur='reports';openSet={};auAll=[];auFilter='';recents=[];repSub='';
-  ['list','lkowner','adlist','aulist','aukeys','qbar','qkeys','ovstats','ovlist'].forEach(function(i){$(i).textContent=''});
+  sessionStorage.removeItem('adm');tok='';all=[];next=null;rIdx=false;rAgg=null;rGen++;navLog=[];lkSlug='';lkOwner=false;cur='reports';openSet={};auAll=[];auFilter='';recents=[];repSub='';
+  ['list','lkowner','adlist','aulist','aukeys','qbar','qkeys','ovstats','ovlist','trchart','trleg','trrows','rpbox'].forEach(function(i){$(i).textContent=''});trS.data=null;trS.M=null;trS.end=null;trS.gen++;
   ovS.loaded=false;ovS.view='users';ovS.q='';ovS.fil='';ovS.sort='new';ovS.gen++;$('ovq').value='';pickSet('ovsort','new');pickSet('ovfilter','');$('ovcount').textContent='';$('ovnote').textContent='';ovSync();
   $('queue').hidden=true;$('freason').value='';$('fq').value='';
   lookupHint();renderRecents();setBadge(0);document.body.dataset.alert='';$('tok').value='';
-  loggedIn(false);msg('Signed out','ok')
+  navSync();loggedIn(false);msg('Signed out','ok')
 };
 $('go').onclick=function(){
   var v=$('tok').value.trim();
@@ -5477,6 +6265,18 @@ export default {
       if (method === 'DELETE' && pathname.startsWith('/ads/')) {
         return handleAdUnpublish(env, request, decodeURIComponent(pathname.slice('/ads/'.length)));
       }
+      if (method === 'GET' && pathname === '/alerts') {
+        return handleAlertsList(env, request, url);
+      }
+      if (method === 'GET' && pathname === '/alerts/unread') {
+        return handleAlertsUnread(env, request);
+      }
+      if (method === 'POST' && pathname === '/alerts/seen') {
+        return handleAlertsSeen(env, request);
+      }
+      if (method === 'DELETE' && pathname.startsWith('/alerts/')) {
+        return handleAlertDelete(env, request, decodeURIComponent(pathname.slice('/alerts/'.length)));
+      }
       if (method === 'POST' && pathname === '/presence') {
         return handlePresence(env, request);
       }
@@ -5506,6 +6306,7 @@ export default {
       if (method === 'GET' && pathname === '/admin/ads') return handleAdminAds(env, request, url);
       if (method === 'GET' && pathname === '/admin/audit') return handleAdminAudit(env, request, url);
       if (method === 'GET' && pathname === '/admin/stats') return handleAdminStats(env, request);
+      if (method === 'GET' && pathname === '/admin/trends') return handleAdminTrends(env, request, url);
       if (method === 'GET' && pathname === '/admin/users') return handleAdminUsers(env, request, url);
       if (method === 'GET' && pathname === '/admin/notes') return handleAdminNotes(env, request, url);
       if (method === 'POST' && pathname === '/admin/owner/action') return handleAdminOwnerAction(env, request);
@@ -5537,5 +6338,7 @@ export default {
   async scheduled(event, env, ctx) {
     ctx.waitUntil(handlePurge(env));
     ctx.waitUntil(prunePresence(env));
+    ctx.waitUntil(pruneAlerts(env));
+    ctx.waitUntil(pruneActivity(env));
   }
 };
