@@ -4722,6 +4722,8 @@ main{position:relative;z-index:1;max-width:720px;margin:0 auto;padding:2px 16px 
 .amsg{font-size:14.5px;line-height:1.4;white-space:pre-wrap;overflow-wrap:anywhere}
 .pgrow{--slug-fs:15.5px;appearance:none;-webkit-appearance:none;display:grid;grid-template-columns:minmax(0,1fr) auto;gap:12px;align-items:center;width:100%;padding:12px 14px;margin:0 0 8px;border:0;border-radius:14px;background:var(--well);text-align:left;color:inherit}
 .pgrow:active{background:var(--s2)}
+.pgrow.stack{grid-template-columns:minmax(0,1fr);gap:8px;align-items:start}
+.pgrow.stack .pm{justify-content:flex-start}
 .pgrow small{display:block;margin-top:3px;font-size:13px;color:var(--muted);overflow-wrap:anywhere}
 .pgrow small.aid{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;color:var(--faint)}
 .pgrow .pm{display:flex;align-items:center;gap:6px;flex-wrap:wrap;justify-content:flex-end}
@@ -5738,10 +5740,10 @@ function loadOwner(slug){
     c.appendChild(el('div','sec-t','Strikes ('+num(d.strikeCount||0)+')'));
     if(!d.strikes||!d.strikes.length)c.appendChild(el('div','fine','No strikes. Reports alone are not strikes; takedowns, story or ad removals, profile removals and suspensions are.'));
     else d.strikes.forEach(function(x,i){
-      var r=el('div','pgrow'),l=el('div');
+      var r=el('div','pgrow stack'),l=el('div');
       l.appendChild(el('div','amsg',x.message));
       l.appendChild(el('small',null,fmt(x.at)+' - '+ago(x.at)+(x.dismissedAt?' - deleted by user '+ago(x.dismissedAt):'')));
-      r.appendChild(l);var m=el('div','pm');m.appendChild(chip('strike #'+(i+1),'bad'));m.appendChild(chip(x.kind.replace(/_/g,' ')));r.appendChild(m);c.appendChild(r)
+      var m=el('div','pm');m.appendChild(chip('strike #'+(i+1),'bad'));m.appendChild(chip(x.kind.replace(/_/g,' ')));r.appendChild(m);r.appendChild(l);c.appendChild(r)
     });
     if(d.hasProfileImage){c.appendChild(el('div','sec-t','Profile picture'));var pw=el('div','media');pw.appendChild(mediaTile('Profile picture',function(){return loadMedia(slug,'profile')},true));c.appendChild(pw)}
     if(d.ledger&&d.ledger.length){
@@ -5752,10 +5754,10 @@ function loadOwner(slug){
       c.appendChild(el('div','sec-t','Alerts sent ('+num(d.alertTotal||d.alerts.length)+')'));
       if(d.alertTotal>d.alerts.length)c.appendChild(el('div','fine','Showing the latest '+num(d.alerts.length)+'. Word for word what the account received.'));
       d.alerts.forEach(function(x){
-        var r=el('div','pgrow'),l=el('div');
+        var r=el('div','pgrow stack'),l=el('div');
         l.appendChild(el('div','amsg',x.message));
         l.appendChild(el('small',null,fmt(x.at)+' - '+ago(x.at)+(x.dismissedAt?' - deleted by user '+ago(x.dismissedAt):'')));
-        r.appendChild(l);var m=el('div','pm');if(x.strike)m.appendChild(chip('strike','bad'));m.appendChild(chip(x.kind.replace(/_/g,' ')));r.appendChild(m);c.appendChild(r)
+        var m=el('div','pm');if(x.strike)m.appendChild(chip('strike','bad'));m.appendChild(chip(x.kind.replace(/_/g,' ')));r.appendChild(m);r.appendChild(l);c.appendChild(r)
       })
     }
     if(d.pages.length){
@@ -5946,7 +5948,8 @@ function ovUser(u){
   if(u.online)m.appendChild(chip('online','st good'));
   if(u.suspended)m.appendChild(chip('suspended','bad'));
   if(u.deleting)m.appendChild(chip('deleting','warn'));
-  r.appendChild(m);$('ovlist').appendChild(r)
+  if(m.children.length>1){r.className='pgrow stack';r.insertBefore(m,l)}else r.appendChild(m);
+  $('ovlist').appendChild(r)
 }
 function ovNote(n){
   var r=el('button','pgrow');r.type='button';r.onclick=function(){openLookup(n.slug)};
