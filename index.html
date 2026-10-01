@@ -492,7 +492,7 @@ body[data-auth=out] #msg{bottom:calc(24px + env(safe-area-inset-bottom,0px))}
         <button class="btn block" id="relgo">Release slug</button>
       </div>
       <div class="card static">
-        <div class="sec-head"><span class="tile sev-csam"><span class="ico" data-i="trash"></span></span><div><div class="card-t">Purge</div><div class="card-s">The same job the cron runs: deletes expired unpublished pages and accounts past their deletion window.</div></div></div>
+        <div class="sec-head"><span class="tile sev-csam"><span class="ico" data-i="trash"></span></span><div><div class="card-t">Purge</div><div class="card-s">The same jobs the cron runs: deletes expired unpublished pages, accounts past their deletion window, stale like/follow timestamps, unreferenced backup images, and old presence, alert, activity and report-index records.</div></div></div>
         <button class="btn danger block" id="purgego">Run purge now</button>
       </div>
     </div>
@@ -547,6 +547,8 @@ P('retired-draft','Retired draft','omar.haddad@example.com',{age:100,x:{status:'
 P('copied-lyrics-post','Lyrics collection','tom.becker@example.com',{age:60,x:{status:'taken down',deletedAt:N-20*D}});
 P('flagged-demo-page','Flagged demo page','alex.rivera@example.com',{age:2,x:{csamHold:true}});
 pages['letters-to-lisbon'].story.images.cards.push({url:'https://images.example.com/lisbon-card.jpg'});
+users['tom.becker@example.com'].alerts.push({at:N-400*D,kind:'page_takedown',message:'Your page was taken down. Reason: spam.'});
+var stale={timestamps:4,images:6,presence:9,activity:14};
 function Ad(slug,st,used,tot,uv,owner){ads[slug]={slug:slug,status:st,viewsUsed:used,viewsTotal:tot,uniqueViewers:uv,createdAt:N-ri(3,40)*D,ownerEmail:owner,refunded:false}}
 Ad('letters-to-lisbon','active',3120,5000,2480,'lena.fischer@example.com');
 Ad('wedding-moodboard','paused',640,2000,590,'priya.nair@example.com');
@@ -646,7 +648,7 @@ function route(path,o){
     var L4=Object.keys(pages).map(function(s){return pages[s]}).filter(function(x){return x.status==='live'&&(!qq||x.slug.indexOf(qq)>=0)}).sort(function(a,b2){return b2.createdAt-a.createdAt});
     return ok({notes:L4.map(function(x){return{slug:x.slug,title:x.title,createdAt:x.createdAt,story:x.showInStories}}),next:null,total:L4.length})}
   if(p==='/admin/trends')return ok(trends(q));
-  if(p==='/admin/purge'){var n=0;Object.keys(pages).forEach(function(s){var x=pages[s];if(x.status==='unpublished'&&!x.csamHold&&N-x.deletedAt>30*D){delete pages[s];n++}});Object.keys(users).forEach(function(e){var x=users[e];if(x.pendingDeletionAt&&N-x.pendingDeletionAt>30*D){delete users[e];n++}});A('purge','',n+' items');return ok({purged:n})}
+  if(p==='/admin/purge'){var n=0;Object.keys(pages).forEach(function(s){var x=pages[s];if(x.status==='unpublished'&&!x.csamHold&&N-x.deletedAt>30*D){delete pages[s];n++}});Object.keys(users).forEach(function(e){var x=users[e];if(x.pendingDeletionAt&&N-x.pendingDeletionAt>30*D){delete users[e];n++}});Object.keys(users).forEach(function(e){var a=users[e].alerts,k=a.length;users[e].alerts=a.filter(function(x){return N-x.at<=365*D});n+=k-users[e].alerts.length});var rl=reports.length;reports=reports.filter(function(x){return!(x.isCsam&&x.dismissedAt&&N-x.dismissedAt>548*D)});n+=rl-reports.length;Object.keys(stale).forEach(function(k){n+=stale[k];stale[k]=0});A('purge','',n+' items');return ok({purged:n})}
   return err(404,'Not found in demo')
 }
 window.fetch=function(path,o){
@@ -2046,7 +2048,7 @@ $('ext').onchange=function(){
   ask({title:'Load external images?',text:'External images will be fetched by the worker from whatever hosts the page points at. Those hosts see the worker (not your IP) and that a preview was opened, and content from CSAM reports may display.',ok:'Load images',danger:true}).then(function(ok){if(!ok)b.checked=false;else refreshFrames()})
 };
 $('purgego').onclick=function(){
-  ask({title:'Run the purge now?',text:'Permanently deletes pages unpublished more than 30 days ago (except held or locked ones) and accounts past their 30-day deletion window.',ok:'Run purge',danger:true}).then(function(ok){
+  ask({title:'Run the purge now?',text:'Permanently deletes pages unpublished more than 30 days ago (except held or locked ones), accounts past their 30-day deletion window, stale like/follow timestamps, backup images older than 14 days that no note references, presence records older than 90 days, alerts older than a year, activity log entries older than 800 days, and dismissed CSAM report index rows older than 18 months.',ok:'Run purge',danger:true}).then(function(ok){
     if(!ok)return;
     msg('Running purge…','ok');
     api('/admin/purge',{method:'POST'}).then(function(o){msg(o.ok?'Purge done, '+o.j.purged+(o.j.purged===1?' item':' items')+' removed':(o.j.error||'Purge failed'))}).catch(function(){msg('Network error, check your connection')})
