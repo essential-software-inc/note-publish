@@ -26,7 +26,7 @@
  * intentionally open (read-only, cheap).
  */
 
-const MAX_HTML_BYTES = 2 * 1024 * 1024; // 2MB — plan §6, tune as needed
+const MAX_HTML_BYTES = 2 * 1024 * 1024; // 2MB per published page, tune as needed
 // Backup images are stored one object each under sync/<sub>/img/<id> rather
 // than embedded in the single notes.json, so the backup file itself stays
 // small (text only) and a sync only ever uploads images it hasn't sent before.
@@ -57,7 +57,7 @@ const RESERVED_SLUGS = new Set([
   'www', 'assets', 'static', 'favicon.ico', 'robots.txt', 'health',
   'auth', 'sync', 'my', 'presence'
 ]);
-const SOFT_DELETE_RETENTION_MS = 30 * 24 * 60 * 60 * 1000; // 30 days, plan §3.5
+const SOFT_DELETE_RETENTION_MS = 30 * 24 * 60 * 60 * 1000; // soft-deleted pages are kept 30 days before purge
 // CSAM-reported pages and their report records are held for 18 months (548 days),
 // counted from the report (or, for dismissed report records, from dismissal). 18 U.S.C.
 // § 2258A(h) requires preservation for 1 year from the NCMEC CyberTipline submission;
@@ -206,7 +206,7 @@ async function putUser(env, sub, user) {
 
 /* ---------------- Presence (online / guest counts for the admin Overview) ---------------- */
 // Best-effort, reporting-only. Signed-in accounts are touched from requireSessionInfo (any authed
-// call, at most once a minute per isolate). Guests have no account, so they only appear once the
+// call, at most once every PRESENCE_TOUCH_MIN_MS per isolate). Guests have no account, so they only appear once the
 // app POSTs /presence {deviceId} (same per-device id it already sends as viewerId). The table is
 // created lazily; equivalent SQL:
 //   CREATE TABLE presence (id TEXT PRIMARY KEY, kind TEXT NOT NULL, first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL);
@@ -340,7 +340,7 @@ async function handlePresence(env, request) {
 
 const PROFILE_NAME_MAX = 30;
 
-// Cosmetic-only display name (plan: Stories feature) set from the Log Out
+// Cosmetic-only display name set from the Log Out
 // confirm dialog. Not unique, not the real identity — email stays that.
 // Shown only on Subscribed-feed note cards, before the title.
 async function handleSetProfileName(env, request) {
@@ -358,9 +358,8 @@ async function handleSetProfileName(env, request) {
 }
 
 // GET /account/profile-name — reads back the signed-in account's own
-// cosmetic display name (the Log Out dialog previously only ever cached
-// its last local write; this is what lets a second device, or a
-// reinstall, pick up a name set elsewhere instead of showing blank).
+// cosmetic display name. This is what lets a second device, or a
+// reinstall, pick up a name set elsewhere instead of showing blank.
 async function handleGetProfileName(env, request) {
   const sub = await requireSession(env, request);
   if (!sub) return textError(401, 'sign-in required');
@@ -1159,7 +1158,7 @@ async function handleUnpublish(env, request, slug) {
   const meta = await getMeta(env, slug);
   if (!meta || meta.deletedAt) return textError(404, 'not found');
 
-  // Admin bypass (plan §5a/§8): non-cooperative takedowns (DMCA, abuse,
+  // Admin bypass: non-cooperative takedowns (DMCA, abuse,
   // CSAM) don't have the owner's token, so ADMIN_TOKEN lets a force-unpublish
   // through instead. Checked before the owner-token path so an admin never
   // needs a slug's token at all.
@@ -1181,9 +1180,9 @@ async function handleUnpublish(env, request, slug) {
   }
 
   // Snapshot the live content to its own retained key *before* unlinking.
-  // Soft-delete alone isn't enough to guarantee the 30-day retention promise
-  // (plan §3.5): the slug becomes reclaimable immediately, and a republish
-  // under the same slug would overwrite "<slug>.html" — destroying exactly
+  // Soft-delete alone isn't enough to guarantee the 30-day retention window
+  // for unpublished pages: the slug becomes reclaimable immediately, and a
+  // republish under the same slug would overwrite "<slug>.html" — destroying exactly
   // the content a pending report/takedown investigation might need, before
   // the retention window is up. The snapshot is independent of whatever
   // happens to the live slug afterward; handlePurge() below deletes it once
@@ -1197,7 +1196,7 @@ async function handleUnpublish(env, request, slug) {
     });
   }
 
-  // Soft-delete (plan §3.5): unlink immediately (slug 404s). A normal owner
+  // Soft-delete: unlink immediately (slug 404s). A normal owner
   // unpublish also frees the slug for immediate reclaim by design. An admin-
   // forced takedown does not: adminLocked stays true permanently, so the
   // exact same slug can't just be republished right back by whoever it was
@@ -1336,8 +1335,7 @@ function _storiesSeededOrder(arr, seedStr) {
 // it ends up in R2 (decoded data: URI bytes) or, for an already-remote
 // src, the URL string itself. 300KB comfortably covers a compressed
 // device photo; anything bigger just falls back to the title-text avatar
-// client-side. (Previously this bounded the base64 string written
-// straight into the D1 image_url column; see storeStoryImage.)
+// client-side. The image is stored in R2 (see storeStoryImage).
 const STORY_IMAGE_MAX_BYTES = 300 * 1024;
 
 // Pulls the note's raw first image src for the story-ring avatar preview,
@@ -1504,8 +1502,7 @@ const STORY_IMAGE_R2_MARKER = 'r2';
 // Extracts the note's first image for the story-ring avatar and, if it's
 // an inline data: URI, decodes and stores the raw bytes in R2 (see
 // storyImageKey) instead of writing the (often large) base64 string into
-// D1 — D1 image_url previously held the data URI directly, which bloated
-// row size and every /stories response. Returns the value to store in the
+// D1, which would bloat row size and every /stories response. Returns the value to store in the
 // stories.image_url column: STORY_IMAGE_R2_MARKER when an image was
 // written to R2, a plain URL when the note's first image is already a
 // remote (non-data:) src, or null when there's no usable image (no image,
@@ -1697,7 +1694,7 @@ async function handleStoriesStrip(env, request) {
 
 // POST /stories/:slug/seen — marks a story opened by the signed-in
 // viewer, so its ring greys out across every device on this account
-// (plan: ring state is server-synced, not per-device local state).
+// (ring state is server-synced, not per-device local state).
 // Silently no-ops for a slug that isn't actually a live story (already
 // unpublished, toggled off, or never existed) rather than 404ing — the
 // client fires this right after opening whatever the strip handed it,
@@ -2274,7 +2271,7 @@ async function handleServe(env, slug) {
   const obj = await env.NOTES_BUCKET.get(slug + '.html');
   if (!obj) return new Response('Not found', { status: 404 });
 
-  // Security hardening (plan §6): this page is now attacker-reachable at a
+  // Security hardening: this page is now attacker-reachable at a
   // public URL, unlike the locally-opened export it started as. Restrict
   // script-src so a published note can't be turned into an XSS/phishing
   // vector; the exported HTML's own inline sizing script still runs
@@ -2300,9 +2297,9 @@ async function handleServe(env, slug) {
   });
 }
 
-// Best-effort rate limit for POST /report/:slug (plan §11 only covers
-// /publish and /publish/* via dashboard rules — and even those require a
-// Cloudflare zone/domain, unavailable on a bare *.workers.dev deployment).
+// Best-effort rate limit for POST /report/:slug. Cloudflare dashboard rate-limit
+// rules only cover /publish and /publish/*, and even those require a Cloudflare
+// zone/domain, which a bare *.workers.dev deployment doesn't have.
 // A fixed window per IP, stored in the REPORTS namespace: cheap, not
 // perfectly accurate (the window slides forward on every report within it,
 // so sustained abuse can delay the reset), but enough to stop naive
@@ -2391,7 +2388,7 @@ async function handleReport(env, request, slug, ctx) {
   try { body = JSON.parse(raw); } catch (e) { return textError(400, 'invalid JSON body'); }
   const reason = typeof body?.reason === 'string' ? body.reason.slice(0, 40) : 'other';
   const details = typeof body?.details === 'string' ? body.details.slice(0, 2000) : '';
-  // CSAM is split into its own category deliberately (plan §5.1/§5.2): it is
+  // CSAM is split into its own category deliberately: it is
   // the one case where "we don't moderate" doesn't apply. It must be
   // reported to NCMEC's CyberTipline and the content preserved rather than
   // deleted — that response path is a legal/operational process outside
@@ -2450,7 +2447,7 @@ async function handleReport(env, request, slug, ctx) {
   return json({ ok: true });
 }
 
-// Purge job (plan §3.5/§12): deletes R2 blobs (and their KV metadata) for
+// Purge job: deletes R2 blobs (and their KV metadata) for
 // slugs soft-deleted more than SOFT_DELETE_RETENTION_MS ago, plus the
 // pre-overwrite snapshots handleUnpublish() writes under "deleted/". Wired
 // to the cron trigger declared in wrangler.toml via the scheduled() export
@@ -2513,8 +2510,7 @@ async function handlePurge(env) {
   } while (r2Cursor);
 
   // Accounts scheduled for deletion (see handleDeleteAccount) whose
-  // 30-day grace period has elapsed without the owner signing back in —
-  // purge them the same way handleDeleteAccount used to do immediately.
+  // 30-day grace period has elapsed without the owner signing back in.
   let acctCursor;
   do {
     const page = await env.ACCOUNTS.list({ prefix: 'user:', cursor: acctCursor });
@@ -2556,9 +2552,8 @@ async function handlePurge(env) {
 // back in with the same Google account during that window cancels it
 // (see handleGoogleAuth). The actual purge happens in purgeAccountData,
 // invoked by the cron-triggered handlePurge once the grace period
-// elapses. Only revokes *this* session, so the device signs out right
-// away; other signed-in devices fall off naturally via their own 30-day
-// session TTL if the deletion isn't cancelled in time.
+// elapses. Every session on the account is revoked right away, so each
+// signed-in device is signed out the next time it contacts the server.
 async function revokeAllSessions(env, sub) {
   const prefix = 'usess:' + sub + ':';
   let cursor;
@@ -2838,8 +2833,7 @@ async function getCreditBalance(env, sub) {
 
 /* ---- RevenueCat webhook: credits the ledger off a verified purchase ---- */
 
-// product_id (as configured in Play Console/RevenueCat, section 3 of the
-// setup guide) -> views granted. Add a row here for every view-package
+// product_id (as configured in Play Console/RevenueCat) -> views granted. Add a row here for every view-package
 // product created. Kept server-side and not trusted from the client at all.
 const AD_VIEW_PACKAGES = {
   'nb_ad_views_1000': 1000,
@@ -2873,9 +2867,7 @@ async function handleRevenueCatWebhook(env, request) {
   // app_user_id must be the app's Google `sub` for this to land in the
   // right person's balance — set on the client via
   // Purchases.configure({ appUserID: sub }) after Google sign-in, not left
-  // as RevenueCat's own anonymous ID. Flagging this because it's an easy
-  // thing to have missed when the SDK was first wired up for the Pro
-  // unlock, where the app-user-id didn't matter as much.
+  // as RevenueCat's own anonymous ID.
   const sub = event.app_user_id;
   if (!sub) return textError(400, 'missing app_user_id');
 
@@ -3359,7 +3351,7 @@ async function handleAdminReportsReindex(env, request) {
 }
 
 // D1-backed report list. Filters (dismissed, reason, slug substring) and the sort run in SQL; the first
-// page also returns exact aggregates (agg) so the counts no longer depend on how much is loaded. Status
+// page also returns exact aggregates (agg) so the counts don't depend on how much is loaded. Status
 // (live / taken down / ...) lives in KV metadata, so that one filter stays client-side. Returns null on
 // any D1 failure so the caller can fall back to the KV walk.
 async function handleAdminReportsIndexed(env, url) {
@@ -6533,8 +6525,8 @@ export default {
       // Manual trigger for everything scheduled() runs nightly (see below):
       // handlePurge plus pruneAll; the count covers both.
       // POST with the admin token in the X-Admin-Token header, like
-      // the other admin endpoints — it used to be a GET taking the token as
-      // a query param, which left the token in browser history and logs.
+      // the other admin endpoints, so the token never lands in a URL, browser
+      // history or logs.
       //   curl -X POST -H "X-Admin-Token: $TOKEN" https://<worker>/admin/purge
       if (method === 'POST' && pathname === '/admin/purge') {
         const auth = await adminAuthOk(env, request);
