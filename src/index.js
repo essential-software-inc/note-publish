@@ -270,6 +270,15 @@ async function recordActivityDay(env, id, now) {
   if (activityLastDay.size > 5000) activityLastDay.clear();
   activityLastDay.set(id, day);
 }
+// Dismissed CSAM report records expire from KV 18 months after dismissal, but their report_index copy
+// (slug, reason, times; no details) is otherwise only removed when the admin list happens to load it.
+// This sweeps those rows on the same 18-month clock so they can't outlive the record they mirror.
+async function pruneReportIndex(env) {
+  try {
+    await ensureReportIndex(env);
+    await env.ADS_DB.prepare('DELETE FROM report_index WHERE is_csam = 1 AND dismissed_at IS NOT NULL AND dismissed_at < ?').bind(Date.now() - CSAM_RETENTION_MS).run();
+  } catch (e) { /* reporting-only; swallow */ }
+}
 async function pruneActivity(env) {
   try {
     await ensureActivity(env);
@@ -6561,5 +6570,6 @@ export default {
     ctx.waitUntil(prunePresence(env));
     ctx.waitUntil(pruneAlerts(env));
     ctx.waitUntil(pruneActivity(env));
+    ctx.waitUntil(pruneReportIndex(env));
   }
 };
