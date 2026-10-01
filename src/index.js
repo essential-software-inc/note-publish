@@ -745,9 +745,24 @@ async function gcSyncImages(env) {
 
 /* ---------------- Route handlers ---------------- */
 
-async function handleCheckSlug(env, slug) {
+async function handleCheckSlug(env, slug, request) {
   if (!validSlug(slug)) return json({ available: false, reason: 'invalid-format' });
   const meta = await getMeta(env, slug);
+  // A signed-in owner asking about their OWN live slug: still taken (nothing is ever overwritten), but
+  // offer the next free numbered address (my-note-2, -3, ...) so both pages can live side by side.
+  if (request && meta && !meta.deletedAt && !meta.adminLocked && meta.ownerSub) {
+    const me = await requireSession(env, request);
+    if (me && me === meta.ownerSub) {
+      for (let n = 2; n <= 20; n++) {
+        const suffix = '-' + n;
+        const cand = slug.slice(0, 48 - suffix.length).replace(/-+$/, '') + suffix;
+        if (!validSlug(cand)) continue;
+        const m = await getMeta(env, cand);
+        if (!m || (m.deletedAt && !m.adminLocked)) return json({ available: false, yours: true, suggest: cand });
+      }
+      return json({ available: false, yours: true });
+    }
+  }
   // adminLocked (set only by an admin-forced takedown, see handleUnpublish)
   // stays unavailable even after deletedAt — a normal owner unpublish still
   // frees the slug immediately by design, but a DMCA/CSAM/abuse takedown
@@ -885,6 +900,16 @@ function parseStoryTags(raw) {
   catch (e) { return []; }
 }
 
+// A story is only live in the strip/Stories tab for STORIES_LOOKBACK_MS after it's posted. Once that
+// has elapsed the page's showInStories flag is stale, so it counts as OFF (the stories row itself stays
+// so followers' Subscribed feed keeps it for its own longer window). Turning it on again then starts a
+// fresh cycle, because the toggle sees was=false.
+async function storyCycleEnded(env, slug, meta) {
+  if (!meta || !meta.showInStories) return false;
+  const row = await env.ADS_DB.prepare('SELECT created_at FROM stories WHERE slug = ?').bind(slug).first();
+  return !row || row.created_at < Date.now() - STORIES_LOOKBACK_MS;
+}
+
 async function handlePublish(env, request) {
   if (!(await checkPublishRateLimit(env, request))) return textError(429, 'too many publishes, slow down');
   let body;
@@ -971,6 +996,7 @@ async function handleUpdate(env, request, slug) {
   if (!meta || meta.deletedAt) return textError(404, 'not found');
   const tokenHash = await sha256Hex(token);
   if (!timingSafeEqual(tokenHash, meta.tokenHash)) return textError(403, 'invalid token');
+  if (await storyCycleEnded(env, slug, meta)) meta.showInStories = false;
 
   await env.NOTES_BUCKET.put(slug + '.html', html, {
     httpMetadata: { contentType: 'text/html; charset=utf-8' }
@@ -1032,6 +1058,26 @@ async function handleUpdate(env, request, slug) {
 // plus the optional card details; turning a story on reads the already-stored page from R2 for its
 // preview images. The response carries the story row in the same shape GET /stories returns, so the
 // app can put it in the strip straight away instead of making a second request.
+// POST /publish/:slug/relink — a signed-in OWNER re-attaches to their own live page. The app keeps the
+// page's private token on the device and in the account backup; if neither has it (the note was
+// published but its published state never made it into a backup before the data was cleared) the page
+// stays online with no way to edit it. The account itself proves ownership, so this issues a fresh
+// token (replacing the stored hash) and the app links it back to the matching note. Never touches the page.
+async function handleRelink(env, request, slug) {
+  if (!(await checkPublishRateLimit(env, request))) return textError(429, 'too many publishes, slow down');
+  if (!validSlug(slug)) return textError(400, 'invalid slug');
+  const sub = await requireSession(env, request);
+  if (!sub) return textError(401, 'sign-in required');
+  const meta = await getMeta(env, slug);
+  if (!meta || meta.deletedAt || meta.adminLocked) return textError(404, 'not found');
+  if (!meta.ownerSub || meta.ownerSub !== sub) return textError(403, 'not your page');
+  const token = newToken();
+  meta.tokenHash = await sha256Hex(token);
+  if (await storyCycleEnded(env, slug, meta)) meta.showInStories = false;
+  await putMeta(env, slug, meta);
+  return json({ slug, token, title: meta.title || null, createdAt: meta.createdAt, updatedAt: meta.updatedAt, showInStories: !!meta.showInStories });
+}
+
 async function handleSetStories(env, request, slug) {
   if (!(await checkPublishRateLimit(env, request))) return textError(429, 'too many publishes, slow down');
   if (!validSlug(slug)) return textError(400, 'invalid slug');
@@ -1052,6 +1098,7 @@ async function handleSetStories(env, request, slug) {
     if (!adopted) return textError(403, 'sign-in required to show a note in stories');
   }
 
+  if (await storyCycleEnded(env, slug, meta)) meta.showInStories = false;
   const was = !!meta.showInStories;
   const wants = showInStories;
   if (wants && meta.storyBlocked) return textError(403, 'stories are disabled for this page');
@@ -1213,6 +1260,13 @@ async function handleMyPages(env, request) {
   if (!sub) return textError(401, 'sign-in required');
   const prefix = 'owner:' + sub + ':';
   const pages = [];
+  // Slugs whose story is still inside its live window; null if the lookup fails (then nothing is changed).
+  let liveStories = null;
+  try {
+    const { results } = await env.ADS_DB.prepare('SELECT slug FROM stories WHERE author_sub = ? AND created_at >= ?')
+      .bind(sub, Date.now() - STORIES_LOOKBACK_MS).all();
+    liveStories = new Set(results.map(r => r.slug));
+  } catch (e) { /* leave flags as they are */ }
   let cursor;
   do {
     const page = await env.SLUGS.list({ prefix, cursor });
@@ -1220,7 +1274,8 @@ async function handleMyPages(env, request) {
       const slug = key.name.slice(prefix.length);
       const meta = await getMeta(env, slug);
       if (!meta || meta.deletedAt) continue; // stale index entry (e.g. a purge raced this) — skip rather than list a dead page
-      pages.push({ slug, createdAt: meta.createdAt, updatedAt: meta.updatedAt, sizeBytes: meta.sizeBytes });
+      if (meta.showInStories && liveStories && !liveStories.has(slug)) { meta.showInStories = false; await putMeta(env, slug, meta); }
+      pages.push({ slug, createdAt: meta.createdAt, updatedAt: meta.updatedAt, sizeBytes: meta.sizeBytes, showInStories: !!meta.showInStories, title: meta.title || null, noteCreatedAt: meta.noteCreatedAt ?? null });
     }
     cursor = page.list_complete ? undefined : page.cursor;
   } while (cursor);
@@ -6203,13 +6258,17 @@ export default {
 
     try {
       if (method === 'GET' && pathname.startsWith('/check-slug/')) {
-        return handleCheckSlug(env, decodeURIComponent(pathname.slice('/check-slug/'.length)));
+        return handleCheckSlug(env, decodeURIComponent(pathname.slice('/check-slug/'.length)), request);
       }
       if (method === 'GET' && pathname.startsWith('/meta/')) {
         return handleMeta(env, decodeURIComponent(pathname.slice('/meta/'.length)));
       }
       if (method === 'POST' && pathname === '/publish') {
         return handlePublish(env, request);
+      }
+      if (method === 'POST' && pathname.startsWith('/publish/') && pathname.endsWith('/relink')
+          && pathname.length > '/publish/'.length + '/relink'.length) {
+        return handleRelink(env, request, decodeURIComponent(pathname.slice('/publish/'.length, -'/relink'.length)));
       }
       if (method === 'PUT' && pathname.startsWith('/publish/') && pathname.endsWith('/stories')
           && pathname.length > '/publish/'.length + '/stories'.length) {
