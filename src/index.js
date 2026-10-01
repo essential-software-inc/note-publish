@@ -243,8 +243,10 @@ async function touchPresence(env, kind, key) {
 async function prunePresence(env) {
   try {
     await ensurePresence(env);
-    await env.ADS_DB.prepare('DELETE FROM presence WHERE last_seen < ?').bind(Date.now() - PRESENCE_RETENTION_MS).run();
+    const r = await env.ADS_DB.prepare('DELETE FROM presence WHERE last_seen < ?').bind(Date.now() - PRESENCE_RETENTION_MS).run();
+    return ((r && r.meta && r.meta.changes) || 0);
   } catch (e) { /* reporting-only; swallow */ }
+  return 0;
 }
 // Daily-active ledger for the admin trend charts. One row per (UTC day, id) the first time an id is
 // seen that day in an isolate, so distinct counts over any day/week/month/year range are exact from
@@ -276,14 +278,25 @@ async function recordActivityDay(env, id, now) {
 async function pruneReportIndex(env) {
   try {
     await ensureReportIndex(env);
-    await env.ADS_DB.prepare('DELETE FROM report_index WHERE is_csam = 1 AND dismissed_at IS NOT NULL AND dismissed_at < ?').bind(Date.now() - CSAM_RETENTION_MS).run();
+    const r = await env.ADS_DB.prepare('DELETE FROM report_index WHERE is_csam = 1 AND dismissed_at IS NOT NULL AND dismissed_at < ?').bind(Date.now() - CSAM_RETENTION_MS).run();
+    return ((r && r.meta && r.meta.changes) || 0);
   } catch (e) { /* reporting-only; swallow */ }
+  return 0;
 }
 async function pruneActivity(env) {
   try {
     await ensureActivity(env);
-    await env.ADS_DB.prepare('DELETE FROM activity_daily WHERE day < ?').bind(Math.floor(Date.now() / 86400000) - ACTIVITY_RETENTION_DAYS).run();
+    const r = await env.ADS_DB.prepare('DELETE FROM activity_daily WHERE day < ?').bind(Math.floor(Date.now() / 86400000) - ACTIVITY_RETENTION_DAYS).run();
+    return ((r && r.meta && r.meta.changes) || 0);
   } catch (e) { /* reporting-only; swallow */ }
+  return 0;
+}
+
+// The four reporting/retention prunes, shared by the nightly cron and the admin purge button.
+// Returns the total rows deleted.
+async function pruneAll(env) {
+  const n = await Promise.all([prunePresence(env), pruneAlerts(env), pruneActivity(env), pruneReportIndex(env)]);
+  return n.reduce((a, b) => a + b, 0);
 }
 
 function presenceDeviceId(body) {
@@ -3184,8 +3197,12 @@ function reportAlertText(meta, slug, reason) {
   return 'Your note ' + alertNoteName(meta, slug) + ' was reported. ' + alertReason(ALERT_REPORT_REASONS[reason] || 'Other') + ' ' + ALERT_SUSPENSION_NOTE;
 }
 async function pruneAlerts(env) {
-  try { await ensureAlerts(env); await env.ADS_DB.prepare('DELETE FROM alerts WHERE created_at < ?').bind(Date.now() - ALERT_RETENTION_MS).run(); }
-  catch (e) { console.log('alert prune failed: ' + (e && e.message)); }
+  try {
+    await ensureAlerts(env);
+    const r = await env.ADS_DB.prepare('DELETE FROM alerts WHERE created_at < ?').bind(Date.now() - ALERT_RETENTION_MS).run();
+    return ((r && r.meta && r.meta.changes) || 0);
+  } catch (e) { console.log('alert prune failed: ' + (e && e.message)); }
+  return 0;
 }
 
 // GET /alerts?cursor=: the signed-in account's own alerts, newest first, keyset-paginated; total on the first page.
@@ -4950,7 +4967,7 @@ body[data-auth=out] #msg{bottom:calc(24px + env(safe-area-inset-bottom,0px))}
         <button class="btn block" id="relgo">Release slug</button>
       </div>
       <div class="card static">
-        <div class="sec-head"><span class="tile sev-csam"><span class="ico" data-i="trash"></span></span><div><div class="card-t">Purge</div><div class="card-s">The same job the cron runs: deletes expired unpublished pages and accounts past their deletion window.</div></div></div>
+        <div class="sec-head"><span class="tile sev-csam"><span class="ico" data-i="trash"></span></span><div><div class="card-t">Purge</div><div class="card-s">The same jobs the cron runs: deletes expired unpublished pages, accounts past their deletion window, stale like/follow timestamps, unreferenced backup images, and old presence, alert, activity and report-index records.</div></div></div>
         <button class="btn danger block" id="purgego">Run purge now</button>
       </div>
     </div>
@@ -6335,7 +6352,7 @@ $('ext').onchange=function(){
   ask({title:'Load external images?',text:'External images will be fetched by the worker from whatever hosts the page points at. Those hosts see the worker (not your IP) and that a preview was opened, and content from CSAM reports may display.',ok:'Load images',danger:true}).then(function(ok){if(!ok)b.checked=false;else refreshFrames()})
 };
 $('purgego').onclick=function(){
-  ask({title:'Run the purge now?',text:'Permanently deletes pages unpublished more than 30 days ago (except held or locked ones) and accounts past their 30-day deletion window.',ok:'Run purge',danger:true}).then(function(ok){
+  ask({title:'Run the purge now?',text:'Permanently deletes pages unpublished more than 30 days ago (except held or locked ones), accounts past their 30-day deletion window, stale like/follow timestamps, backup images older than 14 days that no note references, presence records older than 90 days, alerts older than a year, activity log entries older than 800 days, and dismissed CSAM report index rows older than 18 months.',ok:'Run purge',danger:true}).then(function(ok){
     if(!ok)return;
     msg('Running purge\u2026','ok');
     api('/admin/purge',{method:'POST'}).then(function(o){msg(o.ok?'Purge done, '+o.j.purged+(o.j.purged===1?' item':' items')+' removed':(o.j.error||'Purge failed'))}).catch(function(){msg('Network error, check your connection')})
@@ -6513,8 +6530,9 @@ export default {
       if (method === 'POST' && pathname === '/webhooks/revenuecat') {
         return handleRevenueCatWebhook(env, request);
       }
-      // Manual trigger for the same purge scheduled() runs nightly (see
-      // below). POST with the admin token in the X-Admin-Token header, like
+      // Manual trigger for everything scheduled() runs nightly (see below):
+      // handlePurge plus pruneAll; the count covers both.
+      // POST with the admin token in the X-Admin-Token header, like
       // the other admin endpoints — it used to be a GET taking the token as
       // a query param, which left the token in browser history and logs.
       //   curl -X POST -H "X-Admin-Token: $TOKEN" https://<worker>/admin/purge
@@ -6522,7 +6540,7 @@ export default {
         const auth = await adminAuthOk(env, request);
         if (auth === 'limited') return textError(429, 'too many failed attempts, try again in 5 minutes');
         if (auth !== 'ok') return textError(403, 'invalid admin token');
-        const purged = await handlePurge(env);
+        const purged = (await handlePurge(env)) + (await pruneAll(env));
         await audit(env, 'purge', null, purged + ' removed');
         return json({ ok: true, purged });
       }
@@ -6567,9 +6585,6 @@ export default {
   // finishes instead of it being killed once this function returns.
   async scheduled(event, env, ctx) {
     ctx.waitUntil(handlePurge(env));
-    ctx.waitUntil(prunePresence(env));
-    ctx.waitUntil(pruneAlerts(env));
-    ctx.waitUntil(pruneActivity(env));
-    ctx.waitUntil(pruneReportIndex(env));
+    ctx.waitUntil(pruneAll(env));
   }
 };
