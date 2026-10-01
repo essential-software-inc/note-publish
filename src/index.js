@@ -1,58 +1,29 @@
 /**
- * Publish-to-Web backend for Note Builder.
- * Implements publish-feature-plan.md sections 3-6, plus Google sign-in and
- * cross-device account sync (notes backup + published-page ownership).
+ * Publish-to-Web backend for Note Builder: publishing, Google sign-in,
+ * account sync, stories, likes, ads and the admin page.
  *
- * Bindings expected (see wrangler.toml):
- *   NOTES_BUCKET  - R2 bucket, stores "<slug>.html", "sync/<sub>/notes.json",
- *                   "story-images/<slug>" (ring-avatar blobs for the
- *                   Stories feature — see storeStoryImage/handleServeStoryImage
- *                   and storeStoryCardImages/handleServeStoryCardImage for
- *                   the ring avatar vs. Subscribed-feed card thumbnails),
- *                   and "profile-images/<sub>" (account profile pictures —
- *                   see handleSetProfileImage/handleServeProfileImage)
- *   SLUGS         - KV namespace, stores JSON metadata per slug, plus
- *                   "owner:<sub>:<slug>" index keys for GET /my/pages
- *   REPORTS       - KV namespace, stores report records
- *   ACCOUNTS      - KV namespace, stores "user:<sub>" records and
- *                   "session:<hash>" tokens (see handleGoogleAuth)
- *   REPORT_WEBHOOK_URL (secret, optional) - POSTed with report JSON for alerting
- *   GOOGLE_CLIENT_IDS (secret) - comma-separated OAuth client IDs accepted
- *                   as the idToken audience (the app's web client ID, and
- *                   any Android client IDs that ever appear as `aud`) —
- *                   see verifyGoogleIdToken
- *   ADS_DB        - D1 database. Originally ads-only (round-robin cursor +
- *                   view-credit ledger, see migrations/0001_ads.sql; also
- *                   ad_viewers, a reporting-only unique-viewer dedup table,
- *                   see migrations/0002_ad_viewers.sql — it never gates
- *                   spend or the views_used/views_total counters, which are
- *                   unrelated and unchanged by it). Also holds stories,
- *                   subscriptions, and story_seen (migrations/0003_stories.sql;
- *                   the story card's description/tags/note-created time are
- *                   migrations/0009_story_card_fields.sql),
- *                   plus likes (migrations/0006_likes.sql), and published_notes, an
- *                   indexed mirror of the SLUGS "owner:<sub>:<slug>" keys used only for
- *                   GET /account/published-notes' keyset pagination (migrations/0010_published_notes.sql),
- *                   for the Stories feature — same rationale as the ads
- *                   tables: feed/ring queries need real joins that KV can't
- *                   do. Page HTML/slugs/tokens stay in SLUGS/NOTES_BUCKET as
- *                   before — a story or an ad IS a published page, just also
- *                   indexed here for the queries that need it.
- *                   Also holds alerts (created on first use by ensureAlerts): automatic
- *                   notices to an account — see createAlert / GET /alerts.
- *   REVENUECAT_WEBHOOK_SECRET (secret) - must match the "Authorization Header
- *                   value" configured on the RevenueCat project's webhook
- *                   (Project settings > Integrations > Webhooks) — see
- *                   handleRevenueCatWebhook. Without this set the webhook
- *                   endpoint refuses everything (fail closed).
+ * Bindings:
+ *   NOTES_BUCKET (R2)  - "<slug>.html", "sync/<sub>/notes.json", sync images,
+ *                        "story-images/<slug>", "profile-images/<sub>"
+ *   SLUGS (KV)         - JSON metadata per slug, plus "owner:<sub>:<slug>" index keys
+ *   REPORTS (KV)       - report records
+ *   ACCOUNTS (KV)      - "user:<sub>" records and "session:<hash>" tokens
+ *   ADS_DB (D1)        - ads, ad_viewers, stories, subscriptions, story_seen, likes,
+ *                        published_notes (indexed mirror of the owner keys, for
+ *                        keyset pagination) and alerts (created by ensureAlerts).
+ *                        Page HTML, slugs and tokens stay in SLUGS/NOTES_BUCKET;
+ *                        D1 only indexes what needs joins. Schema in migrations/.
  *
- * Rate limiting on POST /publish and PUT /publish/:slug is configured via
- * Cloudflare's dashboard Rate Limiting Rules (plan §4) as the primary
- * defense, PLUS an in-code per-IP backstop (checkPublishRateLimit) so the
- * two endpoints that write to R2/D1 are never left unthrottled if the
- * dashboard rule is missing, misconfigured, or reset. GET /@:slug,
- * /check-slug/:slug, and /meta/:slug are intentionally left open
- * (read-only, cheap).
+ * Secrets:
+ *   REPORT_WEBHOOK_URL (optional)  - receives report JSON for alerting
+ *   GOOGLE_CLIENT_IDS              - comma-separated client IDs accepted as idToken audience
+ *   REVENUECAT_WEBHOOK_SECRET      - must match the webhook's Authorization header value;
+ *                                    unset, the webhook refuses everything (fail closed)
+ *
+ * Rate limiting: POST /publish and PUT /publish/:slug are limited by a Cloudflare
+ * dashboard rule, plus an in-code per-IP backstop (checkPublishRateLimit) in case the
+ * rule is missing or misconfigured. GET /@:slug, /check-slug/:slug and /meta/:slug are
+ * intentionally open (read-only, cheap).
  */
 
 const MAX_HTML_BYTES = 2 * 1024 * 1024; // 2MB — plan §6, tune as needed
@@ -5364,7 +5335,7 @@ function repQuery(first){
 }
 function repFilter(){if(rIdx)loadReports(true);else renderAll()}
 function startReindex(){
-  if(reindexing)return;reindexing=true;msg('Indexing reports for search');
+  if(reindexing)return;reindexing=true;msg('Indexing reports for search\u2026');
   (function step(c){
     api('/admin/reports/reindex',{method:'POST',body:{cursor:c}}).then(function(o){
       if(!o.ok){reindexing=false;bad(o);return}
@@ -6315,7 +6286,7 @@ $('ext').onchange=function(){
 $('purgego').onclick=function(){
   ask({title:'Run the purge now?',text:'Permanently deletes pages unpublished more than 30 days ago (except held or locked ones) and accounts past their 30-day deletion window.',ok:'Run purge',danger:true}).then(function(ok){
     if(!ok)return;
-    msg('Running purge','ok');
+    msg('Running purge\u2026','ok');
     api('/admin/purge',{method:'POST'}).then(function(o){msg(o.ok?'Purge done, '+o.j.purged+(o.j.purged===1?' item':' items')+' removed':(o.j.error||'Purge failed'))}).catch(function(){msg('Network error, check your connection')})
   })
 };
