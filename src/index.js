@@ -4558,6 +4558,7 @@ main{position:relative;z-index:1;max-width:720px;margin:0 auto;padding:2px 16px 
 .btn{--bg:var(--s2);--fg:var(--text);--bd:var(--line2);appearance:none;-webkit-appearance:none;align-items:center;justify-content:center;gap:7px;min-height:44px;padding:0 16px;border-radius:14px;border:1px solid var(--bd);background:var(--bg);color:var(--fg);font-size:14.5px;font-weight:650;letter-spacing:-.005em;line-height:1;text-decoration:none;box-shadow:inset 0 1px 0 rgba(255,255,255,.07);transition:transform .12s,filter .15s}
 .btn:active{transform:scale(.97);filter:brightness(1.14)}
 .btn:disabled{opacity:.5;cursor:default}
+.btn.wait::before{content:'';flex:none;width:13px;height:13px;border:2px solid currentColor;border-right-color:transparent;border-radius:50%;animation:spin .8s linear infinite}
 .btn.busy::before{content:"";width:14px;height:14px;border-radius:50%;border:2px solid currentColor;border-right-color:transparent;animation:spin .7s linear infinite}
 @keyframes spin{to{transform:rotate(360deg)}}
 .btn.primary{--bg:linear-gradient(180deg,#A0AEFF,#7F90FF);--fg:var(--accent-ink);--bd:transparent}
@@ -4814,6 +4815,7 @@ main{position:relative;z-index:1;max-width:720px;margin:0 auto;padding:2px 16px 
 #msg{--y:10px;--o:0;position:fixed;left:14px;right:14px;bottom:calc(92px + env(safe-area-inset-bottom,0px));z-index:40;max-width:480px;margin:0 auto;padding:13px 16px;border-radius:16px;background:#232853;border:1px solid var(--line2);box-shadow:0 14px 34px rgba(2,3,18,.6);font-size:14.5px;opacity:var(--o);transform:translateY(var(--y));pointer-events:none;transition:opacity .2s,transform .2s}
 #msg.show{--o:1;--y:0px;pointer-events:auto}
 #msg.err{border-color:rgba(255,106,134,.6);color:#FFD9E0}
+#msg .lnk{margin-left:14px}
 body[data-auth=out] #msg{bottom:calc(24px + env(safe-area-inset-bottom,0px))}
 
 /* sheets */
@@ -5087,19 +5089,29 @@ function num(n){return Number(n||0).toLocaleString()}
 function agoS(t){if(!t)return'-';var s=Math.max(0,(Date.now()-t)/1000);if(s<60)return'now';var m=s/60;if(m<60)return Math.floor(m)+'m';var h=m/60;if(h<24)return Math.floor(h)+'h';var d=h/24;if(d<14)return Math.floor(d)+'d';if(d<60)return Math.floor(d/7)+'w';return Math.floor(d/30)+'mo'}
 function ago(t){if(!t)return'-';var s=Math.max(0,(Date.now()-t)/1000);if(s<60)return'just now';var m=s/60;if(m<60)return Math.floor(m)+'m ago';var h=m/60;if(h<24)return Math.floor(h)+'h ago';var d=h/24;if(d<30)return Math.floor(d)+'d ago';return new Date(t).toLocaleDateString()}
 function dayLabel(t){var d=new Date(t),n=new Date(),a=new Date(d.getFullYear(),d.getMonth(),d.getDate()),b=new Date(n.getFullYear(),n.getMonth(),n.getDate()),diff=Math.round((b-a)/864e5);if(diff===0)return'Today';if(diff===1)return'Yesterday';return d.toLocaleDateString(undefined,{weekday:'long',month:'short',day:'numeric'})}
-function msg(t,k){
+function msg(t,k,act){
   var m=$('msg');clearTimeout(mt);
   if(!t){m.className='';m.textContent='';return}
   k=k||(/fail|error|invalid|denied|too many|not live|enter a slug|enter your|cannot|couldn/i.test(t)?'err':'ok');
   m.textContent=t;m.className='show '+k;
-  mt=setTimeout(function(){m.className=''},k==='err'?7000:4000)
+  if(act){var b=el('button','lnk',act.label);b.type='button';b.onclick=function(){m.className='';act.fn()};m.appendChild(b)}
+  mt=setTimeout(function(){m.className=''},act?act.ms||8000:k==='err'?7000:4000)
 }
 var inflight=0;
 function spin(d){inflight=Math.max(0,inflight+d);$('rf').classList.toggle('spin',inflight>0)}
 function api(path,o){o=o||{};var h={'X-Admin-Token':tok};if(o.body)h['Content-Type']='application/json';
   spin(1);
-  return fetch(path,{method:o.method||'GET',headers:h,body:o.body?JSON.stringify(o.body):undefined}).then(function(r){return r.json().catch(function(){return{}}).then(function(j){spin(-1);return{ok:r.ok,s:r.status,j:j}})},function(e){spin(-1);throw e})}
-function btn(label,cls,fn){var b=document.createElement('button');b.type='button';b.className='btn'+(cls?' '+cls:'');b.textContent=label;b.onclick=function(){fn(b)};return b}
+  return fetch(path,{method:o.method||'GET',headers:h,body:o.body?JSON.stringify(o.body):undefined}).then(function(r){return r.json().catch(function(){return{}}).then(function(j){spin(-1);if(r.ok&&o.method&&o.method!=='GET'&&path.indexOf('/admin/reports/reindex')<0)staleViews();return{ok:r.ok,s:r.status,j:j}})},function(e){spin(-1);throw e})}
+// A change made here (dismiss, take down, restore, story, owner, ad, NCMEC) leaves the other tabs showing old
+// numbers until a reload. Clear what they cached so each one refetches the next time it is opened.
+var repStale=false;
+function staleViews(){
+  ovS.loaded=false;
+  if(cur!=='ads'){$('adlist').textContent='';adCur=''}
+  auAll=[];auNext=null;$('aulist').textContent='';
+  if(cur!=='reports')repStale=true
+}
+function btn(label,cls,fn){var b=document.createElement('button');b.type='button';b.className='btn'+(cls?' '+cls:'');b.textContent=label;b.onclick=function(){var r=fn(b);if(r&&r.then){b.disabled=true;b.classList.add('wait');var d=function(){b.disabled=false;b.classList.remove('wait')};r.then(d,d)}};return b}
 function link(label,href){var a=el('a','btn',label);a.href=href;a.target='_blank';a.rel='noopener';return a}
 function chip(text,cls){return el('span','chip'+(cls?' '+cls:''),text)}
 function aidRow(c,id){if(!id)return;var d=el('div','kv');d.appendChild(el('b',null,'Author ID'));var v=el('span','aid',id);v.style.cssText='font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:13px;cursor:pointer';v.onclick=function(){try{navigator.clipboard.writeText(id).then(function(){msg('Author ID copied')},function(){msg(id)})}catch(e){msg(id)}};d.appendChild(v);c.appendChild(d)}
@@ -5319,6 +5331,7 @@ function showTab(t){
   navChrome();
   $('rf').hidden=t==='tools';
   setSub();
+  if(t==='reports'&&repStale){repStale=false;loadReports(true)}
   if(t==='overview'&&!ovS.loaded){ovS.loaded=true;loadOverview();ovList(true)}
   if(t==='ads'&&!$('adlist').firstChild)loadAds(true);
   if(t==='audit'&&!auAll.length&&!$('aulist').firstChild)loadAudit(true);
@@ -5336,7 +5349,7 @@ function bad(o){if(o.s===403||o.s===429){sessionStorage.removeItem('adm');logged
 
 /* ---------- Reports ---------- */
 function fqv(){return $('fq').value.trim().toLowerCase().replace(/^\\/?@?/,'')}
-function repQuery(){
+function repQuery(first){
   var p=[];
   if($('fdis').checked)p.push('dismissed=1');
   if(rIdx){
@@ -5345,7 +5358,7 @@ function repQuery(){
     if(q)p.push('q='+encodeURIComponent(q));
     if(so&&so!=='new')p.push('sort='+so)
   }
-  if(next)p.push('cursor='+encodeURIComponent(next));
+  if(next&&!first)p.push('cursor='+encodeURIComponent(next));
   return p.join('&')
 }
 function repFilter(){if(rIdx)loadReports(true);else renderAll()}
@@ -5400,10 +5413,12 @@ function renderQueue(base){
   if(sel&&order.indexOf(sel)<0)order.push(sel);
   order.forEach(function(r){key(r,LABEL[r]||r,cnt[r]||0,sevOf(r))})
 }
-function renderAll(){
-  var fr=$('freason').value,fs=$('fstatus').value,grp=$('fgroup').checked,dis=$('fdis').checked,so=$('fsort').value,fq=$('fq').value.trim().toLowerCase().replace(/^\\/?@?/,'');
-  var base=all.filter(function(r){return(!fs||r.status===fs)&&(!fq||r.slug.indexOf(fq)>=0)});
-  renderQueue(base);
+function repBase(){
+  var fs=$('fstatus').value,fq=fqv();
+  return all.filter(function(r){return(!fs||r.status===fs)&&(!fq||r.slug.indexOf(fq)>=0)})
+}
+function repGroups(base){
+  var fr=$('freason').value,grp=$('fgroup').checked,so=$('fsort').value;
   var items=base.filter(function(r){return!fr||r.reason===fr});
   var groups=[],idx={};
   items.forEach(function(r){var k=grp?r.slug:r.key;if(idx[k]==null){idx[k]=groups.length;groups.push({slug:r.slug,key:k,items:[]})}groups[idx[k]].items.push(r)});
@@ -5414,18 +5429,50 @@ function renderAll(){
     if(so==='old')return an-bn;
     return bn-an
   });
-  var L=$('list');L.textContent='';groups.forEach(renderGroup);
+  return groups
+}
+// Subtitle, reason chips and tab badge. Split out of renderAll so a dismiss can refresh them without
+// rebuilding the list (which would wipe the Undo note).
+function repCounts(groups,base){
+  var dis=$('fdis').checked;
+  renderQueue(base);
   var n=groups.length,nc=groups.filter(hasCsam).length;
   repSub=n?(num(n)+(n===1?' page ':' pages ')+(dis?'dismissed':'to review')+(nc&&!dis?', '+nc+' with a CSAM report':'')+(next?'. More to load':'')):'';
-  if(!n){
-    if(all.length||(rIdx&&(fr||fq)))L.appendChild(empty('Nothing matches','Change the filters above to see more reports.','search'));
-    else L.appendChild(empty(dis?'No dismissed reports':'All clear',dis?'Dismissed reports show up here.':'There are no open reports.','check'))
-  }
   if(!dis){var s={},h=false;all.forEach(function(r){s[r.slug]=1;if(r.isCsam)h=true});
     if(rIdx&&rAgg){h=rAgg.csam>0;setBadge(rAgg.pages,h,true)}else setBadge(Object.keys(s).length,h);
     document.body.dataset.alert=h?'csam':''}
   else{setBadge(0);document.body.dataset.alert=''}
-  if(cur==='reports')setSub();
+  if(cur==='reports')setSub()
+}
+function repRefresh(){var b=repBase();repCounts(repGroups(b),b)}
+// Instant counts: take the dismissed reports off the server totals (rAgg) straight away; syncReportAgg
+// then replaces them with the exact figures.
+function repAggDrop(removed){
+  if(!rIdx||!rAgg)return;
+  var left={};all.forEach(function(r){left[r.slug]=1});
+  var gone={};removed.forEach(function(r){
+    rAgg.total=Math.max(0,rAgg.total-1);
+    var k=r.reason||'?';if(rAgg.byReason[k]){rAgg.byReason[k]--;if(rAgg.byReason[k]<=0)delete rAgg.byReason[k]}
+    gone[r.slug]=r.isCsam||gone[r.slug]||0
+  });
+  Object.keys(gone).forEach(function(sl){if(!left[sl]){rAgg.pages=Math.max(0,rAgg.pages-1);if(gone[sl])rAgg.csam=Math.max(0,rAgg.csam-1)}})
+}
+// Indexed mode shows server-side totals (rAgg); after a dismiss they are fetched again so the badge and
+// chips drop straight away.
+function syncReportAgg(){
+  if(!rIdx)return;var g=rGen;
+  api('/admin/reports?'+repQuery(true)).then(function(o){if(g!==rGen||!o.ok||!o.j.agg)return;rAgg=o.j.agg;repRefresh()}).catch(function(){})
+}
+function renderAll(){
+  var fr=$('freason').value,fs=$('fstatus').value,so=$('fsort').value,dis=$('fdis').checked,fq=fqv();
+  var base=repBase(),groups=repGroups(base);
+  var L=$('list');L.textContent='';groups.forEach(renderGroup);
+  var n=groups.length;
+  repCounts(groups,base);
+  if(!n){
+    if(all.length||(rIdx&&(fr||fq)))L.appendChild(empty('Nothing matches','Change the filters above to see more reports.','search'));
+    else L.appendChild(empty(dis?'No dismissed reports':'All clear',dis?'Dismissed reports show up here.':'There are no open reports.','check'))
+  }
   // Filters, the reason chips and "Most reported" only see what's loaded, so pull the remaining pages
   // (up to 1000 reports) before they apply. Stops if a page fails to load or adds nothing.
   if(next&&!fullBusy&&all.length<1000&&(fs||(!rIdx&&(fr||fq||so==='most')))){
@@ -5460,9 +5507,9 @@ function renderGroup(g){
   tools.appendChild(mkSnaps(g.slug,first.status,first.reportedAt,pad,csam,done));
   pad.appendChild(tools);
   var foot=card.foot;
-  if(first.status==='live'){foot.appendChild(btn('Take down','destroy',function(){takedown(g.slug,csam,done)}));if(!csam)foot.appendChild(btn('Release slug',null,function(){release(g.slug,function(){done('unpublished')})}))}
-  if(first.status==='taken down')foot.appendChild(btn('Restore',null,function(){restore(g.slug,csam,0,done)}));
-  if(csam)foot.appendChild(btn(nc?'Add NCMEC record':'Record NCMEC report',null,function(){recordNcmec(g.slug,function(){loadReports(true)})}));
+  if(first.status==='live'){foot.appendChild(btn('Take down','destroy',function(){return takedown(g.slug,csam,done)}));if(!csam)foot.appendChild(btn('Release slug',null,function(){return release(g.slug,function(){done('unpublished')})}))}
+  if(first.status==='taken down')foot.appendChild(btn('Restore',null,function(){return restore(g.slug,csam,0,done)}));
+  if(csam)foot.appendChild(btn(nc?'Add NCMEC record':'Record NCMEC report',null,function(){return recordNcmec(g.slug,function(){all.forEach(function(r){if(r.slug===g.slug)r.ncmec={at:Date.now()}});renderAll()})}));
   if($('fdis').checked)foot.appendChild(btn('Undo dismiss',null,function(b){undismiss(g,b)}));
   else foot.appendChild(btn('Dismiss',null,function(){dismissGroup(g,csam,nc,card.c)}));
   $('list').appendChild(card.c)
@@ -5470,36 +5517,48 @@ function renderGroup(g){
 function sendKeys(path,keys){return Promise.all(keys.map(function(k){return api(path,{method:'POST',body:{key:k}})})).then(function(rs){return rs.every(function(r){return r.ok})})}
 function dropKeys(keys){all=all.filter(function(r){return keys.indexOf(r.key)<0})}
 function dismissGroup(g,csam,nc,card){
-  var keys=g.items.map(function(x){return x.key}),slug=g.slug;
+  var keys=g.items.map(function(x){return x.key}),slug=g.slug,removed=g.items.slice();
   if(csam){
     ask({title:'Dismiss /'+slug+'?',text:'CSAM report: only dismiss once the page is handled and NCMEC has been notified.'+(nc?'':'\\n\\nNO NCMEC REPORT IS RECORDED for this page.')+'\\n\\nThe record is hidden but kept for 18 months and can be brought back from Dismissed.',ok:'Dismiss',danger:true}).then(function(ok){
       if(!ok)return;
-      sendKeys('/admin/dismiss',keys).then(function(ok2){if(!ok2){msg('dismiss failed');return}dropKeys(keys);var r=el('div','card note');r.appendChild(el('span',null,'Dismissed /'+slug));r.appendChild(btn('Undo',null,function(){sendKeys('/admin/undismiss',keys).then(function(){loadReports(true)})}));card.replaceWith(r)})
+      sendKeys('/admin/dismiss',keys).then(function(ok2){if(!ok2){msg('dismiss failed');return}dropKeys(keys);repAggDrop(removed);repRefresh();syncReportAgg();var r=el('div','card note');r.appendChild(el('span',null,'Dismissed /'+slug));r.appendChild(btn('Undo',null,function(){sendKeys('/admin/undismiss',keys).then(function(){loadReports(true)})}));card.replaceWith(r)})
     });
     return}
-  var row=el('div','card note');row.appendChild(el('span',null,'Dismissing /'+slug));
-  var t=setTimeout(function(){sendKeys('/admin/dismiss',keys).then(function(ok){if(ok){dropKeys(keys);row.remove();renderAll()}else{msg('dismiss failed');row.replaceWith(card)}})},8000);
-  row.appendChild(btn('Undo',null,function(){clearTimeout(t);row.replaceWith(card)}));
-  row.appendChild(el('i','count'));
-  card.replaceWith(row)
+  // Instant: the card and the counts change on tap. The request goes out after a short Undo window,
+  // because an ordinary report is deleted for good once dismissed.
+  var prevAgg=rAgg?JSON.parse(JSON.stringify(rAgg)):null;
+  dropKeys(keys);repAggDrop(removed);renderAll();
+  var t=setTimeout(function(){sendKeys('/admin/dismiss',keys).then(function(ok){
+    if(ok){syncReportAgg();return}
+    msg('dismiss failed');all=all.concat(removed);rAgg=prevAgg;renderAll()
+  })},8000);
+  msg('Dismissed /'+slug,'ok',{label:'Undo',fn:function(){clearTimeout(t);all=all.concat(removed);rAgg=prevAgg;renderAll()}})
 }
-function undismiss(g,b){b.disabled=true;sendKeys('/admin/undismiss',g.items.map(function(x){return x.key})).then(function(ok){if(ok)loadReports(true);else{b.disabled=false;msg('undo failed')}})}
+function undismiss(g,b){
+  var keys=g.items.map(function(x){return x.key}),removed=g.items.slice();
+  var prevAgg=rAgg?JSON.parse(JSON.stringify(rAgg)):null;
+  dropKeys(keys);repAggDrop(removed);renderAll();
+  sendKeys('/admin/undismiss',keys).then(function(ok){
+    if(ok){syncReportAgg();return}
+    msg('undo failed');all=all.concat(removed);rAgg=prevAgg;renderAll()
+  })
+}
 
 /* ---------- Actions shared by Reports and Lookup ---------- */
 var REASON_F={label:'Reason (shown to the user)',ph:'e.g. spam, impersonation, hateful content',max:200};
 function reasonOf(v){var r=String(v&&v[0]||'').trim();if(!r)msg('A reason is required');return r}
 function takedown(slug,csam,done){
-  ask({title:'Take down /'+slug+'?',text:csam?'CSAM report: the page is preserved under deleted/ for 18 months. You must still report to NCMEC.':'The slug will be permanently locked.',ok:'Take down',danger:true,fields:[REASON_F]}).then(function(v){
+  return ask({title:'Take down /'+slug+'?',text:csam?'CSAM report: the page is preserved under deleted/ for 18 months. You must still report to NCMEC.':'The slug will be permanently locked.',ok:'Take down',danger:true,fields:[REASON_F]}).then(function(v){
     if(!v)return;var reason=reasonOf(v);if(!reason)return;
-    api('/publish/'+encodeURIComponent(slug),{method:'DELETE',body:{adminToken:tok,reason:reason}}).then(function(o){
+    return api('/publish/'+encodeURIComponent(slug),{method:'DELETE',body:{adminToken:tok,reason:reason}}).then(function(o){
       if(o.ok)done('taken down');else if(o.s===404){msg('/'+slug+' is not live');done('missing')}else msg('takedown failed: '+o.s)}).catch(function(){msg('network error')})
   })
 }
 function release(slug,done){
   if(!slug){msg('Enter a slug or link');return}
-  ask({title:'Release /'+slug+'?',text:'The page goes offline and its likes, story and ad are removed, but the slug is NOT locked: anyone can publish to it again right away. A copy is kept for 30 days.',ok:'Release slug',danger:true}).then(function(ok){
+  return ask({title:'Release /'+slug+'?',text:'The page goes offline and its likes, story and ad are removed, but the slug is NOT locked: anyone can publish to it again right away. A copy is kept for 30 days.',ok:'Release slug',danger:true}).then(function(ok){
     if(!ok)return;
-    api('/publish/'+encodeURIComponent(slug),{method:'DELETE',body:{adminToken:tok,release:true}}).then(function(o){
+    return api('/publish/'+encodeURIComponent(slug),{method:'DELETE',body:{adminToken:tok,release:true}}).then(function(o){
       if(o.ok){msg('/'+slug+' released. It can be published again now.');if(done)done()}
       else if(o.s===404)msg('/'+slug+' is not live (never published, already unpublished, or taken down).');
       else msg('release failed: '+o.s)}).catch(function(){msg('network error')})
@@ -5508,16 +5567,16 @@ function release(slug,done){
 function restore(slug,csam,ts,done){
   var w=csam?'WARNING: this page was reported as CSAM. Restoring puts it back online. Only continue if you have confirmed the report was mistaken.':'It returns as a plain page (story status and likes are not recovered).';
   if(ts)w+='\\n\\nThe copy from '+fmt(ts)+' will be used.';
-  ask({title:'Restore /'+slug+'?',text:w,ok:'Restore',danger:csam}).then(function(ok){
+  return ask({title:'Restore /'+slug+'?',text:w,ok:'Restore',danger:csam}).then(function(ok){
     if(!ok)return;
-    api('/admin/restore/'+encodeURIComponent(slug)+(ts?'?ts='+ts:''),{method:'POST'}).then(function(o){
+    return api('/admin/restore/'+encodeURIComponent(slug)+(ts?'?ts='+ts:''),{method:'POST'}).then(function(o){
       if(o.ok){msg('');done('live')}else msg(o.j.error||'restore failed')}).catch(function(){msg('network error')})
   })
 }
 function recordNcmec(slug,done){
-  ask({title:'Record NCMEC report',text:'For /'+slug+'. Leave the report ID blank if there is none.',ok:'Save record',fields:[{label:'CyberTipline report ID',ph:'Report ID'},{label:'Note',ph:'Optional, up to 200 characters',max:200}]}).then(function(v){
+  return ask({title:'Record NCMEC report',text:'For /'+slug+'. Leave the report ID blank if there is none.',ok:'Save record',fields:[{label:'CyberTipline report ID',ph:'Report ID'},{label:'Note',ph:'Optional, up to 200 characters',max:200}]}).then(function(v){
     if(!v)return;
-    api('/admin/ncmec',{method:'POST',body:{slug:slug,reportId:v[0],note:v[1]||''}}).then(function(o){
+    return api('/admin/ncmec',{method:'POST',body:{slug:slug,reportId:v[0],note:v[1]||''}}).then(function(o){
       if(o.ok){msg('NCMEC report recorded for /'+slug);if(done)done()}else msg(o.j.error||'failed')})
   })
 }
@@ -5556,7 +5615,7 @@ function mkSnaps(slug,status,hitTs,card,csam,done){
         line.appendChild(chip(s.source));
         if(s.ts===hitTs)line.appendChild(chip('this report','warn'));
         line.appendChild(mkView({slug:slug,isCsam:csam},s,d));
-        if(status==='taken down')line.appendChild(btn('Restore this copy','sm',function(){restore(slug,csam,s.ts,done)}));
+        if(status==='taken down')line.appendChild(btn('Restore this copy','sm',function(){return restore(slug,csam,s.ts,done)}));
         d.appendChild(line);
         var m=el('div','snap-meta');m.appendChild(el('code',null,new Date(s.ts).toISOString()+' / '+s.ts+' / '+Math.round(s.size/1024)+' KB'));
         d.insertBefore(m,line.nextSibling);
@@ -5627,20 +5686,20 @@ function renderLookup(d){
   c.appendChild(tools);
   var foot=el('div','foot');
   if(d.status==='live'){
-    foot.appendChild(btn('Take down','destroy',function(){takedown(d.slug,d.csamHold,refresh)}));
-    if(!d.csamHold)foot.appendChild(btn('Release slug',null,function(){release(d.slug,refresh)}));
-    if(d.showInStories)foot.appendChild(btn('Remove from stories',null,function(){storyAct(d.slug,'remove',refresh)}))}
-  if(d.storyBlocked)foot.appendChild(btn('Allow stories again',null,function(){storyAct(d.slug,'allow',refresh)}));
-  if(d.status==='taken down')foot.appendChild(btn('Restore',null,function(){restore(d.slug,d.csamHold,0,refresh)}));
-  if(d.csamHold||d.reports)foot.appendChild(btn(d.ncmec.length?'Add NCMEC record':'Record NCMEC report',null,function(){recordNcmec(d.slug,refresh)}));
+    foot.appendChild(btn('Take down','destroy',function(){return takedown(d.slug,d.csamHold,refresh)}));
+    if(!d.csamHold)foot.appendChild(btn('Release slug',null,function(){return release(d.slug,refresh)}));
+    if(d.showInStories)foot.appendChild(btn('Remove from stories',null,function(){return storyAct(d.slug,'remove',refresh)}))}
+  if(d.storyBlocked)foot.appendChild(btn('Allow stories again',null,function(){return storyAct(d.slug,'allow',refresh)}));
+  if(d.status==='taken down')foot.appendChild(btn('Restore',null,function(){return restore(d.slug,d.csamHold,0,refresh)}));
+  if(d.csamHold||d.reports)foot.appendChild(btn(d.ncmec.length?'Add NCMEC record':'Record NCMEC report',null,function(){return recordNcmec(d.slug,refresh)}));
   out.appendChild(c);
   if(foot.children.length)c.appendChild(foot)
 }
 function storyAct(slug,action,done){
   var rm=action==='remove';
-  ask({title:rm?'Remove /'+slug+' from stories?':'Show /'+slug+' in stories again?',text:rm?'The page stays online. The owner cannot turn stories back on until you allow it.':'',ok:rm?'Remove':'Allow',danger:rm,fields:rm?[REASON_F]:undefined}).then(function(v){
+  return ask({title:rm?'Remove /'+slug+' from stories?':'Show /'+slug+' in stories again?',text:rm?'The page stays online. The owner cannot turn stories back on until you allow it.':'',ok:rm?'Remove':'Allow',danger:rm,fields:rm?[REASON_F]:undefined}).then(function(v){
     if(!v)return;var reason='';if(rm){reason=reasonOf(v);if(!reason)return}
-    api('/admin/story',{method:'POST',body:{slug:slug,action:action,reason:reason}}).then(function(o){if(o.ok){msg('');done()}else msg(o.j.error||'failed')})
+    return api('/admin/story',{method:'POST',body:{slug:slug,action:action,reason:reason}}).then(function(o){if(o.ok){msg('');done()}else msg(o.j.error||'failed')})
   })
 }
 function loadOwner(slug){
@@ -5711,31 +5770,31 @@ function loadOwner(slug){
     }
     var again=function(){loadOwner(slug)};
     var foot=el('div','foot');
-    foot.appendChild(d.suspended?btn('Unsuspend',null,function(){ownerAct(slug,'unsuspend','Unsuspend this account?','',false,'Unsuspend',again)}):btn('Suspend','danger',function(){ownerAct(slug,'suspend','Suspend this account?','It is signed out everywhere and cannot sign in. Pages stay online.',true,'Suspend',again)}));
-    foot.appendChild(d.pendingDeletionAt?btn('Cancel deletion',null,function(){ownerAct(slug,'cancel-delete','Cancel the scheduled deletion?','',false,'Cancel deletion',again)}):btn('Delete account','danger',function(){ownerAct(slug,'delete','Delete this account?','Schedules the account for deletion in 30 days and suspends it. The owner cannot cancel by signing in.',true,'Schedule deletion',again)}));
-    if(d.displayName)foot.appendChild(btn('Clear name',null,function(){ownerAct(slug,'clear-name','Clear this display name?','Removes the name from their stories and Subscribed feed cards. They can set a new one.',true,'Clear name',again)}));
-    if(d.hasProfileImage)foot.appendChild(btn('Remove picture',null,function(){ownerAct(slug,'clear-picture','Remove this profile picture?','Deletes it from storage. They can upload a new one.',true,'Remove picture',again)}));
-    if(d.pages.length)foot.appendChild(btn('Take down all live pages','destroy',function(){takedownAll(d.pages,again)}));
+    foot.appendChild(d.suspended?btn('Unsuspend',null,function(){return ownerAct(slug,'unsuspend','Unsuspend this account?','',false,'Unsuspend',again)}):btn('Suspend','danger',function(){return ownerAct(slug,'suspend','Suspend this account?','It is signed out everywhere and cannot sign in. Pages stay online.',true,'Suspend',again)}));
+    foot.appendChild(d.pendingDeletionAt?btn('Cancel deletion',null,function(){return ownerAct(slug,'cancel-delete','Cancel the scheduled deletion?','',false,'Cancel deletion',again)}):btn('Delete account','danger',function(){return ownerAct(slug,'delete','Delete this account?','Schedules the account for deletion in 30 days and suspends it. The owner cannot cancel by signing in.',true,'Schedule deletion',again)}));
+    if(d.displayName)foot.appendChild(btn('Clear name',null,function(){return ownerAct(slug,'clear-name','Clear this display name?','Removes the name from their stories and Subscribed feed cards. They can set a new one.',true,'Clear name',again)}));
+    if(d.hasProfileImage)foot.appendChild(btn('Remove picture',null,function(){return ownerAct(slug,'clear-picture','Remove this profile picture?','Deletes it from storage. They can upload a new one.',true,'Remove picture',again)}));
+    if(d.pages.length)foot.appendChild(btn('Take down all live pages','destroy',function(){return takedownAll(d.pages,again)}));
     c.appendChild(foot);out.appendChild(c);
     if(c.scrollIntoView)c.scrollIntoView({behavior:'smooth',block:'start'})
   })
 }
 function ownerAct(slug,action,title,text,danger,okLabel,done){
   var needs=action==='suspend'||action==='clear-name'||action==='clear-picture';
-  ask({title:title,text:text,ok:okLabel,danger:danger,fields:needs?[REASON_F]:undefined}).then(function(v){
+  return ask({title:title,text:text,ok:okLabel,danger:danger,fields:needs?[REASON_F]:undefined}).then(function(v){
     if(!v)return;var reason='';if(needs){reason=reasonOf(v);if(!reason)return}
-    api('/admin/owner/action',{method:'POST',body:{slug:slug,action:action,reason:reason}}).then(function(o){if(o.ok){msg('done');done()}else msg(o.j.error||'failed')})
+    return api('/admin/owner/action',{method:'POST',body:{slug:slug,action:action,reason:reason}}).then(function(o){if(o.ok){msg('done');done()}else msg(o.j.error||'failed')})
   })
 }
 function takedownAll(pages,done){
-  ask({title:'Take down all '+pages.length+' live pages?',text:'Takes down every live page of this account and permanently locks their slugs.',ok:'Take down all',danger:true,fields:[REASON_F]}).then(function(v){
+  return ask({title:'Take down all '+pages.length+' live pages?',text:'Takes down every live page of this account and permanently locks their slugs.',ok:'Take down all',danger:true,fields:[REASON_F]}).then(function(v){
     if(!v)return;var reason=reasonOf(v);if(!reason)return;
     var i=0,fails=0;
-    (function step(){
-      if(i>=pages.length){msg(fails?fails+' takedown(s) failed':'All pages taken down');done();return}
+    return new Promise(function(res){(function step(){
+      if(i>=pages.length){msg(fails?fails+' takedown(s) failed':'All pages taken down');done();res();return}
       var s=pages[i++].slug;
       api('/publish/'+encodeURIComponent(s),{method:'DELETE',body:{adminToken:tok,reason:reason}}).then(function(o){if(!o.ok&&o.s!==404)fails++;step()}).catch(function(){fails++;step()})
-    })()
+    })()})
   })
 }
 
@@ -5752,14 +5811,27 @@ function loadAds(reset){
     if(!L.firstChild)L.appendChild(empty('No ads','No ads match this filter.','ads'))
   }).catch(function(){unskel(L);moreBusy($('admore'),false);msg('network error')})
 }
+// The server's result applied to the card on screen: no list reload. Under a status filter a card that no
+// longer matches leaves the list, and the campaign count follows.
+function adApplied(a,action){
+  var to={pause:'paused',resume:'active',takedown:'unpublished'}[action];
+  if(to)a.status=to;
+  var f=$('adst').value;
+  if(f&&a.status!==f){
+    if(a._c)a._c.remove();
+    adTotal=Math.max(0,adTotal-1);
+    SUBS.ads=num(adTotal)+(adTotal===1?' campaign':' campaigns')+' - '+$('adst').textContent.toLowerCase();if(cur==='ads')setSub();
+    if(!$('adlist').firstChild)$('adlist').appendChild(empty('No ads','No ads match this filter.','ads'))
+  }else renderAd(a)
+}
 function adAct(a,action,refund,o){
   o.ok=o.ok||'Confirm';
   var needs=action==='pause'||action==='takedown';
   if(needs)o.fields=[REASON_F];
-  ask(o).then(function(v){
+  return ask(o).then(function(v){
     if(!v)return;var reason='';if(needs){reason=reasonOf(v);if(!reason)return}
-    api('/admin/ad',{method:'POST',body:{slug:a.slug,action:action,refund:!!refund,reason:reason}}).then(function(r){
-      if(r.ok){msg(r.j.refunded?r.j.refunded+' views refunded':'done');loadAds(true)}else msg(r.j.error||'failed')})
+    return api('/admin/ad',{method:'POST',body:{slug:a.slug,action:action,refund:!!refund,reason:reason}}).then(function(r){
+      if(r.ok){msg(r.j.refunded?r.j.refunded+' views refunded':'done');adApplied(a,action)}else msg(r.j.error||'failed')})
   })
 }
 function renderAd(a){
@@ -5773,13 +5845,14 @@ function renderAd(a){
   card.pad.appendChild(k);
   var tools=el('div','tools');tools.appendChild(btn('Lookup',null,function(){openLookup(a.slug)}));card.pad.appendChild(tools);
   var foot=card.foot;
-  if(a.status==='active')foot.appendChild(btn('Pause',null,function(){adAct(a,'pause',0,{title:'Pause /'+a.slug+'?',text:'It stops being served until resumed.',ok:'Pause'})}));
-  if(a.status==='paused')foot.appendChild(btn('Resume',null,function(){adAct(a,'resume',0,{title:'Resume /'+a.slug+'?',ok:'Resume'})}));
+  if(a.status==='active')foot.appendChild(btn('Pause',null,function(){return adAct(a,'pause',0,{title:'Pause /'+a.slug+'?',text:'It stops being served until resumed.',ok:'Pause'})}));
+  if(a.status==='paused')foot.appendChild(btn('Resume',null,function(){return adAct(a,'resume',0,{title:'Resume /'+a.slug+'?',ok:'Resume'})}));
   if(a.status==='active'||a.status==='paused'){
-    foot.appendChild(btn('Take down','danger',function(){adAct(a,'takedown',0,{title:'Take the ad down?',text:'/'+a.slug+' stays online and the '+num(left)+' unused views are forfeited.',ok:'Take down',danger:true})}));
-    if(left>0)foot.appendChild(btn('Take down + refund','danger',function(){adAct(a,'takedown',1,{title:'Take down and refund?',text:'The ad on /'+a.slug+' comes down and '+num(left)+' unused views are refunded to the owner.',ok:'Take down + refund',danger:true})}))}
-  else if(a.status==='unpublished'&&left>0)foot.appendChild(btn('Refund unused','danger',function(){adAct(a,'refund',0,{title:'Refund '+num(left)+' unused views?',text:'They go back to the owner of /'+a.slug+'. This can only be done once.',ok:'Refund',danger:true})}));
-  $('adlist').appendChild(card.c)
+    foot.appendChild(btn('Take down','danger',function(){return adAct(a,'takedown',0,{title:'Take the ad down?',text:'/'+a.slug+' stays online and the '+num(left)+' unused views are forfeited.',ok:'Take down',danger:true})}));
+    if(left>0)foot.appendChild(btn('Take down + refund','danger',function(){return adAct(a,'takedown',1,{title:'Take down and refund?',text:'The ad on /'+a.slug+' comes down and '+num(left)+' unused views are refunded to the owner.',ok:'Take down + refund',danger:true})}))}
+  else if(a.status==='unpublished'&&left>0)foot.appendChild(btn('Refund unused','danger',function(){return adAct(a,'refund',0,{title:'Refund '+num(left)+' unused views?',text:'They go back to the owner of /'+a.slug+'. This can only be done once.',ok:'Refund',danger:true})}));
+  if(a._c&&a._c.parentNode)a._c.replaceWith(card.c);else $('adlist').appendChild(card.c);
+  a._c=card.c
 }
 
 /* ---------- Audit ---------- */
@@ -6223,7 +6296,7 @@ $('fq').oninput=function(){renderAll();if(rIdx){clearTimeout(qT);qT=setTimeout(f
 $('fdis').onchange=function(){loadReports(true)};
 $('lkgo').onclick=function(){doLookup($('lkslug').value)};
 $('lkslug').onkeydown=function(e){if(e.key==='Enter')doLookup($('lkslug').value)};
-$('relgo').onclick=function(){release(slugFrom($('relslug').value),function(){$('relslug').value=''})};
+$('relgo').onclick=function(){return release(slugFrom($('relslug').value),function(){$('relslug').value=''})};
 $('imgs').onchange=function(){
   var b=this;
   if(!b.checked){refreshFrames();return}
