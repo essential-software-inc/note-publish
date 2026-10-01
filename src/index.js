@@ -5092,16 +5092,17 @@ function dayLabel(t){var d=new Date(t),n=new Date(),a=new Date(d.getFullYear(),d
 function msg(t,k,act){
   var m=$('msg');clearTimeout(mt);
   if(!t){m.className='';m.textContent='';return}
-  k=k||(/fail|error|invalid|denied|too many|not live|enter a slug|enter your|cannot|couldn/i.test(t)?'err':'ok');
+  t=String(t).replace(/[.\\s]+$/,'');t=t.charAt(0).toUpperCase()+t.slice(1);
+  k=k||(/fail|error|invalid|denied|too many|not live|enter a slug|enter your|cannot|could not|required|not authorized|turn on/i.test(t)?'err':'ok');
   m.textContent=t;m.className='show '+k;
-  if(act){var b=el('button','lnk',act.label);b.type='button';b.onclick=function(){m.className='';act.fn()};m.appendChild(b)}
+  if(act){var b=el('button','lnk',act.label);b.type='button';b.onclick=function(e){e.stopPropagation();m.className='';act.fn()};m.appendChild(b)}
   mt=setTimeout(function(){m.className=''},act?act.ms||8000:k==='err'?7000:4000)
 }
 var inflight=0;
 function spin(d){inflight=Math.max(0,inflight+d);$('rf').classList.toggle('spin',inflight>0)}
 function api(path,o){o=o||{};var h={'X-Admin-Token':tok};if(o.body)h['Content-Type']='application/json';
   spin(1);
-  return fetch(path,{method:o.method||'GET',headers:h,body:o.body?JSON.stringify(o.body):undefined}).then(function(r){return r.json().catch(function(){return{}}).then(function(j){spin(-1);if(r.ok&&o.method&&o.method!=='GET'&&path.indexOf('/admin/reports/reindex')<0)staleViews();return{ok:r.ok,s:r.status,j:j}})},function(e){spin(-1);throw e})}
+  return fetch(path,{method:o.method||'GET',headers:h,body:o.body?JSON.stringify(o.body):undefined}).then(function(r){return r.json().catch(function(){return{}}).then(function(j){spin(-1);if(r.ok&&o.method&&o.method!=='GET'&&path.indexOf('/admin/reports/reindex')<0)staleViews();return{ok:r.ok,s:r.status,j:j}})},function(e){spin(-1);msg('Network error, check your connection');throw e})}
 // A change made here (dismiss, take down, restore, story, owner, ad, NCMEC) leaves the other tabs showing old
 // numbers until a reload. Clear what they cached so each one refetches the next time it is opened.
 var repStale=false;
@@ -5345,7 +5346,7 @@ function loggedIn(ok){
   showTab(cur);navSync();
   if(cur==='lookup'&&lkSlug){$('lkslug').value=lkSlug;doLookup(lkSlug,lkOwner)}
 }
-function bad(o){if(o.s===403||o.s===429){sessionStorage.removeItem('adm');loggedIn(false)}msg(o.j.error||'failed ('+o.s+')')}
+function bad(o){if(o.s===403||o.s===429){sessionStorage.removeItem('adm');loggedIn(false)}msg(o.j.error||(o.s===403?'Not authorized, check your admin token':o.s===429?'Too many attempts, try again shortly':'Request failed ('+o.s+')'))}
 
 /* ---------- Reports ---------- */
 function fqv(){return $('fq').value.trim().toLowerCase().replace(/^\\/?@?/,'')}
@@ -5369,7 +5370,7 @@ function startReindex(){
       if(!o.ok){reindexing=false;bad(o);return}
       if(o.j.done){reindexing=false;msg('');loadReports(true);return}
       step(o.j.cursor)
-    }).catch(function(){reindexing=false;msg('network error')})
+    }).catch(function(){reindexing=false;msg('Network error, check your connection')})
   })('')
 }
 function loadReports(reset){
@@ -5387,7 +5388,7 @@ function loadReports(reset){
     if(o.j.indexed===false)startReindex();
     if(!o.j.reports.length&&next){return loadReports(false)}
     renderAll()
-  }).catch(function(){if(g!==rGen)return;unskel(L);moreBusy($('more'),false);msg('network error')})
+  }).catch(function(){if(g!==rGen)return;unskel(L);moreBusy($('more'),false);msg('Network error, check your connection')})
 }
 function setBadge(n,hot,exact){var b=$('nb-reports');if(!n){b.hidden=true;return}b.hidden=false;b.textContent=n>99?'99+':String(n)+(next&&!exact?'+':'');b.className='nb'+(hot?' hot':'')}
 function hasCsam(g){return g.items.some(function(x){return x.isCsam})}
@@ -5521,7 +5522,7 @@ function dismissGroup(g,csam,nc,card){
   if(csam){
     ask({title:'Dismiss /'+slug+'?',text:'CSAM report: only dismiss once the page is handled and NCMEC has been notified.'+(nc?'':'\\n\\nNO NCMEC REPORT IS RECORDED for this page.')+'\\n\\nThe record is hidden but kept for 18 months and can be brought back from Dismissed.',ok:'Dismiss',danger:true}).then(function(ok){
       if(!ok)return;
-      sendKeys('/admin/dismiss',keys).then(function(ok2){if(!ok2){msg('dismiss failed');return}dropKeys(keys);repAggDrop(removed);repRefresh();syncReportAgg();var r=el('div','card note');r.appendChild(el('span',null,'Dismissed /'+slug));r.appendChild(btn('Undo',null,function(){sendKeys('/admin/undismiss',keys).then(function(){loadReports(true)})}));card.replaceWith(r)})
+      sendKeys('/admin/dismiss',keys).then(function(ok2){if(!ok2){msg('Could not dismiss /'+slug);return}dropKeys(keys);repAggDrop(removed);repRefresh();syncReportAgg();var r=el('div','card note');r.appendChild(el('span',null,'Dismissed /'+slug));r.appendChild(btn('Undo',null,function(){sendKeys('/admin/undismiss',keys).then(function(){loadReports(true)})}));card.replaceWith(r)})
     });
     return}
   // Instant: the card and the counts change on tap. The request goes out after a short Undo window,
@@ -5530,17 +5531,17 @@ function dismissGroup(g,csam,nc,card){
   dropKeys(keys);repAggDrop(removed);renderAll();
   var t=setTimeout(function(){sendKeys('/admin/dismiss',keys).then(function(ok){
     if(ok){syncReportAgg();return}
-    msg('dismiss failed');all=all.concat(removed);rAgg=prevAgg;renderAll()
+    msg('Could not dismiss /'+slug);all=all.concat(removed);rAgg=prevAgg;renderAll()
   })},8000);
-  msg('Dismissed /'+slug,'ok',{label:'Undo',fn:function(){clearTimeout(t);all=all.concat(removed);rAgg=prevAgg;renderAll()}})
+  msg('Dismissed /'+slug,'ok',{label:'Undo',fn:function(){clearTimeout(t);all=all.concat(removed);rAgg=prevAgg;renderAll();msg('Dismissal undone','ok')}})
 }
 function undismiss(g,b){
   var keys=g.items.map(function(x){return x.key}),removed=g.items.slice();
   var prevAgg=rAgg?JSON.parse(JSON.stringify(rAgg)):null;
   dropKeys(keys);repAggDrop(removed);renderAll();
   sendKeys('/admin/undismiss',keys).then(function(ok){
-    if(ok){syncReportAgg();return}
-    msg('undo failed');all=all.concat(removed);rAgg=prevAgg;renderAll()
+    if(ok){syncReportAgg();msg('Report restored to the open list');return}
+    msg('Could not restore the report');all=all.concat(removed);rAgg=prevAgg;renderAll()
   })
 }
 
@@ -5551,7 +5552,7 @@ function takedown(slug,csam,done){
   return ask({title:'Take down /'+slug+'?',text:csam?'CSAM report: the page is preserved under deleted/ for 18 months. You must still report to NCMEC.':'The slug will be permanently locked.',ok:'Take down',danger:true,fields:[REASON_F]}).then(function(v){
     if(!v)return;var reason=reasonOf(v);if(!reason)return;
     return api('/publish/'+encodeURIComponent(slug),{method:'DELETE',body:{adminToken:tok,reason:reason}}).then(function(o){
-      if(o.ok)done('taken down');else if(o.s===404){msg('/'+slug+' is not live');done('missing')}else msg('takedown failed: '+o.s)}).catch(function(){msg('network error')})
+      if(o.ok){msg('Taken down /'+slug);done('taken down')}else if(o.s===404){msg('Page /'+slug+' is not live');done('missing')}else msg('Could not take down /'+slug+' ('+o.s+')')}).catch(function(){msg('Network error, check your connection')})
   })
 }
 function release(slug,done){
@@ -5559,9 +5560,9 @@ function release(slug,done){
   return ask({title:'Release /'+slug+'?',text:'The page goes offline and its likes, story and ad are removed, but the slug is NOT locked: anyone can publish to it again right away. A copy is kept for 30 days.',ok:'Release slug',danger:true}).then(function(ok){
     if(!ok)return;
     return api('/publish/'+encodeURIComponent(slug),{method:'DELETE',body:{adminToken:tok,release:true}}).then(function(o){
-      if(o.ok){msg('/'+slug+' released. It can be published again now.');if(done)done()}
-      else if(o.s===404)msg('/'+slug+' is not live (never published, already unpublished, or taken down).');
-      else msg('release failed: '+o.s)}).catch(function(){msg('network error')})
+      if(o.ok){msg('Released /'+slug+', it can be published again');if(done)done()}
+      else if(o.s===404)msg('Page /'+slug+' is not live, nothing to release');
+      else msg('Could not release /'+slug+' ('+o.s+')')}).catch(function(){msg('Network error, check your connection')})
   })
 }
 function restore(slug,csam,ts,done){
@@ -5570,14 +5571,14 @@ function restore(slug,csam,ts,done){
   return ask({title:'Restore /'+slug+'?',text:w,ok:'Restore',danger:csam}).then(function(ok){
     if(!ok)return;
     return api('/admin/restore/'+encodeURIComponent(slug)+(ts?'?ts='+ts:''),{method:'POST'}).then(function(o){
-      if(o.ok){msg('');done('live')}else msg(o.j.error||'restore failed')}).catch(function(){msg('network error')})
+      if(o.ok){msg('Restored /'+slug);done('live')}else msg(o.j.error||'Could not restore /'+slug)}).catch(function(){msg('Network error, check your connection')})
   })
 }
 function recordNcmec(slug,done){
   return ask({title:'Record NCMEC report',text:'For /'+slug+'. Leave the report ID blank if there is none.',ok:'Save record',fields:[{label:'CyberTipline report ID',ph:'Report ID'},{label:'Note',ph:'Optional, up to 200 characters',max:200}]}).then(function(v){
     if(!v)return;
     return api('/admin/ncmec',{method:'POST',body:{slug:slug,reportId:v[0],note:v[1]||''}}).then(function(o){
-      if(o.ok){msg('NCMEC report recorded for /'+slug);if(done)done()}else msg(o.j.error||'failed')})
+      if(o.ok){msg('NCMEC report recorded for /'+slug);if(done)done()}else msg(o.j.error||'Could not save the NCMEC record')})
   })
 }
 function mkView(r,s,row){
@@ -5588,11 +5589,11 @@ function mkView(r,s,row){
       b.disabled=true;
       fetch('/admin/snapshot/'+encodeURIComponent(r.slug)+'/'+s.ts,{headers:{'X-Admin-Token':tok}}).then(function(x){return x.text().then(function(t){return{ok:x.ok,t:t}})}).then(function(o){
         b.disabled=false;
-        if(!o.ok){msg('snapshot load failed');return}
+        if(!o.ok){msg('Could not load the snapshot');return}
         fr=document.createElement('iframe');fr.setAttribute('sandbox','');fr.referrerPolicy='no-referrer';
         fr.className='snap-frame';
         row.appendChild(fr);setFrame(fr,o.t);b.textContent='Hide'
-      }).catch(function(){b.disabled=false;msg('network error')})
+      }).catch(function(){b.disabled=false;msg('Network error, check your connection')})
     }
     if(r.isCsam)ask({title:'Open CSAM snapshot?',text:'This snapshot is from a CSAM report. It opens as text and styling only unless an images toggle is on in Tools.',ok:'Open',danger:true}).then(function(ok){if(ok)open()});
     else open()
@@ -5604,9 +5605,10 @@ function mkSnaps(slug,status,hitTs,card,csam,done){
   var t=btn('Snapshots',null,function(){
     if(box){box.remove();box=null;return}
     t.disabled=true;
-    api('/admin/snapshots/'+encodeURIComponent(slug)).then(function(o){
+    api('/admin/snapshots/'+encodeURIComponent(slug)).catch(function(){t.disabled=false;return null}).then(function(o){
+      if(!o)return;
       t.disabled=false;
-      if(!o.ok){msg(o.j.error||'snapshot list failed');return}
+      if(!o.ok){msg(o.j.error||'Could not load snapshots');return}
       box=el('div','snaps');
       if(!o.j.snapshots.length)box.appendChild(el('div','snap-none','No snapshots for /'+slug));
       o.j.snapshots.forEach(function(s){
@@ -5622,7 +5624,7 @@ function mkSnaps(slug,status,hitTs,card,csam,done){
         box.appendChild(d)
       });
       card.appendChild(box)
-    }).catch(function(){t.disabled=false;msg('network error')})
+    }).catch(function(){t.disabled=false;msg('Network error, check your connection')})
   });
   return t
 }
@@ -5647,7 +5649,7 @@ function doLookup(v,owner){
     recents=[slug].concat(recents.filter(function(s){return s!==slug})).slice(0,8);renderRecents();
     renderLookup(o.j);navSync();
     if(owner&&o.j.found&&o.j.hasOwner)loadOwner(slug)
-  }).catch(function(){msg('network error')})
+  }).catch(function(){msg('Network error, check your connection')})
 }
 function renderLookup(d){
   var out=$('lkout');out.textContent='';$('lkowner').textContent='';lkShown=d.slug;
@@ -5699,12 +5701,12 @@ function storyAct(slug,action,done){
   var rm=action==='remove';
   return ask({title:rm?'Remove /'+slug+' from stories?':'Show /'+slug+' in stories again?',text:rm?'The page stays online. The owner cannot turn stories back on until you allow it.':'',ok:rm?'Remove':'Allow',danger:rm,fields:rm?[REASON_F]:undefined}).then(function(v){
     if(!v)return;var reason='';if(rm){reason=reasonOf(v);if(!reason)return}
-    return api('/admin/story',{method:'POST',body:{slug:slug,action:action,reason:reason}}).then(function(o){if(o.ok){msg('');done()}else msg(o.j.error||'failed')})
+    return api('/admin/story',{method:'POST',body:{slug:slug,action:action,reason:reason}}).then(function(o){if(o.ok){msg(rm?'Removed /'+slug+' from stories':'Stories allowed again for /'+slug);done()}else msg(o.j.error||(rm?'Could not remove /'+slug+' from stories':'Could not allow stories for /'+slug))})
   })
 }
 function loadOwner(slug){
   api('/admin/owner?slug='+encodeURIComponent(slug)).then(function(o){
-    if(!o.ok){msg(o.j.error||'failed');return}
+    if(!o.ok){msg(o.j.error||'Could not load the account');return}
     var d=o.j,out=$('lkowner');out.textContent='';
     var c=el('div','card static sev-other');
     if(d.anonymous){c.appendChild(el('div',null,'Anonymous page: no account to act on.'));out.appendChild(c);return}
@@ -5779,11 +5781,13 @@ function loadOwner(slug){
     if(c.scrollIntoView)c.scrollIntoView({behavior:'smooth',block:'start'})
   })
 }
+var OWNER_ACT={suspend:['Account suspended','suspend the account'],unsuspend:['Account unsuspended','unsuspend the account'],'cancel-delete':['Deletion cancelled','cancel the deletion'],'delete':['Account scheduled for deletion','schedule the deletion'],'clear-name':['Display name cleared','clear the display name'],'clear-picture':['Profile picture removed','remove the profile picture']};
 function ownerAct(slug,action,title,text,danger,okLabel,done){
   var needs=action==='suspend'||action==='clear-name'||action==='clear-picture';
   return ask({title:title,text:text,ok:okLabel,danger:danger,fields:needs?[REASON_F]:undefined}).then(function(v){
     if(!v)return;var reason='';if(needs){reason=reasonOf(v);if(!reason)return}
-    return api('/admin/owner/action',{method:'POST',body:{slug:slug,action:action,reason:reason}}).then(function(o){if(o.ok){msg('done');done()}else msg(o.j.error||'failed')})
+    return api('/admin/owner/action',{method:'POST',body:{slug:slug,action:action,reason:reason}}).then(function(o){var OA=OWNER_ACT[action]||['Done','complete the account action'];
+      if(o.ok){msg(OA[0]);done()}else msg(o.j.error||'Could not '+OA[1])})
   })
 }
 function takedownAll(pages,done){
@@ -5791,7 +5795,7 @@ function takedownAll(pages,done){
     if(!v)return;var reason=reasonOf(v);if(!reason)return;
     var i=0,fails=0;
     return new Promise(function(res){(function step(){
-      if(i>=pages.length){msg(fails?fails+' takedown(s) failed':'All pages taken down');done();res();return}
+      if(i>=pages.length){msg(fails?fails+(fails===1?' takedown failed':' takedowns failed'):'All pages taken down');done();res();return}
       var s=pages[i++].slug;
       api('/publish/'+encodeURIComponent(s),{method:'DELETE',body:{adminToken:tok,reason:reason}}).then(function(o){if(!o.ok&&o.s!==404)fails++;step()}).catch(function(){fails++;step()})
     })()})
@@ -5809,7 +5813,7 @@ function loadAds(reset){
     o.j.ads.forEach(renderAd);
     adCur=o.j.next;$('admore').hidden=adCur==null;
     if(!L.firstChild)L.appendChild(empty('No ads','No ads match this filter.','ads'))
-  }).catch(function(){unskel(L);moreBusy($('admore'),false);msg('network error')})
+  }).catch(function(){unskel(L);moreBusy($('admore'),false);msg('Network error, check your connection')})
 }
 // The server's result applied to the card on screen: no list reload. Under a status filter a card that no
 // longer matches leaves the list, and the campaign count follows.
@@ -5824,6 +5828,7 @@ function adApplied(a,action){
     if(!$('adlist').firstChild)$('adlist').appendChild(empty('No ads','No ads match this filter.','ads'))
   }else renderAd(a)
 }
+var AD_DONE={pause:'Ad paused',resume:'Ad resumed',takedown:'Ad taken down',refund:'No views to refund'},AD_VERB={pause:'pause',resume:'resume',takedown:'take down',refund:'refund'};
 function adAct(a,action,refund,o){
   o.ok=o.ok||'Confirm';
   var needs=action==='pause'||action==='takedown';
@@ -5831,7 +5836,7 @@ function adAct(a,action,refund,o){
   return ask(o).then(function(v){
     if(!v)return;var reason='';if(needs){reason=reasonOf(v);if(!reason)return}
     return api('/admin/ad',{method:'POST',body:{slug:a.slug,action:action,refund:!!refund,reason:reason}}).then(function(r){
-      if(r.ok){msg(r.j.refunded?r.j.refunded+' views refunded':'done');adApplied(a,action)}else msg(r.j.error||'failed')})
+      if(r.ok){msg(r.j.refunded?r.j.refunded+(r.j.refunded===1?' view refunded':' views refunded'):AD_DONE[action]||'Done');adApplied(a,action)}else msg(r.j.error||'Could not '+(AD_VERB[action]||'update')+' the ad')})
   })
 }
 function renderAd(a){
@@ -5865,7 +5870,7 @@ function loadAudit(reset){
     if(!o.ok){bad(o);return}
     auAll=auAll.concat(o.j.entries);auNext=o.j.nextCursor;$('aumore').hidden=!auNext;
     renderAudit()
-  }).catch(function(){unskel(L);moreBusy($('aumore'),false);msg('network error')})
+  }).catch(function(){unskel(L);moreBusy($('aumore'),false);msg('Network error, check your connection')})
 }
 function renderAudit(){
   var keys=$('aukeys');keys.textContent='';
@@ -5919,7 +5924,7 @@ function loadOverview(){
     var st=o.j.stats;
     S.forEach(function(s){var v=st[s.getAttribute('data-k')];s.firstChild.textContent=v==null?'-':num(v);s.classList.remove('ld')});
     $('ovnote').textContent='Online means active in the last '+o.j.onlineWindowMin+' minutes. '+(o.j.trackingSince?'Activity tracked since '+new Date(o.j.trackingSince).toLocaleDateString()+'. ':'No activity recorded yet. ')+'Notes cover signed-in publishers only.'
-  }).catch(function(){fail();msg('network error')})
+  }).catch(function(){fail();msg('Network error, check your connection')})
 }
 function ovSync(){
   var users=ovS.view==='users';
@@ -5964,7 +5969,7 @@ function ovList(reset){
     m.hidden=ovS.cur==null;
     $('ovcount').textContent=ovS.total?'Showing '+num(ovS.shown)+' of '+num(ovS.total):'';
     if(!L.firstChild)L.appendChild(empty(users?'No users':'No notes','Nothing matches this search.',users?'users':'reports'))
-  }).catch(function(){if(g!==ovS.gen)return;unskel(L);moreBusy(m,false);msg('network error')})
+  }).catch(function(){if(g!==ovS.gen)return;unskel(L);moreBusy(m,false);msg('Network error, check your connection')})
 }
 
 /* ---------- Trends: growth and decline over time ---------- */
@@ -6113,11 +6118,11 @@ function trInit(){
   });
   [].forEach.call($('trbk').children,function(b){b.onclick=function(){var v=b.getAttribute('data-b');if(trS.bk===v)return;trS.bk=v;trLoad()}});
   [].forEach.call($('trmode').children,function(b){b.onclick=function(){trS.mode=b.getAttribute('data-m');trMetSync();if(trS.M)trChartRender()}});
-  $('trprev').onclick=function(){if(this.getAttribute('aria-disabled')==='true'){msg('No earlier data. Trends start on '+trMINV+'.','ok');return}var p=trPlan();trS.end=trNext(p.bk,p.starts[2*p.N-1],-p.N);trLoad()};
-  $('trnext').onclick=function(){if(this.getAttribute('aria-disabled')==='true'){msg('Already showing the latest '+trS.bk+'.','ok');return}var p=trPlan(),c=trNext(p.bk,p.starts[2*p.N-1],p.N);trS.end=c>=trStart(p.bk,Date.now()+trOFF)?null:c;trLoad()};
+  $('trprev').onclick=function(){if(this.getAttribute('aria-disabled')==='true'){msg('No earlier data, trends start on '+trMINV,'ok');return}var p=trPlan();trS.end=trNext(p.bk,p.starts[2*p.N-1],-p.N);trLoad()};
+  $('trnext').onclick=function(){if(this.getAttribute('aria-disabled')==='true'){msg('Already showing the latest '+trS.bk,'ok');return}var p=trPlan(),c=trNext(p.bk,p.starts[2*p.N-1],p.N);trS.end=c>=trStart(p.bk,Date.now()+trOFF)?null:c;trLoad()};
   $('trnow').onclick=function(){trS.end=null;trLoad()};
   $('trjump').onchange=function(){
-    var v=$('trjump').value;if(!v)return;
+    var v=$('trjump').value;if(!v){trS.end=null;trLoad();return}
     var a=v.split('-'),s=Date.UTC(+a[0],+a[1]-1,+a[2]);
     trS.end=s>=trStart(trS.bk,Date.now()+trOFF)?null:s;trLoad()
   };
@@ -6148,7 +6153,7 @@ function trLoad(){
     $('trchart').classList.remove('busy');
     if(!o.ok){bad(o);return}
     trS.data=o.j;trBuild();trRender()
-  }).catch(function(){if(g!==trS.gen)return;$('trchart').classList.remove('busy');msg('network error')})
+  }).catch(function(){if(g!==trS.gen)return;$('trchart').classList.remove('busy');msg('Network error, check your connection')})
 }
 function trNavSync(){
   var p=trS.plan,N=p.N;
@@ -6260,7 +6265,7 @@ $('back').onclick=goBack;
 $('rf').onclick=function(){
   if(cur==='overview'){loadOverview();ovList(true)}
   else if(cur==='reports')loadReports(true);
-  else if(cur==='lookup'){if(lkSlug)doLookup(lkSlug)}
+  else if(cur==='lookup'){if(lkSlug)doLookup(lkSlug);else msg('Enter a slug or link first')}
   else if(cur==='ads')loadAds(true);
   else if(cur==='audit')loadAudit(true)
 };
@@ -6310,8 +6315,8 @@ $('ext').onchange=function(){
 $('purgego').onclick=function(){
   ask({title:'Run the purge now?',text:'Permanently deletes pages unpublished more than 30 days ago (except held or locked ones) and accounts past their 30-day deletion window.',ok:'Run purge',danger:true}).then(function(ok){
     if(!ok)return;
-    msg('Purging...','ok');
-    api('/admin/purge',{method:'POST'}).then(function(o){msg(o.ok?'Purge done: '+o.j.purged+' item(s) removed':(o.j.error||'purge failed'))}).catch(function(){msg('network error')})
+    msg('Running purge','ok');
+    api('/admin/purge',{method:'POST'}).then(function(o){msg(o.ok?'Purge done, '+o.j.purged+(o.j.purged===1?' item':' items')+' removed':(o.j.error||'Purge failed'))}).catch(function(){msg('Network error, check your connection')})
   })
 };
 $('msg').onclick=function(){msg('')};
