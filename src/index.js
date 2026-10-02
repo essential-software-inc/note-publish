@@ -1239,8 +1239,25 @@ async function handleUnpublish(env, request, slug) {
   ]);
   // An ad IS this page: unpublishing the page must take the ad down too, or
   // /ads/next would keep handing out its HTML until the 30-day purge.
+  // For an admin release, read the ad first: a release is not a penalty, so its unused views are refunded.
+  let relAd = null;
+  if (isAdminRelease) {
+    try { relAd = await env.ADS_DB.prepare('SELECT owner_sub, views_total, views_used, status FROM ads WHERE slug = ?').bind(slug).first(); }
+    catch (e) { console.log('release ad lookup failed: ' + (e && e.message)); }
+  }
   await env.ADS_DB.prepare("UPDATE ads SET status = 'unpublished', updated_at = ? WHERE slug = ? AND status != 'unpublished'")
     .bind(now, slug).run();
+  if (isAdminRelease) {
+    const adStopped = !!(relAd && (relAd.status === 'active' || relAd.status === 'paused'));
+    let refunded = 0;
+    if (adStopped) {
+      try { refunded = await refundAdViews(env, slug, relAd); }
+      catch (e) { console.log('release refund failed: ' + (e && e.message)); }
+      if (refunded) await audit(env, 'ad_refund', slug, 'refunded ' + refunded + ' (release)');
+    }
+    // Not a strike: the kind is "release" and the text avoids the "was paused" / "was taken down" wording that marks ad strikes.
+    await createAlert(env, meta.ownerSub, 'release', 'Your note ' + alertNoteName(meta, slug) + ' was unpublished by an admin. Its address is free, so you can publish it again. Its likes' + (meta.showInStories ? ' and story' : '') + ' were removed' + (adStopped ? ', and its ad was stopped' : '') + '.' + (refunded ? ' ' + refunded + ' unused ad views were refunded to your balance.' : ''));
+  }
   return json({ ok: true });
 }
 
@@ -3360,7 +3377,8 @@ async function handleAdminReportsIndexed(env, url) {
     const sp = url.searchParams;
     const dis = sp.get('dismissed') === '1';
     const reason = (sp.get('reason') || '').slice(0, 40);
-    const q = (sp.get('q') || '').toLowerCase().replace(/[^a-z0-9-]/g, '').slice(0, 48);
+    const aid = adminAidQ(sp.get('q'));
+    const q = aid ? '' : (sp.get('q') || '').toLowerCase().replace(/[^a-z0-9-]/g, '').slice(0, 48);
     const sp2 = sp.get('sort');
     const sort = sp2 === 'old' || sp2 === 'most' ? sp2 : 'new';
     const cursorRaw = sp.get('cursor') || '';
@@ -3368,7 +3386,13 @@ async function handleAdminReportsIndexed(env, url) {
     const cur = sort === 'most' ? null : parseAdminCursor(cursorRaw);
     const dClause = dis ? 'dismissed_at IS NOT NULL' : 'dismissed_at IS NULL';
     const base = [dClause], bb = [];
-    if (q) { base.push('instr(slug, ?) > 0'); bb.push(q); }
+    if (aid) {
+      // Pure D1 (see ADMIN_AID_SLUGS_SQL): no slug list to build or cap, and the report cursor pages the result.
+      const asub = (await adminSubFromAid(env, aid)) || '';
+      try { await ensureAlerts(env); } catch (e) {}
+      base.push('slug IN (' + ADMIN_AID_SLUGS_SQL + ')');
+      bb.push(asub, asub);
+    } else if (q) { base.push('instr(slug, ?) > 0'); bb.push(q); }
     const where = base.slice(), wb = bb.slice();
     if (reason) { where.push('reason = ?'); wb.push(reason); }
     if (cur) { where.push(sort === 'old' ? '(reported_at, key) > (?, ?)' : '(reported_at, key) < (?, ?)'); wb.push(cur.key, cur.id); }
@@ -3719,6 +3743,68 @@ async function adminGate(env, request) {
   if (auth !== 'ok') return textError(403, 'invalid admin token');
   return null;
 }
+// Author IDs are the public handle for an account, so admin searches accept them wherever a slug works.
+// adminAidQ: the lowercased ID if the text is one, else null. adminSubFromAid: its account sub, or null.
+function adminAidQ(raw) {
+  const v = String(raw || '').trim().toLowerCase();
+  return AUTHOR_ID_RE.test(v) ? v : null;
+}
+async function adminSubFromAid(env, aid) {
+  const row = await env.ADS_DB.prepare('SELECT sub FROM authors WHERE author_id = ?').bind(aid).first();
+  return row ? row.sub : null;
+}
+// The slugs an account is tied to for admin filters: its live pages (published_notes) plus every page it was
+// ever sent a report alert about, which is how taken-down pages stay findable (takedown drops the owner key and
+// the published_notes row). One indexed D1 read, and the same set ownerReportStats uses.
+const ADMIN_AID_SLUGS_SQL = "SELECT slug FROM published_notes WHERE author_sub = ? " +
+  "UNION SELECT substr(ref, 1, instr(ref, ':') - 1) FROM alerts WHERE sub = ? AND kind = 'report' AND ref IS NOT NULL";
+// GET /admin/resolve?aid=&cursor=: the account behind an author ID. `slug` is a page the slug-keyed owner
+// endpoints can anchor on (null if the account has none). `slugs` is one page of ADMIN_RESOLVE_PAGE for the
+// client-side Audit filter; `next` is the cursor for the following page, so a big account never makes a search wait.
+const ADMIN_RESOLVE_PAGE = 100;
+const ADMIN_ANCHOR_MAX = 40; // max old pages checked for an anchor (KV reads count as subrequests)
+async function handleAdminResolve(env, request, url) {
+  const g = await adminGate(env, request); if (g) return g;
+  const aid = adminAidQ(url.searchParams.get('aid'));
+  if (!aid) return textError(400, 'invalid author ID');
+  const sub = await adminSubFromAid(env, aid);
+  if (!sub) return textError(404, 'no account with that author ID');
+  try { await ensureAlerts(env); } catch (e) {}
+  const after = (url.searchParams.get('cursor') || '').toLowerCase().replace(/[^a-z0-9-]/g, '').slice(0, 64);
+  let rows = [];
+  try {
+    rows = ((await env.ADS_DB.prepare(
+      'SELECT slug FROM (' + ADMIN_AID_SLUGS_SQL + ") WHERE slug != '' AND slug > ? ORDER BY slug LIMIT ?"
+    ).bind(sub, sub, after, ADMIN_RESOLVE_PAGE + 1).all()).results) || [];
+  } catch (e) { console.log('admin resolve failed: ' + (e && e.message)); }
+  const more = rows.length > ADMIN_RESOLVE_PAGE;
+  if (more) rows.pop();
+  const slugs = rows.map(r => r.slug);
+  let anchor = null;
+  if (!after) {
+    // Prefer a live page; otherwise the first few candidates, checked together, for one that still names the owner.
+    const live = await env.ADS_DB.prepare('SELECT slug FROM published_notes WHERE author_sub = ? ORDER BY created_at DESC LIMIT 1').bind(sub).first();
+    if (live) anchor = live.slug;
+    else {
+      // No live page: check the account's reported pages newest first, 5 at a time in parallel, until one
+      // still names the owner. Capped at ADMIN_ANCHOR_MAX candidates to stay under the subrequest limit.
+      let cands = [];
+      try {
+        cands = (((await env.ADS_DB.prepare(
+          "SELECT substr(ref, 1, instr(ref, ':') - 1) AS slug FROM alerts WHERE sub = ? AND kind = 'report' AND ref IS NOT NULL " +
+          'GROUP BY slug ORDER BY MAX(created_at) DESC LIMIT ?'
+        ).bind(sub, ADMIN_ANCHOR_MAX).all()).results) || []).map(r => r.slug).filter(Boolean);
+      } catch (e) { console.log('admin anchor failed: ' + (e && e.message)); }
+      for (let i = 0; i < cands.length && !anchor; i += 5) {
+        const batch = cands.slice(i, i + 5);
+        const metas = await Promise.all(batch.map(s => getMeta(env, s)));
+        const j = metas.findIndex(m => m && m.ownerSub === sub);
+        if (j >= 0) anchor = batch[j];
+      }
+    }
+  }
+  return json({ slug: anchor, slugs, next: more && slugs.length ? slugs[slugs.length - 1] : null });
+}
 function adminSlugParam(url) {
   const s = (url.searchParams.get('slug') || '').toLowerCase();
   return SLUG_RE.test(s) ? s : null;
@@ -3993,7 +4079,7 @@ async function handleAdminStory(env, request) {
   return json({ ok: true });
 }
 
-// GET /admin/ads?status=&q=&cursor=: ads across all accounts, newest first, keyset-paginated.
+// GET /admin/ads?status=&q=&cursor= (q: slug part or author ID): ads across all accounts, newest first, keyset-paginated.
 const ADMIN_ADS_PAGE = 30;
 async function handleAdminAds(env, request, url) {
   const g = await adminGate(env, request); if (g) return g;
@@ -4001,10 +4087,12 @@ async function handleAdminAds(env, request, url) {
   const status = url.searchParams.get('status') || '';
   const cur = parseAdminCursor(url.searchParams.get('cursor'));
   const filter = ['active', 'paused', 'exhausted', 'unpublished'].includes(status);
-  const q = (url.searchParams.get('q') || '').toLowerCase().replace(/[^a-z0-9-]/g, '').slice(0, 48);
+  const aid = adminAidQ(url.searchParams.get('q'));
+  const q = aid ? '' : (url.searchParams.get('q') || '').toLowerCase().replace(/[^a-z0-9-]/g, '').slice(0, 48);
   const where = [], b = [];
   if (filter) { where.push('a.status = ?'); b.push(status); }
-  if (q) { where.push('a.slug LIKE ?'); b.push('%' + q + '%'); }
+  if (aid) { where.push('a.owner_sub = ?'); b.push((await adminSubFromAid(env, aid)) || ''); }
+  else if (q) { where.push('a.slug LIKE ?'); b.push('%' + q + '%'); }
   const w = where.length ? ' WHERE ' + where.join(' AND ') : '';
   const curSql = cur ? (where.length ? ' AND ' : ' WHERE ') + '(a.created_at, a.slug) < (?, ?)' : '';
   // LIMIT+1 tells us whether another page exists without a second query; the total (first page only)
@@ -4433,11 +4521,12 @@ async function handleAdminNotes(env, request, url) {
   await ensureAdminIndexes(env);
   const sp = url.searchParams;
   const cur = parseAdminCursor(sp.get('cursor'));
-  const q = (sp.get('q') || '').toLowerCase().replace(/[^a-z0-9-]/g, '').slice(0, 48);
+  const aid = adminAidQ(sp.get('q'));
+  const q = aid ? '' : (sp.get('q') || '').toLowerCase().replace(/[^a-z0-9-]/g, '').slice(0, 48);
   const from = ' FROM published_notes n LEFT JOIN stories s ON s.slug = n.slug';
-  const whereSql = q ? ' WHERE n.slug LIKE ?' : '';
-  const bind = q ? [q + '%'] : [];
-  const curSql = cur ? (q ? ' AND ' : ' WHERE ') + '(n.created_at, n.slug) < (?, ?)' : '';
+  const whereSql = aid ? ' WHERE n.author_sub = ?' : q ? ' WHERE n.slug LIKE ?' : '';
+  const bind = aid ? [(await adminSubFromAid(env, aid)) || ''] : q ? [q + '%'] : [];
+  const curSql = cur ? ((aid || q) ? ' AND ' : ' WHERE ') + '(n.created_at, n.slug) < (?, ?)' : '';
   const stmts = [
     env.ADS_DB.prepare('SELECT n.slug, n.created_at, s.title, (s.slug IS NOT NULL) AS story' + from + whereSql + curSql + ' ORDER BY n.created_at DESC, n.slug DESC LIMIT ?')
       .bind(...bind, ...(cur ? [cur.key, cur.id] : []), ADMIN_DIR_PAGE + 1)
@@ -4550,7 +4639,10 @@ main{position:relative;z-index:1;max-width:720px;margin:0 auto;padding:2px 16px 
 .btn:active{transform:scale(.97);filter:brightness(1.14)}
 .btn:disabled{opacity:.5;cursor:default}
 .btn.wait::before{content:'';flex:none;width:13px;height:13px;border:2px solid currentColor;border-right-color:transparent;border-radius:50%;animation:spin .8s linear infinite}
-.btn.busy::before{content:"";width:14px;height:14px;border-radius:50%;border:2px solid currentColor;border-right-color:transparent;animation:spin .7s linear infinite}
+.btn.busy::before{content:"";flex:none;width:14px;height:14px;border-radius:50%;border:2px solid currentColor;border-right-color:transparent;animation:spin .7s linear infinite}
+.btn.busy:disabled{opacity:1}
+.btn.wait:disabled{opacity:1}
+.more.busy,.more.wait{background:linear-gradient(100deg,var(--s2) 35%,rgba(255,255,255,.2) 50%,var(--s2) 65%) 0 0/200% 100%;animation:sweep 1s linear infinite}
 @keyframes spin{to{transform:rotate(360deg)}}
 .btn.primary{--bg:linear-gradient(180deg,#A0AEFF,#7F90FF);--fg:var(--accent-ink);--bd:transparent}
 .btn.danger{--bg:var(--danger-bg);--fg:var(--danger);--bd:rgba(255,106,134,.36)}
@@ -4829,6 +4921,26 @@ body[data-auth=out] #msg{bottom:calc(24px + env(safe-area-inset-bottom,0px))}
 .sheet-field span{display:block;margin:0 2px 6px;font-size:13px;font-weight:600;color:var(--muted)}
 .sheet-body{flex:1 1 auto;min-height:0;overflow-y:auto;overscroll-behavior:contain}
 .sheet-actions{display:grid;gap:10px;flex:none;padding-top:6px}
+.coc-intro{margin:8px 0 12px;color:var(--muted);font-size:15px}
+.sheet-body.coc-c .tile{margin-left:auto;margin-right:auto}
+.sheet-body.coc-c h2,.sheet-body.coc-c .coc-intro{text-align:center}
+.coc-tags{position:sticky;top:0;z-index:2;display:flex;flex-wrap:nowrap;gap:5px;margin:0 -22px 6px;padding:8px 12px 10px;background:linear-gradient(180deg,#242742,#242742 80%,rgba(36,39,66,0))}
+.coc-tags button{flex:1 1 auto;min-width:0;appearance:none;-webkit-appearance:none;cursor:pointer;padding:6px 4px;text-align:center;white-space:nowrap;border-radius:999px;background:var(--s2);border:1px solid var(--line2);color:var(--text);font:inherit;font-size:12.5px;font-weight:700;transition:transform .12s,filter .15s}
+.coc-tags button:active{transform:scale(.95);filter:brightness(1.2)}
+.coc-sec{margin:0 0 12px;padding:14px 15px 10px;border-radius:18px;border:1px solid var(--line);background:var(--well)}
+.coc-sec{transition:border-color .3s,box-shadow .3s}
+.coc-sec.coc-key{border-color:var(--accent)}
+.coc-sec.coc-hit{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-bg)}
+.coc-h{display:flex;align-items:center;gap:9px;margin:0 0 10px;font-size:16px;font-weight:750;letter-spacing:-.01em}
+.coc-n{flex:none;display:grid;place-items:center;width:24px;height:24px;border-radius:50%;background:var(--s3);font-size:12.5px;font-weight:750}
+.coc-sec ul{margin:0;padding:0 0 0 18px}
+.coc-sec li{margin:0 0 7px;font-size:14.5px;line-height:1.45;color:var(--muted)}
+.coc-sec li b{color:var(--text);font-weight:650}
+.coc-ex{margin:2px 0 8px;padding:9px 11px;border-radius:12px;font-size:13.5px;line-height:1.45;color:var(--text)}
+.coc-ex b{display:block;margin-bottom:2px;font-size:12px;letter-spacing:.04em;text-transform:uppercase}
+.coc-ok{background:rgba(70,224,168,.1);border:1px solid rgba(70,224,168,.3)}
+.coc-no{background:var(--danger-bg);border:1px solid rgba(255,106,134,.36)}
+.coc-end{margin:4px 2px 18px;text-align:center;color:var(--muted);font-size:14px}
 
 @media (prefers-reduced-motion:reduce){*,*::before,*::after{transition:none;animation:none}}
 </style></head><body data-auth="out">
@@ -4852,6 +4964,7 @@ body[data-auth=out] #msg{bottom:calc(24px + env(safe-area-inset-bottom,0px))}
     <div class="btitle" id="bttl">Reports</div>
     <button class="icon-btn" id="rf" aria-label="Refresh"><span class="ico" data-i="refresh"></span></button>
     <button class="icon-btn" id="so" aria-label="Sign out"><span class="ico" data-i="lock"></span></button>
+    <button class="icon-btn" id="coc" aria-label="Code of Conduct"><span class="ico" data-i="book"></span></button>
   </div></header>
 
   <main>
@@ -4914,7 +5027,7 @@ body[data-auth=out] #msg{bottom:calc(24px + env(safe-area-inset-bottom,0px))}
         <div class="qkeys" id="qkeys"></div>
       </section>
       <input type="hidden" id="freason" value="">
-      <div class="search"><div class="field-wrap"><span class="ico" data-i="search"></span><input class="field" id="fq" placeholder="Filter by slug" autocomplete="off" autocapitalize="off" spellcheck="false"></div></div>
+      <div class="search"><div class="field-wrap"><span class="ico" data-i="search"></span><input class="field" id="fq" placeholder="Filter by slug or author ID" autocomplete="off" autocapitalize="off" spellcheck="false"></div></div>
       <div class="filters">
         <span class="sel"><button type="button" class="pick" id="fstatus" aria-label="Status" aria-haspopup="listbox" value="">Any status</button><span class="ico" data-i="chev"></span></span>
         <span class="sel"><button type="button" class="pick" id="fsort" aria-label="Sort" aria-haspopup="listbox" value="new">Newest first</button><span class="ico" data-i="chev"></span></span>
@@ -4927,7 +5040,7 @@ body[data-auth=out] #msg{bottom:calc(24px + env(safe-area-inset-bottom,0px))}
 
     <div id="p-lookup" class="pnl">
       <div class="search">
-        <div class="field-wrap"><span class="ico" data-i="search"></span><input class="field" id="lkslug" placeholder="Slug or link" autocomplete="off" autocapitalize="off" spellcheck="false"></div>
+        <div class="field-wrap"><span class="ico" data-i="search"></span><input class="field" id="lkslug" placeholder="Slug, link, author ID" autocomplete="off" autocapitalize="off" spellcheck="false"></div>
         <button class="btn primary" id="lkgo">Look up</button>
       </div>
       <div class="recent" id="lkrec"></div>
@@ -4936,7 +5049,7 @@ body[data-auth=out] #msg{bottom:calc(24px + env(safe-area-inset-bottom,0px))}
     </div>
 
     <div id="p-ads" class="pnl">
-      <div class="search"><div class="field-wrap"><span class="ico" data-i="search"></span><input class="field" id="adq" placeholder="Filter by slug" autocomplete="off" autocapitalize="off" spellcheck="false"></div></div>
+      <div class="search"><div class="field-wrap"><span class="ico" data-i="search"></span><input class="field" id="adq" placeholder="Filter by slug or author ID" autocomplete="off" autocapitalize="off" spellcheck="false"></div></div>
       <div class="filters">
         <span class="sel"><button type="button" class="pick" id="adst" aria-label="Ad status" aria-haspopup="listbox" value="">All ads</button><span class="ico" data-i="chev"></span></span>
       </div>
@@ -4945,6 +5058,7 @@ body[data-auth=out] #msg{bottom:calc(24px + env(safe-area-inset-bottom,0px))}
     </div>
 
     <div id="p-audit" class="pnl">
+      <div class="search"><div class="field-wrap"><span class="ico" data-i="search"></span><input class="field" id="auq" placeholder="Filter by slug, detail or author ID" autocomplete="off" autocapitalize="off" spellcheck="false"></div></div>
       <div class="filters" id="aukeys"></div>
       <div class="tl" id="aulist"></div>
       <button class="btn block more" id="aumore" hidden>Load more</button>
@@ -4990,6 +5104,7 @@ var ICON={
   clear:svg('<circle cx="12" cy="12" r="9" fill="currentColor" fill-opacity=".22" stroke="none"/><path d="m9 9 6 6M15 9l-6 6"/>'),
   chev:svg('<path d="m6 9.5 6 6 6-6"/>'),
   refresh:svg('<g transform="translate(12 12) scale(.8) translate(-12 -12)" stroke-width="2.25"><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/><polyline points="23 4 23 10 17 10"/></g>'),
+  book:svg("<path d='M12 7.2C10.6 5.8 8.4 5 5 5v12.5c3.4 0 5.6.8 7 2.2 1.4-1.4 3.6-2.2 7-2.2V5c-3.4 0-5.6.8-7 2.2Z'/><path d='M12 7.2v12.5'/>"),
   lock:svg('<rect x="5" y="10.5" width="14" height="10" rx="2.5"/><path d="M8.5 10.5V8a3.5 3.5 0 0 1 7 0v2.5"/>'),
   unlock:svg('<rect x="5" y="10.5" width="14" height="10" rx="2.5"/><path d="M8.5 10.5V8a3.5 3.5 0 0 1 6.6-1.6"/>'),
   bluebook:'<svg viewBox="0 0 90 105" fill="none" stroke="currentColor" stroke-width="13" aria-hidden="true"><rect x="6" y="28.5" width="54" height="27" rx="6" transform="rotate(55 33 42)"/><rect x="30" y="48.5" width="54" height="27" rx="6" transform="rotate(55 57 62)"/></svg>',
@@ -5030,7 +5145,7 @@ function clearable(i){
   b.onclick=function(){VALD.set.call(i,'');sync();i.dispatchEvent(new Event('input',{bubbles:true}));i.focus()};
   sync()
 }
-function clearableAll(){['tok','ovq','fq','adq','lkslug','relslug'].forEach(function(id){clearable($(id))})}
+function clearableAll(){['tok','ovq','fq','adq','auq','lkslug','relslug'].forEach(function(id){clearable($(id))})}
 
 /* ---------- Snapshot preview (sandboxed) ---------- */
 function toDataUrl(b){return new Promise(function(res){var r=new FileReader();r.onload=function(){res(r.result)};r.onerror=function(){res(null)};r.readAsDataURL(b)})}
@@ -5132,7 +5247,7 @@ function api(path,o){o=o||{};var h={'X-Admin-Token':tok};if(o.body)h['Content-Ty
 // numbers until a reload. Clear what they cached so each one refetches the next time it is opened.
 var repStale=false;
 function staleViews(){
-  ovS.loaded=false;
+  aidMap={};ovS.loaded=false;
   if(cur!=='ads'){$('adlist').textContent='';adCur=''}
   auAll=[];auNext=null;$('aulist').textContent='';
   if(cur!=='reports')repStale=true
@@ -5147,7 +5262,7 @@ function slugEl(s){var d=el('div','slug');d.appendChild(el('span','sl','/'));d.a
 function tile(sev,icon){var t=el('span','tile sev-'+sev);t.appendChild(ico(icon));return t}
 function empty(title,text,icon){var d=el('div','empty'),w=el('div','empty-ico');w.appendChild(ico(icon||'check'));d.appendChild(w);d.appendChild(el('div','empty-t',title));if(text)d.appendChild(el('div','empty-s',text));return d}
 function skel(c,n,k){for(var i=0;i<n;i++)c.appendChild(el('div','skel'+(k?' '+k:'')))}
-function moreBusy(b,on){b.disabled=!!on;b.classList.toggle('busy',!!on);if(on){b._t=b.textContent;b.textContent='Loading'}else if(b._t){b.textContent=b._t;b._t=null}}
+function moreBusy(b,on){clearTimeout(b._bt);if(on){if(!b._t)b._t=b.textContent;b._s=Date.now();b.disabled=true;b.classList.add('busy');b.textContent='Loading\u2026';return}var done=function(){b.disabled=false;b.classList.remove('busy');if(b._t){b.textContent=b._t;b._t=null}},w=b._s?400-(Date.now()-b._s):0;if(w>0)b._bt=setTimeout(done,w);else done()}
 function unskel(c){[].forEach.call(c.querySelectorAll('.skel'),function(n){n.remove()})}
 
 /* ---------- Tap-to-view stored images (story previews, profile picture) ---------- */
@@ -5198,9 +5313,10 @@ function ask(o){
     sh.setAttribute('role','dialog');sh.setAttribute('aria-modal','true');sh.setAttribute('aria-label',o.title);
     sh.appendChild(el('div','grab'));
     var sb=el('div','sheet-body');sh.appendChild(sb);
-    sb.appendChild(tile(o.danger?'csam':'ad',o.danger?'alert':'shield'));
+    sb.appendChild(tile(o.sev||(o.danger?'csam':'ad'),o.icon||(o.danger?'alert':'shield')));
     sb.appendChild(el('h2',null,o.title));
     if(o.text)sb.appendChild(el('div','sheet-text',o.text));
+    if(o.node){sb.classList.add('coc-c');sb.style.margin='0 -22px';sb.style.padding='0 22px';sb.appendChild(o.node)}
     var inputs=[];
     (o.fields||[]).forEach(function(f){
       var l=el('label','sheet-field');l.appendChild(el('span',null,f.label));
@@ -5210,7 +5326,7 @@ function ask(o){
     var acts=el('div','sheet-actions');
     var okb=btn(o.ok||'Confirm',o.danger?'destroy block':'primary block',function(){fin(inputs.length?inputs.map(function(i){return i.value}):true)});
     var cb=btn('Cancel','quiet block',function(){fin(false)});
-    acts.appendChild(okb);acts.appendChild(cb);sh.appendChild(acts);
+    acts.appendChild(okb);if(!o.single)acts.appendChild(cb);sh.appendChild(acts);
     back.appendChild(sh);document.body.appendChild(back);
     function kd(e){if(e.key==='Escape')fin(false);else if(e.key==='Enter'&&inputs.length&&e.target.tagName==='INPUT')okb.click()}
     function fin(v,keep){
@@ -5225,7 +5341,7 @@ function ask(o){
     var api2={done:fin};curSheet=api2;sheetOpen();
     back.onclick=function(e){if(e.target===back)fin(false)};
     document.addEventListener('keydown',kd);
-    requestAnimationFrame(function(){back.classList.add('open');(inputs[0]||cb).focus()})
+    requestAnimationFrame(function(){back.classList.add('open');(inputs[0]||(o.single?okb:cb)).focus()})
   })
 }
 
@@ -5316,7 +5432,7 @@ function navPush(){
 }
 function navSync(){navRec(state(),false)}
 function applyNav(s,y){
-  if(s.t==='lookup'){lkSlug=s.slug||'';lkOwner=!!s.o}
+  if(s.t==='lookup'){lkAid='';lkSlug=s.slug||'';lkOwner=!!s.o}
   showTab(s.t);
   if(s.t==='lookup'){
     $('lkslug').value=lkSlug;
@@ -5340,7 +5456,7 @@ window.addEventListener('popstate',function(e){
   applyNav(s,navY[navI]);navChrome()
 });
 function setSub(){
-  var s=cur==='reports'?repSub:(cur==='lookup'&&lkSlug)?'/'+lkSlug:SUBS[cur]||'';
+  var s=cur==='reports'?repSub:(cur==='lookup'&&lkSlug)?(lkAid?'Author ID '+lkAid:'/'+lkSlug):SUBS[cur]||'';
   $('sub').textContent=s
 }
 function xHint(e){var l=e.scrollLeft,m=e.scrollWidth-e.clientWidth;e.style.setProperty('--fl',l>4?'28px':'0px');e.style.setProperty('--fr',m-l>4?'28px':'0px')}
@@ -5441,7 +5557,8 @@ function renderQueue(base){
 }
 function repBase(){
   var fs=$('fstatus').value,fq=fqv();
-  return all.filter(function(r){return(!fs||r.status===fs)&&(!fq||r.slug.indexOf(fq)>=0)})
+  var fa=isAid(fq)?(rIdx?{all:1}:(aidMap[fq]||{set:{}})):null;
+  return all.filter(function(r){return(!fs||r.status===fs)&&(!fq||(fa?(fa.all||!!fa.set[r.slug]):r.slug.indexOf(fq)>=0))})
 }
 function repGroups(base){
   var fr=$('freason').value,grp=$('fgroup').checked,so=$('fsort').value;
@@ -5582,7 +5699,7 @@ function takedown(slug,csam,done){
 }
 function release(slug,done){
   if(!slug){msg('Enter a slug or link');return}
-  return ask({title:'Release /'+slug+'?',text:'The page goes offline and its likes, story and ad are removed, but the slug is NOT locked: anyone can publish to it again right away. A copy is kept for 30 days.',ok:'Release slug',danger:true}).then(function(ok){
+  return ask({title:'Release /'+slug+'?',text:'The page goes offline and its likes, story and ad are removed, but the slug is NOT locked: anyone can publish to it again right away. The owner gets an alert and unused ad views are refunded. A copy is kept for 30 days.',ok:'Release slug',danger:true}).then(function(ok){
     if(!ok)return;
     return api('/publish/'+encodeURIComponent(slug),{method:'DELETE',body:{adminToken:tok,release:true}}).then(function(o){
       if(o.ok){msg('Released /'+slug+', it can be published again');if(done)done()}
@@ -5655,18 +5772,32 @@ function mkSnaps(slug,status,hitTs,card,csam,done){
 }
 
 /* ---------- Lookup and owner ---------- */
-function lookupHint(){lkShown='';var o=$('lkout');o.textContent='';o.appendChild(empty('Look up a page','Enter a slug or paste a link to see its status, owner and history.','search'))}
+function lookupHint(){lkShown='';var o=$('lkout');o.textContent='';o.appendChild(empty('Look up a page','Enter a slug or author ID, or paste a link, to see its status, owner and history.','search'))}
 function renderRecents(){
   var r=$('lkrec');r.textContent='';
   recents.forEach(function(s){var b=el('button','rc','/'+s);b.type='button';b.onclick=function(){$('lkslug').value=s;doLookup(s)};r.appendChild(b)})
 }
 function openLookup(slug){
-  lkSlug=slug;lkOwner=false;showTab('lookup');navPush();$('lkslug').value=slug;window.scrollTo(0,0);doLookup(slug)
+  lkAid='';lkSlug=slug;lkOwner=false;showTab('lookup');navPush();$('lkslug').value=slug;window.scrollTo(0,0);doLookup(slug)
 }
 function openOwner(slug){lkOwner=true;navPush();loadOwner(slug)}
+// An author ID opens its account's owner view, anchored on one of its pages (the owner endpoints are keyed by slug).
+function lookupAid(a){
+  var g=++lkGen;
+  aidResolve(a).then(function(r){
+    if(g!==lkGen)return;
+    if(r.none){msg('No account with that author ID');return}
+    if(!r.slug){msg('That account has no pages to open');return}
+    msg('');
+    $('lkout').textContent='';lkShown=r.slug;lkAid=a;lkSlug=r.slug;lkOwner=true;setSub();navSync();
+    loadOwner(r.slug)
+  },function(){})
+}
 function doLookup(v,owner){
-  var slug=slugFrom(v);if(!slug){msg('Enter a slug or link');return}
-  lkSlug=slug;lkOwner=!!owner;setSub();var g=++lkGen;
+  var raw=(v||'').trim().toLowerCase();
+  if(isAid(raw)){lookupAid(raw);return}
+  var slug=slugFrom(v);if(!slug){msg('Enter a slug, link or author ID');return}
+  lkAid='';lkSlug=slug;lkOwner=!!owner;setSub();var g=++lkGen;
   api('/admin/lookup?slug='+encodeURIComponent(slug)).then(function(o){
     if(g!==lkGen)return;
     if(!o.ok){bad(o);return}
@@ -5829,6 +5960,21 @@ function takedownAll(pages,done){
 }
 
 /* ---------- Ads ---------- */
+var AID_RE=/^a_[a-f0-9]{32}$/,aidMap={},lkAid='';
+function isAid(v){return AID_RE.test(v)}
+// An author ID -> {slug: an anchor page for the slug-keyed owner view, set: every slug the account has}, cached.
+// {none:true} when nobody has that ID. Cleared whenever an admin change makes cached views stale.
+// The slug set comes a page at a time (100): aidMore adds the next page so a search never waits on a big account.
+function aidFetch(v,cur){
+  return api('/admin/resolve?aid='+encodeURIComponent(v)+(cur?'&cursor='+encodeURIComponent(cur):'')).then(function(o){
+    var r=aidMap[v]||{slug:null,set:{},next:null};
+    if(o.ok){if(!cur)r.slug=o.j.slug||null;(o.j.slugs||[]).forEach(function(x){r.set[x]=1});r.next=o.j.next||null}
+    else if(!cur)r.none=true;
+    aidMap[v]=r;return r
+  })
+}
+function aidResolve(v){return aidMap[v]?Promise.resolve(aidMap[v]):aidFetch(v,'')}
+function aidMore(v){var r=aidMap[v];return r&&r.next?aidFetch(v,r.next):Promise.resolve(r)}
 var adT=null,adFocus='';
 function adqv(){return $('adq').value.trim().toLowerCase().replace(/^[/@]+/,'')}
 // Lookup's "Ads tab": show the ad of one note, opened, in the Ads screen (status filter reset so it cannot be hidden).
@@ -5897,30 +6043,50 @@ function renderAd(a){
 }
 
 /* ---------- Audit ---------- */
-function actTone(a){a=String(a||'');if(/take|purge|suspend|delete|ban/.test(a)&&!/unsuspend/.test(a))return'bad';if(/restore|release|unsuspend|allow|refund|resume/.test(a))return'good';return''}
+var ACT_LBL={takedown:'Takedown',release:'Release',restore:'Restore',dismiss:'Dismiss',undismiss:'Undismiss',purge:'Purge',ncmec_recorded:'NCMEC recorded',owner_suspend:'Suspend account',owner_unsuspend:'Unsuspend account',owner_delete:'Delete account','owner_cancel-delete':'Cancel deletion','owner_clear-name':'Clear name','owner_clear-picture':'Clear picture',story_remove:'Story removed',story_allow:'Story allowed',ad_pause:'Ad paused',ad_resume:'Ad resumed',ad_takedown:'Ad taken down',ad_refund:'Ad refunded'};
+function actLbl(a){a=String(a||'');if(ACT_LBL[a])return ACT_LBL[a];a=a.replace(/[_-]+/g,' ').trim();return a.charAt(0).toUpperCase()+a.slice(1)}
+function actTone(a){a=String(a||'');if(/take|purge|suspend|delete|ban/.test(a)&&!/unsuspend|cancel/.test(a))return'bad';if(/restore|release|unsuspend|cancel|allow|refund|resume/.test(a))return'good';return''}
+var auT=null,auBusy=false;
+function auqv(){return $('auq').value.trim().toLowerCase().replace(/^[/@]+/,'')}
+function auHit(e,q){if(isAid(q))return!!(aidMap[q]&&aidMap[q].set[e.slug]);return!q||String(e.slug||'').toLowerCase().indexOf(q)>-1||String(e.detail||'').toLowerCase().indexOf(q)>-1}
+// The log pages from KV with no server-side search, so a query also pulls in a few older pages (3) to search them.
+function auSearch(){
+  var av=auqv();if(isAid(av)&&!aidMap[av])aidResolve(av).then(function(){if(auqv()===av)renderAudit()},function(){});
+  renderAudit();
+  var n=0;
+  (function step(){
+    if(!auqv()||!auNext||n++>=3)return;
+    var before=auAll.length;
+    loadAudit(false).then(function(){if(auAll.length>before)step()})
+  })()
+}
 function loadAudit(reset){
   var L=$('aulist');
+  if(!reset&&auBusy)return Promise.resolve();
+  auBusy=true;
   if(reset){auNext=null;auAll=[];L.textContent='';skel(L,4)}else moreBusy($('aumore'),true);
   return api('/admin/audit'+(auNext?'?cursor='+encodeURIComponent(auNext):'')).then(function(o){
-    unskel(L);moreBusy($('aumore'),false);
+    auBusy=false;unskel(L);moreBusy($('aumore'),false);
     if(!o.ok){bad(o);return}
     auAll=auAll.concat(o.j.entries);auNext=o.j.nextCursor;$('aumore').hidden=!auNext;
     renderAudit()
-  }).catch(function(){unskel(L);moreBusy($('aumore'),false);msg('Network error, check your connection')})
+  }).catch(function(){auBusy=false;unskel(L);moreBusy($('aumore'),false);msg('Network error, check your connection')})
 }
 function renderAudit(){
   var keys=$('aukeys');keys.textContent='';
-  var seen=[],cnt={};auAll.forEach(function(e){if(cnt[e.action]==null){cnt[e.action]=0;seen.push(e.action)}cnt[e.action]++});
+  var q=auqv(),hits=auAll.filter(function(e){return auHit(e,q)});
+  var seen=[],cnt={};hits.forEach(function(e){if(cnt[e.action]==null){cnt[e.action]=0;seen.push(e.action)}cnt[e.action]++});
+  if(auFilter&&cnt[auFilter]==null){cnt[auFilter]=0;seen.push(auFilter)}
   if(seen.length>1||auFilter){
     var mk=function(v,label,n){var b=el('button','key');b.type='button';b.setAttribute('aria-pressed',auFilter===v?'true':'false');b.appendChild(el('span',null,label));b.appendChild(el('b',null,String(n)));b.onclick=function(){auFilter=v;renderAudit()};keys.appendChild(b)};
-    mk('','All',auAll.length);seen.forEach(function(a){mk(a,a,cnt[a])})
+    mk('','All',hits.length);seen.forEach(function(a){mk(a,actLbl(a),cnt[a])})
   }
   var L=$('aulist');L.textContent='';
   var lastDay='';
-  auAll.filter(function(e){return!auFilter||e.action===auFilter}).forEach(function(e){
+  hits.filter(function(e){return!auFilter||e.action===auFilter}).forEach(function(e){
     var dl=dayLabel(e.at);if(dl!==lastDay){lastDay=dl;L.appendChild(el('div','day',dl))}
     var d=el('div','log '+actTone(e.action)),top=el('div','log-top');
-    top.appendChild(chip(e.action,actTone(e.action)));top.appendChild(el('span','ago',ago(e.at)));
+    top.appendChild(chip(actLbl(e.action),actTone(e.action)));top.appendChild(el('span','ago',ago(e.at)));
     d.appendChild(top);
     if(e.slug||e.detail){
       var main=el('div','log-main');
@@ -5930,7 +6096,16 @@ function renderAudit(){
     }
     L.appendChild(d)
   });
-  if(!L.firstChild)L.appendChild(empty('No audit entries yet','Takedowns, releases and other admin actions are logged here.','audit'))
+  if(!L.firstChild){
+    if(auAll.length&&(q||auFilter))L.appendChild(empty('No matching entries','Nothing in the log matches this filter.','audit'));
+    else L.appendChild(empty('No audit entries yet','Takedowns, releases and other admin actions are logged here.','audit'))
+  }
+  var am=isAid(q)?aidMap[q]:null;
+  if(am&&am.next){
+    L.appendChild(el('div','fine','Matching the first '+num(Object.keys(am.set).length)+' pages of this account.'));
+    L.appendChild(btn('Load more pages','block more',function(){return aidMore(q).then(function(){if(auqv()===q)renderAudit()})}))
+  }
+  if(q&&auNext)L.appendChild(el('div','fine','Showing matches in the entries loaded so far. Load more to search older ones.'))
 }
 
 /* ---------- Overview ---------- */
@@ -5966,7 +6141,7 @@ function ovSync(){
   var users=ovS.view==='users';
   [].forEach.call($('ovseg').children,function(b){b.setAttribute('aria-pressed',b.getAttribute('data-v')===ovS.view?'true':'false')});
   $('ovfil').hidden=!users;
-  $('ovq').placeholder=users?'Search by author ID':'Search by slug'
+  $('ovq').placeholder=users?'Search by author ID':'Search by slug or author ID'
 }
 function ovUser(u){
   var r=el('button','pgrow'),l=el('div');r.type='button';
@@ -6318,7 +6493,7 @@ $('so').onclick=function(){
   sessionStorage.removeItem('adm');tok='';all=[];next=null;rIdx=false;rAgg=null;rGen++;navLog=[];lkSlug='';lkOwner=false;cur='reports';openSet={};auAll=[];auFilter='';recents=[];repSub='';
   ['list','lkowner','adlist','aulist','aukeys','qbar','qkeys','ovstats','ovlist','trchart','trleg','trrows','rpbox'].forEach(function(i){$(i).textContent=''});trS.data=null;trS.M=null;trS.end=null;trS.gen++;
   ovS.loaded=false;ovS.view='users';ovS.q='';ovS.fil='';ovS.sort='new';ovS.gen++;$('ovq').value='';pickSet('ovsort','new');pickSet('ovfilter','');$('ovcount').textContent='';$('ovnote').textContent='';ovSync();
-  $('queue').hidden=true;$('freason').value='';$('fq').value='';$('adq').value='';
+  $('queue').hidden=true;$('freason').value='';$('fq').value='';$('adq').value='';$('auq').value='';aidMap={};lkAid='';
   lookupHint();renderRecents();setBadge(0);document.body.dataset.alert='';$('tok').value='';
   navSync();loggedIn(false);msg('Signed out','ok')
 };
@@ -6334,16 +6509,65 @@ $('more').onclick=function(){loadReports(false)};
 $('admore').onclick=function(){loadAds(false)};
 $('aumore').onclick=function(){loadAudit(false)};
 $('ovmore').onclick=function(){ovList(false)};
+var COC=[
+  {h:"Keep it private",key:1,items:[
+    ["In public, never mention email, slug or link.","This covers any public place: replies, posts, comments, reviews and community chats."],
+    ["Use the Author ID.","It is how we point to a person."],
+    ["Describe a note by its action and time.","For example: the note taken down yesterday around 3 pm, or the note published on Monday evening."],
+    ["Guard what is private.","Never share the admin token or what is inside a note. Tap the lock to sign out when you are done."]
+  ],ex:[["ok","Do say","Author ID 7K2F9: the note published on Monday evening was taken down."],["no","Never say","/my-cool-page by jo@mail.com was removed."]]},
+  {h:"Be kind",items:[
+    ["Reasons are shown to the owner exactly as you type them.","Keep them short, calm and specific, like Spam or Impersonation. No blame, no sarcasm."],
+    ["Be fair.","Same rules for everyone. Look at the page, not the person."],
+    ["Protect reporters.","Owners only see the report category. Never say who reported."]
+  ]},
+  {h:"Use the lightest fix",items:[
+    ["Look first.","Open the snapshot and read the whole page before you act."],
+    ["Match the fix to the problem.","Wrong report? Dismiss it. Only one part is a problem? Fix just that part: remove the story, clear the profile name or pause the ad."],
+    ["Release helps an owner who is stuck.","If an owner cannot edit or unpublish their own page anymore, Release takes it offline and frees its address so they can publish again. It is not a penalty: no reason is needed, the owner gets a short alert, and unused ad views are refunded. Its likes, story and ad are removed. For rule-breaking, use Take down."],
+    ["Take down is for real violations.","It locks the slug for good. Suspend an account only as a last resort, usually after repeated violations."]
+  ]},
+  {h:"Child safety comes first",items:[
+    ["Open child safety reports first.","They are marked in red."],
+    ["Do not dismiss until the page is handled and NCMEC is notified.","Then save the report with Record NCMEC report."],
+    ["Never delete, copy, screenshot or share.","These pages are preserved for 18 months. Keep the image switches in Tools off unless you truly need them."],
+    ["Restore only when you are sure the report was a mistake.",""]
+  ]},
+  {h:"Take care",items:[
+    ["Everything you do is saved in Audit.","That keeps all of us trustworthy."],
+    ["Slow down for permanent actions.","Take down all and Run purge cannot be undone. The purge already runs every night."],
+    ["Ads:","pause first, take down if it keeps breaking the rules. You can refund unused views when you take an ad down."],
+    ["Not sure? Wait and ask another admin.","Slipped up? Restore it and tell the team. Honest mistakes are fine."]
+  ]}
+];
+function cocBuild(){
+  var w=el("div");
+  w.appendChild(el("div","coc-intro","Welcome to the team! Five easy habits keep our community safe and everyone treated with respect. Remember them as:"));
+  var t=el("div","coc-tags"),secs=[];["Private","Kind","Light","Safe","Careful"].forEach(function(x,i){var b=el("button",null,x);b.type="button";b.setAttribute("aria-label","Go to section "+(i+1)+": "+x);b.onclick=function(){var s=secs[i],sb=b.closest(".sheet-body");if(!s||!sb)return;sb.scrollTo({top:sb.scrollTop+s.getBoundingClientRect().top-sb.getBoundingClientRect().top-t.offsetHeight+6,behavior:"smooth"});s.classList.add("coc-hit");setTimeout(function(){s.classList.remove("coc-hit")},1200)};t.appendChild(b)});w.appendChild(t);
+  COC.forEach(function(s,i){
+    var c=el("section","coc-sec"+(s.key?" coc-key":"")),h=el("div","coc-h");
+    h.appendChild(el("span","coc-n",String(i+1)));h.appendChild(el("span",null,s.h));c.appendChild(h);
+    var ul=el("ul");
+    s.items.forEach(function(x){var li=el("li");li.appendChild(el("b",null,x[0]));if(x[1])li.appendChild(document.createTextNode(" "+x[1]));ul.appendChild(li)});
+    c.appendChild(ul);
+    (s.ex||[]).forEach(function(e){var d=el("div","coc-ex coc-"+e[0]);d.appendChild(el("b",null,e[1]));d.appendChild(document.createTextNode(e[2]));c.appendChild(d)});
+    secs.push(c);w.appendChild(c)
+  });
+  w.appendChild(el("div","coc-end","Thank you for looking after our community."));
+  return w
+}
+$("coc").onclick=function(){ask({title:"Admin Code of Conduct",icon:"book",sev:"ad",node:cocBuild(),ok:"Got it",single:true})};
 $('ovsort').onclick=function(){pick('ovsort',function(){ovS.sort=$('ovsort').value;ovList(true)})};
 $('ovfilter').onclick=function(){pick('ovfilter',function(){ovS.fil=$('ovfilter').value;ovList(true)})};
 $('ovq').oninput=function(){clearTimeout(ovS.t);ovS.t=setTimeout(function(){ovS.q=$('ovq').value.trim().toLowerCase();ovList(true)},300)};
 [].forEach.call($('ovseg').children,function(b){b.onclick=function(){var v=b.getAttribute('data-v');if(ovS.view===v)return;ovS.view=v;ovS.q='';$('ovq').value='';ovSync();ovList(true)}});
 $('adst').onclick=function(){pick('adst',function(){loadAds(true)})};
+$('auq').oninput=function(){clearTimeout(auT);auT=setTimeout(auSearch,300)};
 $('adq').oninput=function(){clearTimeout(adT);adT=setTimeout(function(){loadAds(true)},300)};
 $('fstatus').onclick=function(){pick('fstatus',renderAll)};
 $('fsort').onclick=function(){pick('fsort',repFilter)};
 $('fgroup').onchange=renderAll;
-$('fq').oninput=function(){renderAll();if(rIdx){clearTimeout(qT);qT=setTimeout(function(){loadReports(true)},300)}};
+$('fq').oninput=function(){var fv=fqv();if(!rIdx&&isAid(fv)&&!aidMap[fv])aidResolve(fv).then(function(){if(fqv()===fv)renderAll()},function(){});renderAll();if(rIdx){clearTimeout(qT);qT=setTimeout(function(){loadReports(true)},300)}};
 $('fdis').onchange=function(){loadReports(true)};
 $('lkgo').onclick=function(){doLookup($('lkslug').value)};
 $('lkslug').onkeydown=function(e){if(e.key==='Enter')doLookup($('lkslug').value)};
@@ -6559,6 +6783,7 @@ export default {
       if (method === 'GET' && pathname === '/admin/owner') return handleAdminOwner(env, request, url);
       if (method === 'GET' && pathname === '/admin/media') return handleAdminMedia(env, request, url);
       if (method === 'GET' && pathname === '/admin/ads') return handleAdminAds(env, request, url);
+      if (method === 'GET' && pathname === '/admin/resolve') return handleAdminResolve(env, request, url);
       if (method === 'GET' && pathname === '/admin/audit') return handleAdminAudit(env, request, url);
       if (method === 'GET' && pathname === '/admin/stats') return handleAdminStats(env, request);
       if (method === 'GET' && pathname === '/admin/trends') return handleAdminTrends(env, request, url);
