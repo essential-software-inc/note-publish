@@ -312,7 +312,7 @@ main{position:relative;z-index:1;max-width:720px;margin:0 auto;padding:2px 16px 
 .log.good{--dot:var(--ok)}
 .log-top{display:flex;align-items:center;justify-content:space-between;gap:8px}
 .log-top .ago{font-size:13px;color:var(--faint);font-weight:600}
-.log-main{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-top:10px}
+.log-main{display:flex;flex-direction:column;align-items:flex-start;gap:4px;margin-top:10px}
 .log-main .det{color:var(--muted);font-size:14px;word-break:break-word}
 .lnk{appearance:none;-webkit-appearance:none;border:0;background:none;padding:0;color:var(--accent);font-weight:650;font-size:15px}
 
@@ -546,19 +546,20 @@ function hash(s){var h=7;for(var i=0;i<s.length;i++)h=(h*31+s.charCodeAt(i))%214
 function aidFor(e){var o='a_';for(var i=0;i<4;i++){var x=hash(i+':'+e+':'+i).toString(16);o+=('00000000'+x).slice(-8)}return o}
 function ri(a,b){return Math.floor(a+rnd()*(b-a+1))}
 var users={},pages={},ads={},reports=[],audit=[],mseq=0;
-function U(e,name,o){o=o||{};users[e]=Object.assign({email:e,name:name,authorId:aidFor(e),createdAt:N-(o.joined||30)*D,lastSeen:N-(o.seen||2)*H,lastSignInAt:N-(o.signin||5)*H,online:!!o.online,suspended:false,pendingDeletionAt:null,displayName:name,hasProfileImage:!!o.pic,strikes:[],alerts:[],ledger:[],credit:o.credit||0,subscribers:o.subs||0,backup:{images:ri(2,30),imagesMore:false,sizeBytes:ri(80,900)*1024,updatedAt:N-ri(1,40)*H}},o.x||{});return users[e]}
+function U(e,name,o){o=o||{};users[e]=Object.assign({email:e,name:name,authorId:aidFor(e),createdAt:N-(o.joined||30)*D,lastSeen:N-(o.seen||2)*H,lastSignInAt:N-Math.max(o.signin||5,o.seen||2)*H,online:!!o.online,suspended:false,pendingDeletionAt:null,displayName:name,hasProfileImage:!!o.pic,strikes:[],alerts:[],ledger:[],credit:o.credit||0,subscribers:o.subs||0,backup:{images:ri(2,30),imagesMore:false,sizeBytes:ri(80,900)*1024,updatedAt:N-Math.max(ri(1,40),o.seen||2)*H}},o.x||{});return users[e]}
 function P(slug,title,owner,o){o=o||{};pages[slug]=Object.assign({slug:slug,title:title,desc:o.desc||'',tags:o.tags||[],createdAt:N-(o.age||10)*D,updatedAt:N-(o.upd||1)*D,noteCreatedAt:N-((o.age||10)+2)*D,deletedAt:null,status:'live',sizeBytes:ri(20,400)*1024,owner:owner,showInStories:!!o.story,storyBlocked:false,likes:o.likes||0,csamHold:false,ncmec:[],story:o.story?{title:title,createdAt:N-(o.age||10)*D,images:{ring:{r2:true,kind:'ring'},cards:[{r2:true,kind:'card',i:0}]}}:null,snaps:[{ts:N-(o.upd||1)*D,source:'publish',size:ri(20,400)*1024},{ts:N-(o.age||10)*D,source:'publish',size:ri(20,300)*1024}]},o.x||{});return pages[slug]}
 function R(slug,reason,details,ageH,o){reports.push(Object.assign({key:'r'+(++mseq),slug:slug,reason:reason,details:details,reportedAt:N-ageH*H,isCsam:false,dismissedAt:null},o||{}))}
-function A(action,slug,detail){audit.unshift({action:action,slug:slug||'',detail:detail||'',at:Date.now()})}
+function reasonOf(b){return typeof(b&&b.reason)==='string'?b.reason.trim().slice(0,200):''}
+function A(action,slug,detail,at){audit.unshift({action:action,slug:slug||'',detail:detail||'',at:at||Date.now()})}
 U('maya.chen@example.com','Maya Chen',{joined:120,online:1,pic:1,subs:42,credit:300});
 U('dev.patel@example.com','Dev Patel',{joined:90,subs:9});
 U('sam.ortiz@example.com','Sam Ortiz',{joined:6,seen:30,credit:20});
 U('lena.fischer@example.com','Lena Fischer',{joined:200,online:1,pic:1,subs:120,credit:1500});
-U('omar.haddad@example.com','Omar Haddad',{joined:300,seen:900,x:{pendingDeletionAt:N-45*D}});
+U('omar.haddad@example.com','Omar Haddad',{joined:300,seen:1100,x:{pendingDeletionAt:N-45*D}});
 U('priya.nair@example.com','Priya Nair',{joined:60,subs:15,credit:400});
-U('tom.becker@example.com','Tom Becker',{joined:150,seen:400,x:{suspended:true}});
+U('tom.becker@example.com','Tom Becker',{joined:450,seen:400,x:{suspended:true}});
 U('alex.rivera@example.com','Alex Rivera',{joined:15,seen:6});
-var t=users['tom.becker@example.com'];t.strikes.push({at:N-20*D,kind:'page_takedown',message:'Page taken down. Reason: copyright.'});t.alerts.push({at:N-20*D,kind:'page_takedown',strike:true,message:'Your page was taken down. Reason: copyright.'});
+var t=users['tom.becker@example.com'];var tk='Your page /copied-lyrics-post was taken down. Reason: copyright.',sp='Your account was suspended. Reason: copyright.';t.strikes.push({at:N-20*D,kind:'page_takedown',message:tk},{at:N-16*D,kind:'suspension',message:sp});t.alerts.push({at:N-16*D,kind:'suspension',strike:true,message:sp},{at:N-20*D,kind:'page_takedown',strike:true,message:tk});
 P('sunday-sourdough','Sunday sourdough notes','maya.chen@example.com',{likes:84,story:1,age:40,desc:'Hydration ratios and a starter diary',tags:['baking','food']});
 P('trail-journal','Trail journal: Cascades','maya.chen@example.com',{likes:31,age:25,tags:['hiking']});
 P('garden-planner','Garden planner 2026','maya.chen@example.com',{likes:12,age:9});
@@ -570,13 +571,15 @@ P('letters-to-lisbon','Letters to Lisbon','lena.fischer@example.com',{likes:240,
 P('old-recipe-box','Old recipe box',null,{likes:2,age:200});
 P('wedding-moodboard','Wedding moodboard','priya.nair@example.com',{likes:66,age:18,story:1});
 P('release-notes-v2','Release notes v2','alex.rivera@example.com',{age:5});
-P('retired-draft','Retired draft','omar.haddad@example.com',{age:100,x:{status:'unpublished',deletedAt:N-45*D}});
-P('copied-lyrics-post','Lyrics collection','tom.becker@example.com',{age:60,x:{status:'taken down',deletedAt:N-20*D}});
+P('retired-draft','Retired draft','omar.haddad@example.com',{age:100,upd:46,x:{status:'unpublished',deletedAt:N-45*D}});
+P('copied-lyrics-post','Lyrics collection','tom.becker@example.com',{age:60,upd:21,x:{status:'taken down',deletedAt:N-20*D}});
 P('flagged-demo-page','Flagged demo page','alex.rivera@example.com',{age:2,x:{csamHold:true}});
+['retired-draft','copied-lyrics-post'].forEach(function(k){var g=pages[k];g.snaps.unshift({ts:g.deletedAt,source:'removal',size:g.sizeBytes})});
 pages['letters-to-lisbon'].story.images.cards.push({url:'https://images.example.com/lisbon-card.jpg'});
+users['omar.haddad@example.com'].alerts.push({at:N-45*D,kind:'release',message:'Your page /retired-draft was unpublished by an admin. Its address is free, so you can publish it again. Its likes were removed.'});
 users['tom.becker@example.com'].alerts.push({at:N-400*D,kind:'page_takedown',message:'Your page was taken down. Reason: spam.'});
 var stale={timestamps:4,images:6,presence:9,activity:14};
-function Ad(slug,st,used,tot,uv,owner){ads[slug]={slug:slug,status:st,viewsUsed:used,viewsTotal:tot,uniqueViewers:uv,createdAt:N-ri(3,40)*D,ownerEmail:owner,refunded:false}}
+function Ad(slug,st,used,tot,uv,owner){ads[slug]={slug:slug,status:st,viewsUsed:used,viewsTotal:tot,uniqueViewers:uv,createdAt:N-ri(3,Math.min(40,Math.floor((N-pages[slug].createdAt)/D)-1))*D,ownerEmail:owner,refunded:false}}
 Ad('letters-to-lisbon','active',3120,5000,2480,'lena.fischer@example.com');
 Ad('wedding-moodboard','paused',640,2000,590,'priya.nair@example.com');
 Ad('sunday-sourdough','exhausted',1000,1000,870,'maya.chen@example.com');
@@ -591,8 +594,7 @@ R('release-notes-v2','other','',6);
 R('copied-lyrics-post','copyright','Full song lyrics reproduced.',26*24);
 R('flagged-demo-page','csam','Demo entry: placeholder flag only, no real content.',8,{isCsam:true});
 R('trail-journal','spam','Old report, already handled.',100,{dismissedAt:N-80*H});
-A('takedown','copied-lyrics-post','');A('owner_suspend','copied-lyrics-post','');A('release','retired-draft','');
-audit.forEach(function(e,i){e.at=N-(i+1)*D*3});audit.reverse();audit.forEach(function(e,i){e.at=N-(audit.length-i)*D*3});audit.reverse();
+A('release','retired-draft','',N-45*D);A('takedown','copied-lyrics-post','copyright',N-20*D);A('owner_suspend','copied-lyrics-post','copyright',N-16*D);A('dismiss','trail-journal','',N-80*H);
 function pstatus(s){return pages[s]?pages[s].status:'missing'}
 function ok(j,s){return new Response(JSON.stringify(j||{}),{status:s||200,headers:{'Content-Type':'application/json'}})}
 function err(s,m){return ok({error:m},s)}
@@ -652,8 +654,8 @@ function route(path,o){
     return ok(rpO)}
   if(p==='/admin/dismiss'||p==='/admin/undismiss'){var r=reports.filter(function(x){return x.key===b.key})[0];if(!r)return p==='/admin/dismiss'?ok({}):err(404,'report not found');r.dismissedAt=p==='/admin/dismiss'?Date.now():null;A(p==='/admin/dismiss'?'dismiss':'undismiss',r.slug,'');return ok({})}
   if(p==='/admin/reports/reindex')return ok({done:true});
-  if(mt=p.match(/^\/publish\/(.+)$/)){var s=decodeURIComponent(mt[1]),pg=pages[s];if(m!=='DELETE')return err(405,'Method not allowed');if(!pg||pg.status!=='live')return err(404,'Not live');snap(pg,'removal');pg.deletedAt=Date.now();pg.showInStories=false;pg.story=null;if(ads[s])ads[s].status='unpublished';
-    if(b.release){pg.status='unpublished';pg.likes=0;A('release',s,'');}else{pg.status='taken down';A('takedown',s,'');if(pg.owner)strike(pg.owner,'page_takedown','Your page /'+s+' was taken down. Reason: '+(b.reason||'')+'.')}
+  if(mt=p.match(/^\/publish\/(.+)$/)){var s=decodeURIComponent(mt[1]),pg=pages[s];if(m!=='DELETE')return err(405,'Method not allowed');if(!pg||pg.status!=='live')return err(404,'Not live');if(!b.release&&!reasonOf(b))return err(400,'reason required');snap(pg,'removal');var wasSt=pg.showInStories,rad=ads[s],adOn=!!rad&&(rad.status==='active'||rad.status==='paused'),rleft=rad?rad.viewsTotal-rad.viewsUsed:0;pg.deletedAt=Date.now();pg.showInStories=false;pg.story=null;if(ads[s])ads[s].status='unpublished';
+    if(b.release){pg.status='unpublished';pg.likes=0;A('release',s,'');var rref=0;if(adOn&&rleft>0&&!rad.refunded){rref=rleft;rad.refunded=true;rad.viewsTotal=rad.viewsUsed;var rw=users[rad.ownerEmail];if(rw){rw.credit+=rref;rw.ledger.unshift({delta:rref,reason:'ad refund',slug:s,at:Date.now()})}A('ad_refund',s,'refunded '+rref+' (release)')}if(pg.owner&&users[pg.owner])users[pg.owner].alerts.unshift({at:Date.now(),kind:'release',message:'Your page /'+s+' was unpublished by an admin. Its address is free, so you can publish it again. Its likes'+(wasSt?' and story':'')+' were removed'+(adOn?', and its ad was stopped':'')+'.'+(rref?' '+rref+' unused ad views were refunded to your balance.':'')})}else{pg.status='taken down';A('takedown',s,reasonOf(b));if(pg.owner)strike(pg.owner,'page_takedown','Your page /'+s+' was taken down. Reason: '+reasonOf(b)+'.')}
     return ok({})}
   if(mt=p.match(/^\/admin\/restore\/(.+)$/)){var s2=decodeURIComponent(mt[1]),pg2=pages[s2];if(!pg2)return err(404,'not found');if(pg2.status!=='taken down')return err(409,'slug is not admin-taken-down');pg2.status='live';pg2.deletedAt=null;A('restore',s2,q.get('ts')?'snapshot '+q.get('ts'):'');return ok({})}
   if(p==='/admin/ncmec'){var pg3=pages[b.slug];if(!pg3)return err(404,'Page not found');pg3.ncmec.push({at:Date.now(),reportId:b.reportId||'',note:b.note||''});A('ncmec_recorded',b.slug,'');return ok({})}
@@ -662,22 +664,22 @@ function route(path,o){
   if(p==='/admin/resolve'){var ra=(q.get('aid')||'').toLowerCase(),ru=Object.keys(users).map(function(e){return users[e]}).filter(function(x){return x.authorId===ra})[0];if(!ru)return err(404,'no account with that author ID');var rs=aidSlugs(ru.email),lv=rs.filter(function(k){return pages[k].owner===ru.email&&pages[k].status==='live'}).sort(function(a,c){return pages[c].createdAt-pages[a].createdAt})[0],an=lv||rs.slice(0,5).filter(function(k){return pages[k].owner===ru.email})[0]||null;return ok({slug:an,slugs:rs,next:null})}
   if(p==='/admin/lookup')return ok(lookup((q.get('slug')||'').toLowerCase()));
   if(p==='/admin/owner'){var od=owner((q.get('slug')||'').toLowerCase());return od.error?err(404,od.error):ok(od)}
-  if(p==='/admin/story'){var pg6=pages[b.slug];if(!pg6||pg6.status!=='live')return err(404,'not live');if(b.action==='remove'&&!b.reason)return err(400,'reason required');if(b.action!=='remove'&&b.action!=='allow')return err(400,'invalid action');if(b.action==='remove'){pg6.showInStories=false;pg6.storyBlocked=true;pg6.story=null;A('story_remove',b.slug,'');if(pg6.owner)strike(pg6.owner,'story_removal','Your page /'+b.slug+' was removed from stories. Reason: '+b.reason+'.')}else{pg6.storyBlocked=false;A('story_allow',b.slug,'')}return ok({})}
-  if(p==='/admin/owner/action'){var us=ownerOf(b.slug);if(!us)return err(404,'no account for this slug');var a=b.action;if((a==='suspend'||a==='clear-name'||a==='clear-picture')&&!b.reason)return err(400,'reason required');
-    if(a==='suspend'){us.suspended=true;strike(us.email,'suspension','Your account was suspended. Reason: '+b.reason+'.');A('owner_suspend',b.slug,'')}
-    else if(a==='unsuspend'){us.suspended=false;A('owner_unsuspend',b.slug,'')}
-    else if(a==='delete'){us.pendingDeletionAt=Date.now();us.suspended=true;A('owner_delete',b.slug,'')}
-    else if(a==='cancel-delete'){us.pendingDeletionAt=null;us.suspended=false;A('owner_cancel-delete',b.slug,'')}
-    else if(a==='clear-name'){us.displayName='';strike(us.email,'profile_removal','Your display name was removed. Reason: '+b.reason+'.');A('owner_clear-name',b.slug,'')}
-    else if(a==='clear-picture'){us.hasProfileImage=false;strike(us.email,'profile_removal','Your profile picture was removed. Reason: '+b.reason+'.');A('owner_clear-picture',b.slug,'')}
+  if(p==='/admin/story'){var pg6=pages[b.slug];if(!pg6||pg6.status!=='live')return err(404,'not live');if(b.action==='remove'&&!reasonOf(b))return err(400,'reason required');if(b.action!=='remove'&&b.action!=='allow')return err(400,'invalid action');if(b.action==='remove'){pg6.showInStories=false;pg6.storyBlocked=true;pg6.story=null;A('story_remove',b.slug,reasonOf(b));if(pg6.owner)strike(pg6.owner,'story_removal','Your page /'+b.slug+' was removed from stories. Reason: '+reasonOf(b)+'.')}else{pg6.storyBlocked=false;A('story_allow',b.slug,reasonOf(b))}return ok({})}
+  if(p==='/admin/owner/action'){var us=ownerOf(b.slug);if(!us)return err(404,'no account for this slug');var a=b.action;if((a==='suspend'||a==='clear-name'||a==='clear-picture')&&!reasonOf(b))return err(400,'reason required');
+    if(a==='suspend'){us.suspended=true;strike(us.email,'suspension','Your account was suspended. Reason: '+reasonOf(b)+'.');A('owner_suspend',b.slug,reasonOf(b))}
+    else if(a==='unsuspend'){us.suspended=false;A('owner_unsuspend',b.slug,reasonOf(b))}
+    else if(a==='delete'){us.pendingDeletionAt=Date.now();us.suspended=true;A('owner_delete',b.slug,reasonOf(b))}
+    else if(a==='cancel-delete'){us.pendingDeletionAt=null;us.suspended=false;A('owner_cancel-delete',b.slug,reasonOf(b))}
+    else if(a==='clear-name'){us.displayName='';strike(us.email,'profile_removal','Your display name was removed. Reason: '+reasonOf(b)+'.');A('owner_clear-name',b.slug,reasonOf(b))}
+    else if(a==='clear-picture'){us.hasProfileImage=false;strike(us.email,'profile_removal','Your profile picture was removed. Reason: '+reasonOf(b)+'.');A('owner_clear-picture',b.slug,reasonOf(b))}
     else return err(400,'Unknown action');return ok({})}
   if(p==='/admin/ads'){var st=q.get('status'),sq=(q.get('q')||'').toLowerCase(),L2=Object.keys(ads).map(function(s){return ads[s]}).filter(function(x){return(!st||x.status===st)&&(!sq||(/^a_[a-f0-9]{32}$/.test(sq)?((users[x.ownerEmail]||{}).authorId===sq):x.slug.indexOf(sq)>-1))});return ok({ads:L2,total:L2.length,next:null})}
-  if(p==='/admin/ad'){var ad=ads[b.slug];if(!ad)return err(404,'ad not found');var ba=b.action,as=ad.status;if((ba==='pause'||ba==='takedown')&&!b.reason)return err(400,'reason required');if(ba==='pause'&&as!=='active')return err(409,'ad is not active');if(ba==='resume'&&as!=='paused')return err(409,'ad is not paused');if(ba==='takedown'&&as!=='active'&&as!=='paused')return err(409,'ad is not running');if(ba==='refund'&&(as==='active'||as==='paused'))return err(409,'take the ad down first');if(ba!=='pause'&&ba!=='resume'&&ba!=='takedown'&&ba!=='refund')return err(400,'invalid action');var left=ad.viewsTotal-ad.viewsUsed,res={};
+  if(p==='/admin/ad'){var ad=ads[b.slug];if(!ad)return err(404,'ad not found');var ba=b.action,as=ad.status;if((ba==='pause'||ba==='takedown')&&!reasonOf(b))return err(400,'reason required');if(ba==='pause'&&as!=='active')return err(409,'ad is not active');if(ba==='resume'&&as!=='paused')return err(409,'ad is not paused');if(ba==='takedown'&&as!=='active'&&as!=='paused')return err(409,'ad is not running');if(ba==='refund'&&(as==='active'||as==='paused'))return err(409,'take the ad down first');if(ba!=='pause'&&ba!=='resume'&&ba!=='takedown'&&ba!=='refund')return err(400,'invalid action');var left=ad.viewsTotal-ad.viewsUsed,res={};
     if(b.action==='pause')ad.status='paused';else if(b.action==='resume')ad.status='active';
     else if(b.action==='takedown'){ad.status='unpublished';if(b.refund&&left>0){res.refunded=left;ad.refunded=true}}
     else if(b.action==='refund'){if(ad.refunded||left<1)return err(409,'Already refunded');res.refunded=left;ad.refunded=true}
     if(res.refunded){ad.viewsTotal=ad.viewsUsed;var ow=users[ad.ownerEmail];if(ow){ow.credit+=res.refunded;ow.ledger.unshift({delta:res.refunded,reason:'ad refund',slug:b.slug,at:Date.now()})}}
-    A('ad_'+b.action,b.slug,res.refunded?'refunded '+res.refunded:'');return ok(res)}
+    A('ad_'+b.action,b.slug,[reasonOf(b),res.refunded?'refunded '+res.refunded:''].filter(Boolean).join(' \u00b7 '));return ok(res)}
   if(p==='/admin/audit')return ok({entries:audit.slice(),nextCursor:null});
   if(p==='/admin/stats')return ok(stats());
   if(p==='/admin/users'||p==='/admin/notes'){var qq=(q.get('q')||'').toLowerCase(),isU=p==='/admin/users';
