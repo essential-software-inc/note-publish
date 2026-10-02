@@ -593,8 +593,8 @@ R('wedding-moodboard','abuse','Harassing comment in the text.',70);
 R('release-notes-v2','other','',6);
 R('copied-lyrics-post','copyright','Full song lyrics reproduced.',26*24);
 R('flagged-demo-page','csam','Demo entry: placeholder flag only, no real content.',8,{isCsam:true});
-R('trail-journal','spam','Old report, already handled.',100,{dismissedAt:N-80*H});
-A('release','retired-draft','',N-45*D);A('takedown','copied-lyrics-post','copyright',N-20*D);A('owner_suspend','copied-lyrics-post','copyright',N-16*D);A('dismiss','trail-journal','',N-80*H);
+R('flagged-demo-page','csam','Demo entry: earlier placeholder flag, already handled. Dismissed CSAM records are kept for 18 months and can be undone.',100,{isCsam:true,dismissedAt:N-80*H});
+A('release','retired-draft','',N-45*D);A('takedown','copied-lyrics-post','copyright',N-20*D);A('owner_suspend','copied-lyrics-post','copyright',N-16*D);A('dismiss','flagged-demo-page','',N-80*H);
 function pstatus(s){return pages[s]?pages[s].status:'missing'}
 function ok(j,s){return new Response(JSON.stringify(j||{}),{status:s||200,headers:{'Content-Type':'application/json'}})}
 function err(s,m){return ok({error:m},s)}
@@ -652,7 +652,7 @@ function route(path,o){
     var rpO={reports:rpL.map(function(x){var pg=pages[x.slug];return Object.assign({},x,{status:pstatus(x.slug),ncmec:x.isCsam&&pg&&pg.ncmec.length?pg.ncmec[pg.ncmec.length-1]:null})}),nextCursor:null,indexed:true};
     if(rpF){var rpBy={},rpT=0,rpP={},rpCs={};rpB.forEach(function(x){rpBy[x.reason]=(rpBy[x.reason]||0)+1;rpT++});rpIn.forEach(function(x){rpP[x.slug]=1;if(x.isCsam)rpCs[x.slug]=1});rpO.agg={total:rpT,byReason:rpBy,pages:Object.keys(rpP).length,csam:Object.keys(rpCs).length}}
     return ok(rpO)}
-  if(p==='/admin/dismiss'||p==='/admin/undismiss'){var r=reports.filter(function(x){return x.key===b.key})[0];if(!r)return p==='/admin/dismiss'?ok({}):err(404,'report not found');r.dismissedAt=p==='/admin/dismiss'?Date.now():null;A(p==='/admin/dismiss'?'dismiss':'undismiss',r.slug,'');return ok({})}
+  if(p==='/admin/dismiss'||p==='/admin/undismiss'){var r=reports.filter(function(x){return x.key===b.key})[0];if(!r)return p==='/admin/dismiss'?ok({}):err(404,'report not found');if(p==='/admin/dismiss'){if(r.isCsam)r.dismissedAt=Date.now();else reports=reports.filter(function(x){return x!==r})}else if(r.dismissedAt)r.dismissedAt=null;A(p==='/admin/dismiss'?'dismiss':'undismiss',r.slug,'');return ok({})}
   if(p==='/admin/reports/reindex')return ok({done:true});
   if(mt=p.match(/^\/publish\/(.+)$/)){var s=decodeURIComponent(mt[1]),pg=pages[s];if(m!=='DELETE')return err(405,'Method not allowed');if(!pg||pg.status!=='live')return err(404,'Not live');if(!b.release&&!reasonOf(b))return err(400,'reason required');snap(pg,'removal');var wasSt=pg.showInStories,rad=ads[s],adOn=!!rad&&(rad.status==='active'||rad.status==='paused'),rleft=rad?rad.viewsTotal-rad.viewsUsed:0;pg.deletedAt=Date.now();pg.showInStories=false;pg.story=null;if(ads[s])ads[s].status='unpublished';
     if(b.release){pg.status='unpublished';pg.likes=0;A('release',s,'');var rref=0;if(adOn&&rleft>0&&!rad.refunded){rref=rleft;rad.refunded=true;rad.viewsTotal=rad.viewsUsed;var rw=users[rad.ownerEmail];if(rw){rw.credit+=rref;rw.ledger.unshift({delta:rref,reason:'ad refund',slug:s,at:Date.now()})}A('ad_refund',s,'refunded '+rref+' (release)')}if(pg.owner&&users[pg.owner])users[pg.owner].alerts.unshift({at:Date.now(),kind:'release',message:'Your page /'+s+' was unpublished by an admin. Its address is free, so you can publish it again. Its likes'+(wasSt?' and story':'')+' were removed'+(adOn?', and its ad was stopped':'')+'.'+(rref?' '+rref+' unused ad views were refunded to your balance.':'')})}else{pg.status='taken down';A('takedown',s,reasonOf(b));if(pg.owner)strike(pg.owner,'page_takedown','Your page /'+s+' was taken down. Reason: '+reasonOf(b)+'.')}
