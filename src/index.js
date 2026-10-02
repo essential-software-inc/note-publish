@@ -3993,7 +3993,7 @@ async function handleAdminStory(env, request) {
   return json({ ok: true });
 }
 
-// GET /admin/ads?status=&cursor=: ads across all accounts, newest first, keyset-paginated.
+// GET /admin/ads?status=&q=&cursor=: ads across all accounts, newest first, keyset-paginated.
 const ADMIN_ADS_PAGE = 30;
 async function handleAdminAds(env, request, url) {
   const g = await adminGate(env, request); if (g) return g;
@@ -4001,8 +4001,10 @@ async function handleAdminAds(env, request, url) {
   const status = url.searchParams.get('status') || '';
   const cur = parseAdminCursor(url.searchParams.get('cursor'));
   const filter = ['active', 'paused', 'exhausted', 'unpublished'].includes(status);
+  const q = (url.searchParams.get('q') || '').toLowerCase().replace(/[^a-z0-9-]/g, '').slice(0, 48);
   const where = [], b = [];
   if (filter) { where.push('a.status = ?'); b.push(status); }
+  if (q) { where.push('a.slug LIKE ?'); b.push('%' + q + '%'); }
   const w = where.length ? ' WHERE ' + where.join(' AND ') : '';
   const curSql = cur ? (where.length ? ' AND ' : ' WHERE ') + '(a.created_at, a.slug) < (?, ?)' : '';
   // LIMIT+1 tells us whether another page exists without a second query; the total (first page only)
@@ -4934,6 +4936,7 @@ body[data-auth=out] #msg{bottom:calc(24px + env(safe-area-inset-bottom,0px))}
     </div>
 
     <div id="p-ads" class="pnl">
+      <div class="search"><div class="field-wrap"><span class="ico" data-i="search"></span><input class="field" id="adq" placeholder="Filter by slug" autocomplete="off" autocapitalize="off" spellcheck="false"></div></div>
       <div class="filters">
         <span class="sel"><button type="button" class="pick" id="adst" aria-label="Ad status" aria-haspopup="listbox" value="">All ads</button><span class="ico" data-i="chev"></span></span>
       </div>
@@ -5027,7 +5030,7 @@ function clearable(i){
   b.onclick=function(){VALD.set.call(i,'');sync();i.dispatchEvent(new Event('input',{bubbles:true}));i.focus()};
   sync()
 }
-function clearableAll(){['tok','ovq','fq','lkslug','relslug'].forEach(function(id){clearable($(id))})}
+function clearableAll(){['tok','ovq','fq','adq','lkslug','relslug'].forEach(function(id){clearable($(id))})}
 
 /* ---------- Snapshot preview (sandboxed) ---------- */
 function toDataUrl(b){return new Promise(function(res){var r=new FileReader();r.onload=function(){res(r.result)};r.onerror=function(){res(null)};r.readAsDataURL(b)})}
@@ -5706,7 +5709,7 @@ function renderLookup(d){
   if(d.status==='live')tools.appendChild(link('View page','/@'+d.slug));
   tools.appendChild(mkSnaps(d.slug,d.status,0,c,d.csamHold,refresh));
   if(d.hasOwner)tools.appendChild(btn('Owner',null,function(){openOwner(d.slug)}));
-  if(d.ad)tools.appendChild(btn('Ads tab',null,function(){goTab('ads')}));
+  if(d.ad)tools.appendChild(btn('Ads tab',null,function(){openAd(d.slug)}));
   c.appendChild(tools);
   var foot=el('div','foot');
   if(d.status==='live'){
@@ -5789,7 +5792,8 @@ function loadOwner(slug){
         if(p.likes!=null){var lk=el('span','lk');lk.appendChild(ico('heart'));lk.appendChild(el('span','n',num(p.likes)));m.appendChild(lk)}
         if(p.reports)m.appendChild(chip(p.reports+(p.reports===1?' report':' reports'),'bad'));
         if(p.showInStories)m.appendChild(chip('story'));
-        r.appendChild(m);c.appendChild(r)
+        if(m.children.length>1){r.className='pgrow stack';r.insertBefore(m,l)}else r.appendChild(m);
+        c.appendChild(r)
       })
     }
     var again=function(){loadOwner(slug)};
@@ -5825,16 +5829,26 @@ function takedownAll(pages,done){
 }
 
 /* ---------- Ads ---------- */
+var adT=null,adFocus='';
+function adqv(){return $('adq').value.trim().toLowerCase().replace(/^[/@]+/,'')}
+// Lookup's "Ads tab": show the ad of one note, opened, in the Ads screen (status filter reset so it cannot be hidden).
+function openAd(slug){
+  openSet['ad:'+slug]=true;adFocus=slug;
+  $('adq').value=slug;pickSet('adst','');
+  $('adlist').textContent='';adCur='';
+  goTab('ads');if(cur==='ads'&&!$('adlist').firstChild)loadAds(true)
+}
 function loadAds(reset){
   var L=$('adlist');
   if(reset){adCur='';adTotal=0;L.textContent='';skel(L,3)}else moreBusy($('admore'),true);
-  return api('/admin/ads?status='+encodeURIComponent($('adst').value)+'&cursor='+encodeURIComponent(adCur)).then(function(o){
+  return api('/admin/ads?status='+encodeURIComponent($('adst').value)+'&q='+encodeURIComponent(adqv())+'&cursor='+encodeURIComponent(adCur)).then(function(o){
     unskel(L);moreBusy($('admore'),false);
     if(!o.ok){bad(o);return}
     if(o.j.total!=null)adTotal=o.j.total;SUBS.ads=num(adTotal)+(adTotal===1?' campaign':' campaigns')+($('adst').value?' - '+$('adst').textContent.toLowerCase():'');if(cur==='ads')setSub();
     o.j.ads.forEach(renderAd);
+    if(adFocus){var f=o.j.ads.filter(function(x){return x.slug===adFocus})[0];adFocus='';if(f&&f._c&&f._c.scrollIntoView)f._c.scrollIntoView({behavior:'smooth',block:'start'})}
     adCur=o.j.next;$('admore').hidden=adCur==null;
-    if(!L.firstChild)L.appendChild(empty('No ads','No ads match this filter.','ads'))
+    if(!L.firstChild)L.appendChild(empty('No ads','No ads match this search or filter.','ads'))
   }).catch(function(){unskel(L);moreBusy($('admore'),false);msg('Network error, check your connection')})
 }
 // The server's result applied to the card on screen: no list reload. Under a status filter a card that no
@@ -6304,7 +6318,7 @@ $('so').onclick=function(){
   sessionStorage.removeItem('adm');tok='';all=[];next=null;rIdx=false;rAgg=null;rGen++;navLog=[];lkSlug='';lkOwner=false;cur='reports';openSet={};auAll=[];auFilter='';recents=[];repSub='';
   ['list','lkowner','adlist','aulist','aukeys','qbar','qkeys','ovstats','ovlist','trchart','trleg','trrows','rpbox'].forEach(function(i){$(i).textContent=''});trS.data=null;trS.M=null;trS.end=null;trS.gen++;
   ovS.loaded=false;ovS.view='users';ovS.q='';ovS.fil='';ovS.sort='new';ovS.gen++;$('ovq').value='';pickSet('ovsort','new');pickSet('ovfilter','');$('ovcount').textContent='';$('ovnote').textContent='';ovSync();
-  $('queue').hidden=true;$('freason').value='';$('fq').value='';
+  $('queue').hidden=true;$('freason').value='';$('fq').value='';$('adq').value='';
   lookupHint();renderRecents();setBadge(0);document.body.dataset.alert='';$('tok').value='';
   navSync();loggedIn(false);msg('Signed out','ok')
 };
@@ -6325,6 +6339,7 @@ $('ovfilter').onclick=function(){pick('ovfilter',function(){ovS.fil=$('ovfilter'
 $('ovq').oninput=function(){clearTimeout(ovS.t);ovS.t=setTimeout(function(){ovS.q=$('ovq').value.trim().toLowerCase();ovList(true)},300)};
 [].forEach.call($('ovseg').children,function(b){b.onclick=function(){var v=b.getAttribute('data-v');if(ovS.view===v)return;ovS.view=v;ovS.q='';$('ovq').value='';ovSync();ovList(true)}});
 $('adst').onclick=function(){pick('adst',function(){loadAds(true)})};
+$('adq').oninput=function(){clearTimeout(adT);adT=setTimeout(function(){loadAds(true)},300)};
 $('fstatus').onclick=function(){pick('fstatus',renderAll)};
 $('fsort').onclick=function(){pick('fsort',repFilter)};
 $('fgroup').onchange=renderAll;
