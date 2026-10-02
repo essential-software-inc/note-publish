@@ -1206,7 +1206,7 @@ async function handleUnpublish(env, request, slug) {
   meta.deletedAt = now;
   if (isAdminTakedown) meta.adminLocked = true;
   await putMeta(env, slug, meta);
-  if (isAdminTakedown || isAdminRelease) await audit(env, isAdminRelease ? 'release' : 'takedown', slug);
+  if (isAdminTakedown || isAdminRelease) await audit(env, isAdminRelease ? 'release' : 'takedown', slug, isAdminTakedown ? adminReasonOf(body) : null);
   if (isAdminTakedown) await createAlert(env, meta.ownerSub, 'takedown', 'Your note ' + alertNoteName(meta, slug) + ' was taken down. ' + alertReason(adminReasonOf(body)) + ' Its address can\u2019t be reused. ' + ALERT_REPEAT_NOTE);
   // Drop this slug out of its owner's GET /my/pages listing either way —
   // an admin takedown shouldn't keep showing up in the owner's own page
@@ -4032,7 +4032,7 @@ async function handleAdminOwnerAction(env, request) {
   } else return textError(400, 'invalid action');
   await putUser(env, sub, user);
   if (action === 'suspend' || action === 'delete') await revokeAllSessions(env, sub);
-  await audit(env, 'owner_' + action, slug);
+  await audit(env, 'owner_' + action, slug, reason || null);
   const ownerAlert = {
     'clear-picture': ['profile_picture', 'Your profile picture was removed. ' + alertReason(reason) + ' You can upload a new one. ' + ALERT_REPEAT_NOTE],
     'clear-name': ['profile_name', 'Your display name was removed. ' + alertReason(reason) + ' You can set a new one. ' + ALERT_REPEAT_NOTE],
@@ -4072,7 +4072,7 @@ async function handleAdminStory(env, request) {
     delete meta.storyBlocked;
   } else return textError(400, 'invalid action');
   await putMeta(env, slug, meta);
-  await audit(env, 'story_' + body.action, slug);
+  await audit(env, 'story_' + body.action, slug, reason || null);
   await createAlert(env, meta.ownerSub, 'story', body.action === 'remove'
     ? 'Your note ' + alertNoteName(meta, slug) + ' was removed from stories. ' + alertReason(reason) + ' Your note is still published. ' + ALERT_REPEAT_NOTE
     : 'Your note ' + alertNoteName(meta, slug) + ' can be shown in stories again.');
@@ -4173,7 +4173,7 @@ async function handleAdminAd(env, request) {
     console.log('admin ad action failed: ' + (e && e.message));
     return textError(500, 'ad action failed');
   }
-  await audit(env, 'ad_' + body.action, slug, refunded ? 'refunded ' + refunded : null);
+  await audit(env, 'ad_' + body.action, slug, [reason, refunded ? 'refunded ' + refunded : ''].filter(Boolean).join(' \u00b7 ') || null);
   const adRefund = refunded ? ' ' + refunded + ' unused views were refunded to your balance.' : '';
   const adAlert = {
     pause: 'Your ad on /' + slug + ' was paused. ' + alertReason(reason) + ' ' + ALERT_REPEAT_NOTE,
@@ -4870,7 +4870,7 @@ main{position:relative;z-index:1;max-width:720px;margin:0 auto;padding:2px 16px 
 .log.good{--dot:var(--ok)}
 .log-top{display:flex;align-items:center;justify-content:space-between;gap:8px}
 .log-top .ago{font-size:13px;color:var(--faint);font-weight:600}
-.log-main{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-top:10px}
+.log-main{display:flex;flex-direction:column;align-items:flex-start;gap:4px;margin-top:10px}
 .log-main .det{color:var(--muted);font-size:14px;word-break:break-word}
 .lnk{appearance:none;-webkit-appearance:none;border:0;background:none;padding:0;color:var(--accent);font-weight:650;font-size:15px}
 
