@@ -3726,13 +3726,13 @@ const AUDIT_PREFIX = 'audit:';
 const AUDIT_TTL_S = 400 * 24 * 60 * 60;
 const NCMEC_PREFIX = 'ncmec:'; // SLUGS namespace: NCMEC report record(s) per slug
 
-async function audit(env, action, slug, detail) {
+async function audit(env, action, slug, detail, extra) {
   try {
     const at = Date.now();
     await env.REPORTS.put(
       AUDIT_PREFIX + String(REPORT_TS_MAX - at).padStart(13, '0') + ':' + crypto.randomUUID().slice(0, 8),
       '1',
-      { expirationTtl: AUDIT_TTL_S, metadata: { at, action, slug: slug || null, detail: detail || null } }
+      { expirationTtl: AUDIT_TTL_S, metadata: Object.assign({ at, action, slug: slug || null, detail: detail || null }, extra || {}) }
     );
   } catch (e) { console.log('audit failed: ' + (e && e.message)); }
 }
@@ -3828,6 +3828,30 @@ async function reportCounts(env) {
   }
   return counts;
 }
+// Per-slug report breakdown (total, open, by reason) from the D1 index: one grouped read per 80 slugs.
+// Returns null until the report index is built (or if D1 fails), so callers fall back to plain counts.
+async function reportReasonStats(env, slugs) {
+  try {
+    if (!slugs.length || !(await reportIndexOn(env))) return null;
+    await ensureReportIndex(env);
+    const out = new Map();
+    const stmts = [];
+    for (let i = 0; i < slugs.length; i += 80) {
+      const chunk = slugs.slice(i, i + 80);
+      stmts.push(env.ADS_DB.prepare('SELECT slug, reason AS r, COUNT(*) AS t, COALESCE(SUM(dismissed_at IS NULL), 0) AS o FROM report_index WHERE slug IN (' + chunk.map(() => '?').join(',') + ') GROUP BY slug, reason').bind(...chunk));
+    }
+    for (const part of await env.ADS_DB.batch(stmts)) {
+      for (const r of (part.results || [])) {
+        const k = ALERT_REPORT_REASONS[r.r] ? r.r : 'other';
+        const cur = out.get(r.slug) || { total: 0, open: 0, byReason: {} };
+        const b = cur.byReason[k] || (cur.byReason[k] = { total: 0, open: 0 });
+        b.total += r.t; b.open += r.o; cur.total += r.t; cur.open += r.o;
+        out.set(r.slug, cur);
+      }
+    }
+    return out;
+  } catch (e) { console.log('report reason stats failed: ' + (e && e.message)); return null; }
+}
 async function getNcmec(env, slug) {
   try { return JSON.parse(await env.SLUGS.get(NCMEC_PREFIX + slug)) || []; } catch (e) { return []; }
 }
@@ -3838,8 +3862,10 @@ async function handleAdminLookup(env, request, url) {
   const slug = adminSlugParam(url);
   if (!slug) return textError(400, 'invalid slug');
   const meta = await getMeta(env, slug);
-  const reports = (await reportCounts(env)).get(slug) || 0;
-  if (!meta) return json({ found: false, slug, reports });
+  const [reportMap, reasonMap] = await Promise.all([reportCounts(env), reportReasonStats(env, [slug])]);
+  const reports = reportMap.get(slug) || 0;
+  const reportStats = reasonMap ? (reasonMap.get(slug) || { total: 0, open: 0, byReason: {} }) : null;
+  if (!meta) return json({ found: false, slug, reports, reportStats });
   const [user, story, likes, ad, head, snaps, hold, ncmec] = await Promise.all([
     meta.ownerSub ? getUser(env, meta.ownerSub) : null,
     env.ADS_DB.prepare('SELECT title, created_at, description, tags, image_url, image_urls FROM stories WHERE slug = ?').bind(slug).first(),
@@ -3865,7 +3891,7 @@ async function handleAdminLookup(env, request, url) {
     story: story ? { title: story.title, createdAt: story.created_at, images: adminStoryImageSpecs(story) } : null,
     likes: likes ? likes.n : 0,
     ad: ad ? { status: ad.status, viewsTotal: ad.views_total, viewsUsed: ad.views_used } : null,
-    reports, csamHold: hold !== null, snapshots: (snaps.objects || []).length, ncmec
+    reports, reportStats, csamHold: hold !== null, snapshots: (snaps.objects || []).length, ncmec
   });
 }
 
@@ -3970,6 +3996,8 @@ async function handleAdminOwner(env, request, url) {
     }
     cursor = (page.list_complete || pages.length >= 100) ? undefined : page.cursor;
   } while (cursor);
+  const pageReasons = await reportReasonStats(env, pages.map((p) => p.slug));
+  if (pageReasons) pages.forEach((p) => { const s = pageReasons.get(p.slug); if (s) p.byReason = s.byReason; });
   const authorId = (await authorIdsFor(env, [sub]))[sub] || null;
   const reportStats = await ownerReportStats(env, sub, allSlugs);
   // Every alert ever sent to this account, including ones the person has since deleted from their list.
@@ -4221,6 +4249,204 @@ async function handleAdminUndismiss(env, request) {
   return json({ ok: true });
 }
 
+// POST /admin/alert {message, classification, audience: {type: 'all' | 'categories' | 'users', categories, periods, match, users}, preview}:
+// sends one free-text alert (kind 'notice') to a set of accounts. With preview: true nothing is sent; it only counts who the
+// audience reaches (add list: true, q, cursor for a page of them, with q searching author IDs). {recipients: true, at, ts,
+// message, cls} instead lists who a sent alert went to, for the Audit entry it came from. The audit entry carries the exact message, the classification, the audience and the recipient count.
+// The classification is for the admin record only; accounts see the message. The audit record rides in KV key metadata
+// (1024 byte limit), so the message is capped in characters and in bytes.
+const CUSTOM_ALERT_MAX = 250;
+const CUSTOM_ALERT_BYTES = 700;
+const CUSTOM_ALERT_KIND = 'notice';
+const CUSTOM_ALERT_USERS_MAX = 50;
+const CUSTOM_ALERT_CLASSES = ['announcement', 'update', 'maintenance', 'policy', 'safety', 'support', 'other'];
+// Each group is one SELECT of account subs (column s) from data the worker already keeps. "col" is the timestamp the
+// period applies to (null: no period). "before" groups use the period as a cutoff (last seen before it) instead of a window.
+const CA_HOUR = 60 * 60 * 1000;
+const CA_DAY = 24 * CA_HOUR;
+const CA_GROUPS = {
+  signup: { sql: 'SELECT a.sub AS s FROM authors a WHERE 1', col: 'a.created_at' },
+  seen: { sql: "SELECT a.sub AS s FROM authors a JOIN presence p ON p.id = 'u:' || a.sub WHERE 1", col: 'p.last_seen' },
+  away: { sql: "SELECT a.sub AS s FROM authors a LEFT JOIN presence p ON p.id = 'u:' || a.sub WHERE 1", col: 'COALESCE(p.last_seen, 0)', before: true },
+  published: { sql: 'SELECT DISTINCT author_sub AS s FROM published_notes WHERE 1', col: 'created_at' },
+  storied: { sql: 'SELECT DISTINCT author_sub AS s FROM stories WHERE 1', col: 'created_at' },
+  followed: { sql: 'SELECT DISTINCT author_sub AS s FROM subscriptions WHERE 1', col: 'created_at' },
+  advertisers: { sql: 'SELECT DISTINCT owner_sub AS s FROM ads WHERE 1', col: 'created_at' },
+  buyers: { sql: "SELECT DISTINCT owner_sub AS s FROM view_credits_ledger WHERE reason = 'purchase'", col: 'created_at' },
+  struck: { sql: 'SELECT DISTINCT sub AS s FROM alerts WHERE (' + STRIKE_SQL + ')', col: 'created_at' },
+  reported: { sql: "SELECT DISTINCT sub AS s FROM alerts WHERE kind = 'report'", col: 'created_at' },
+  following: { sql: 'SELECT DISTINCT subscriber_sub AS s FROM subscriptions WHERE 1', col: 'created_at' },
+  liked: { sql: 'SELECT DISTINCT liker_sub AS s FROM likes WHERE 1', col: 'created_at' },
+  gotliked: { sql: 'SELECT DISTINCT author_sub AS s FROM likes WHERE 1', col: 'created_at' },
+  takendown: { sql: "SELECT DISTINCT sub AS s FROM alerts WHERE kind = 'takedown'", col: 'created_at' },
+  suspended: { sql: "SELECT DISTINCT sub AS s FROM alerts WHERE kind = 'suspended'", col: 'created_at' },
+  neverpub: { sql: 'SELECT a.sub AS s FROM authors a WHERE NOT EXISTS (SELECT 1 FROM published_notes n WHERE n.author_sub = a.sub)', col: null },
+  neverstory: { sql: 'SELECT a.sub AS s FROM authors a WHERE NOT EXISTS (SELECT 1 FROM stories t WHERE t.author_sub = a.sub)', col: null },
+  neverad: { sql: 'SELECT a.sub AS s FROM authors a WHERE NOT EXISTS (SELECT 1 FROM ads d WHERE d.owner_sub = a.sub)', col: null }
+};
+// The fixed-window groups older audit entries and older admin pages used, as a group plus its period.
+const CA_LEGACY = { new7: ['signup', { days: 7 }], active7: ['seen', { days: 7 }], inactive30: ['away', { days: 30 }], publishers: ['published', null] };
+const CA_STAMP_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/;
+function caStamp(v) {
+  if (typeof v !== 'string' || !CA_STAMP_RE.test(v)) return null;
+  const t = Date.parse(v + ':00Z');
+  return Number.isFinite(t) ? t : null;
+}
+// A period is {hours}, {days}, or {from, to} (UTC, to the minute, either end may be left open); none means any time.
+// Resolves to {from, to, code}: from/to in ms (to is inclusive of its whole minute), code is the short form kept in Audit
+// ("7d", "12h", or "<from>~<to>" as base-36 minutes), which the admin page turns back into words.
+function caPeriod(p, now) {
+  if (p == null) return { from: null, to: null, code: '' };
+  if (typeof p !== 'object') return { error: 'invalid period' };
+  const has = (k) => p[k] != null && p[k] !== '';
+  if (has('hours')) {
+    const h = Number(p.hours);
+    if (!Number.isInteger(h) || h < 1 || h > 168) return { error: 'hours must be 1 to 168' };
+    return { from: now - h * CA_HOUR, to: null, code: h + 'h' };
+  }
+  if (has('days')) {
+    const d = Number(p.days);
+    if (!Number.isInteger(d) || d < 1 || d > 730) return { error: 'days must be 1 to 730' };
+    return { from: now - d * CA_DAY, to: null, code: d + 'd' };
+  }
+  const from = has('from') ? caStamp(p.from) : null, to = has('to') ? caStamp(p.to) : null;
+  if ((has('from') && from == null) || (has('to') && to == null)) return { error: 'invalid date' };
+  if (from != null && to != null && from > to) return { error: 'period start is after its end' };
+  if (from == null && to == null) return { from: null, to: null, code: '' };
+  const m = (t) => (t == null ? '' : Math.floor(t / 60000).toString(36));
+  return { from, to: to == null ? null : to + 59999, code: m(from) + '~' + m(to) };
+}
+function caGroupSql(def, per) {
+  let sql = def.sql;
+  const bind = [];
+  if (def.col && (per.from != null || per.to != null)) {
+    if (def.before) { sql += ' AND ' + def.col + ' < ?'; bind.push(per.from != null ? per.from : per.to); }
+    else {
+      if (per.from != null) { sql += ' AND ' + def.col + ' >= ?'; bind.push(per.from); }
+      if (per.to != null) { sql += ' AND ' + def.col + ' <= ?'; bind.push(per.to); }
+    }
+  }
+  return [sql, bind];
+}
+const caHas = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
+// Resolves the audience to {code, sql, bind, unknown?}: sql yields one column s (account subs), also usable as a subquery.
+// categories: {categories: [...], periods: {<group>: period}, match: 'any' | 'all'}. The code is what Audit keeps:
+// "all", "users", or the groups with their periods ("seen:7d,published:abc~def"; a leading "&" means all groups must match).
+async function customAlertAudience(env, aud) {
+  const type = aud && aud.type;
+  if (type === 'all') return { code: 'all', sql: 'SELECT sub AS s FROM authors', bind: [] };
+  if (type === 'categories') {
+    const now = Date.now();
+    const cats = Array.isArray(aud.categories) ? [...new Set(aud.categories.map(String))] : [];
+    if (!cats.length || cats.length > 24) return { error: 'choose at least one valid category' };
+    const per = aud.periods && typeof aud.periods === 'object' ? aud.periods : {};
+    const parts = [], bind = [], codes = [];
+    for (const c of cats) {
+      let key = c, p = caHas(per, c) ? per[c] : null;
+      if (caHas(CA_LEGACY, c)) { key = CA_LEGACY[c][0]; if (p == null) p = CA_LEGACY[c][1]; }
+      if (!caHas(CA_GROUPS, key)) return { error: 'choose at least one valid category' };
+      const r = caPeriod(p, now);
+      if (r.error) return { error: r.error };
+      const def = CA_GROUPS[key];
+      if (def.before && r.from == null && r.to == null) return { error: 'choose how long accounts have been away' };
+      const [s, b] = caGroupSql(def, def.col ? r : { from: null, to: null });
+      parts.push(s); bind.push(...b);
+      codes.push(c + (def.col && r.code ? ':' + r.code : ''));
+    }
+    const all = aud.match === 'all';
+    return {
+      code: (all ? '&' : '') + codes.join(','),
+      sql: 'SELECT s FROM (' + parts.join(all ? ' INTERSECT ' : ' UNION ') + ') WHERE s IN (SELECT sub FROM authors)',
+      bind
+    };
+  }
+  if (type === 'users') {
+    const ids = [...new Set((Array.isArray(aud.users) ? aud.users : []).map((v) => String(v || '').trim().toLowerCase()).filter(Boolean))];
+    if (!ids.length) return { error: 'enter at least one author ID' };
+    if (ids.length > CUSTOM_ALERT_USERS_MAX) return { error: 'too many accounts, send to ' + CUSTOM_ALERT_USERS_MAX + ' or fewer at a time' };
+    if (ids.some((i) => !AUTHOR_ID_RE.test(i))) return { error: 'invalid author ID' };
+    const marks = ids.map(() => '?').join(',');
+    const found = await env.ADS_DB.prepare('SELECT author_id FROM authors WHERE author_id IN (' + marks + ')').bind(...ids).all();
+    const have = new Set((found.results || []).map((r) => r.author_id));
+    return { code: 'users', sql: 'SELECT sub AS s FROM authors WHERE author_id IN (' + marks + ')', bind: ids, unknown: ids.filter((i) => !have.has(i)) };
+  }
+  return { error: 'choose who receives it' };
+}
+// A random v4-style id built in SQL, so one INSERT ... SELECT can create every row. Matches the 36-char shape handleAlertDelete accepts.
+const ALERT_ID_SQL = "lower(hex(randomblob(4)) || '-' || hex(randomblob(2)) || '-4' || substr(hex(randomblob(2)), 2) || '-' || substr('89ab', abs(random()) % 4 + 1, 1) || substr(hex(randomblob(2)), 2) || '-' || hex(randomblob(6)))";
+// The search box in the recipients sheet: part of an author ID (letters, digits, underscore), matched anywhere in the ID.
+function caSearch(raw) {
+  return String(raw || '').trim().toLowerCase().replace(/^@/, '').replace(/[^a-z0-9_]/g, '').slice(0, 34);
+}
+// One page of recipients (sql yields column s), newest accounts first, shaped like GET /admin/users rows. With a search q it
+// also reports how many recipients match (found) and, for a whole author ID, whether that account is one of them (check:
+// 'in' | 'out' | 'unknown' for an ID that belongs to no account).
+async function caRecipientPage(env, sql, bind, count, body) {
+  const cur = parseAdminCursor(body.cursor);
+  const q = caSearch(body.q);
+  const res = await env.ADS_DB.prepare(
+    'SELECT a.sub, a.author_id, a.created_at, p.last_seen, (SELECT COUNT(*) FROM published_notes n WHERE n.author_sub = a.sub) AS notes' +
+    " FROM authors a LEFT JOIN presence p ON p.id = 'u:' || a.sub WHERE a.sub IN (" + sql + ')' +
+    (q ? ' AND instr(a.author_id, ?) > 0' : '') +
+    (cur ? ' AND (a.created_at, a.sub) < (?, ?)' : '') + ' ORDER BY a.created_at DESC, a.sub DESC LIMIT ?'
+  ).bind(...bind, ...(q ? [q] : []), ...(cur ? [cur.key, cur.id] : []), ADMIN_DIR_PAGE + 1).all();
+  const rows = res.results || [];
+  const more = rows.length > ADMIN_DIR_PAGE;
+  if (more) rows.pop();
+  const last = rows[rows.length - 1];
+  const out = { users: await adminUserRows(env, rows, Date.now()), count, next: more && last ? last.created_at + '|' + last.sub : null };
+  if (q && !cur) {
+    const f = await env.ADS_DB.prepare('SELECT COUNT(*) AS n FROM authors a WHERE a.sub IN (' + sql + ') AND instr(a.author_id, ?) > 0').bind(...bind, q).first();
+    out.found = f ? f.n : 0;
+    const aid = adminAidQ(q);
+    if (aid) out.check = out.found ? 'in' : ((await adminSubFromAid(env, aid)) ? 'out' : 'unknown');
+  }
+  return out;
+}
+// The accounts a sent alert actually went to, read back from the alerts table (so it stays exact even for groups defined by a
+// moving period). Rows of one send share created_at, which newer Audit entries keep as ts; older entries are matched by
+// message and class within a couple of minutes of the entry. An account deleted since is gone from alerts and so from the list.
+async function customAlertSent(env, body) {
+  const message = typeof body.message === 'string' ? body.message : '';
+  const cls = typeof body.cls === 'string' ? body.cls : '';
+  const at = Number(body.at), ts = Number(body.ts);
+  if (!message || !CUSTOM_ALERT_CLASSES.includes(cls) || !Number.isFinite(at)) return textError(400, 'invalid audit entry');
+  const exact = Number.isFinite(ts) && ts > 0;
+  const sql = 'SELECT sub AS s FROM alerts WHERE kind = ? AND ref = ? AND message = ? AND created_at BETWEEN ? AND ?';
+  const bind = [CUSTOM_ALERT_KIND, 'custom:' + cls, message.slice(0, ALERT_MAX_LEN), exact ? ts : at - 120000, exact ? ts : at + 2000];
+  const row = await env.ADS_DB.prepare('SELECT COUNT(*) AS n FROM (' + sql + ')').bind(...bind).first();
+  return json(await caRecipientPage(env, sql, bind, row ? row.n : 0, body));
+}
+async function handleAdminCustomAlert(env, request) {
+  const g = await adminGate(env, request); if (g) return g;
+  const body = await adminBody(request);
+  await Promise.all([ensureAlerts(env), ensurePresence(env)]);
+  if (body.recipients === true) return customAlertSent(env, body);
+  const a = await customAlertAudience(env, body.audience);
+  if (a.error) return textError(400, a.error);
+  const row = await env.ADS_DB.prepare('SELECT COUNT(*) AS n FROM (' + a.sql + ')').bind(...a.bind).first();
+  const count = row ? row.n : 0;
+  if (body.preview === true && body.list === true) return json(await caRecipientPage(env, a.sql, a.bind, count, body));
+  if (body.preview === true) return json({ ok: true, count, unknown: a.unknown || [] });
+  const message = typeof body.message === 'string' ? body.message.replace(/[\u0000-\u001f\u007f]/g, ' ').replace(/\s+/g, ' ').trim() : '';
+  const cls = typeof body.classification === 'string' ? body.classification : '';
+  if (!message) return textError(400, 'message required');
+  if (message.length > CUSTOM_ALERT_MAX || new TextEncoder().encode(message).length > CUSTOM_ALERT_BYTES) return textError(400, 'message too long');
+  if (!CUSTOM_ALERT_CLASSES.includes(cls)) return textError(400, 'classification required');
+  if (a.unknown && a.unknown.length) return textError(400, 'unknown author ID: ' + a.unknown.slice(0, 3).join(', '));
+  if (!count) return textError(400, 'no accounts match');
+  // The audit entry must fit in KV key metadata (1024 bytes), so refuse a send whose record would not, rather than lose the record.
+  const ts = Date.now();
+  const meta = JSON.stringify({ at: ts, action: 'custom_alert', slug: null, detail: message, cls, aud: a.code, n: count + 9999, ts });
+  if (new TextEncoder().encode(meta).length > 1000) return textError(400, 'too long to record in Audit, shorten the message or choose fewer groups');
+  const r = await env.ADS_DB.prepare(
+    'INSERT INTO alerts (id, sub, kind, message, ref, created_at) SELECT ' + ALERT_ID_SQL + ', s, ?, ?, ?, ? FROM (' + a.sql + ')'
+  ).bind(CUSTOM_ALERT_KIND, message, 'custom:' + cls, ts, ...a.bind).run();
+  const sent = (r && r.meta && r.meta.changes) || count;
+  await audit(env, 'custom_alert', null, message, { cls, aud: a.code, n: sent, ts });
+  return json({ ok: true, sent });
+}
+
 // GET /admin/audit?cursor=: newest-first action log.
 async function handleAdminAudit(env, request, url) {
   const g = await adminGate(env, request); if (g) return g;
@@ -4322,8 +4548,34 @@ function ensureTrendTables(env) {
 }
 // SQL for the bucket a timestamp column falls in. The first bound parameter is the UTC offset.
 // Weeks are numbered from the Monday on/before 1970-01-01 so the page can derive the same key.
-function trendKeySql(bucket, col) {
-  const t = '(' + col + ' + CAST(? AS INTEGER))';
+// Per-timestamp UTC offsets, so buckets stay on the admin's own calendar across daylight-saving changes.
+// The page sends offs="<t0>:<off0>,<t1>:<off1>,...": off0 applies from the start of the range, and each later pair is the
+// moment the offset changed and its new value (both ms, ascending). Without offs the single off parameter applies throughout.
+const TREND_MAX_OFFS = 120;
+function parseTrendOffs(raw, off) {
+  if (!raw) return { offs: [off], cuts: [] };
+  const parts = String(raw).split(',');
+  if (parts.length > TREND_MAX_OFFS) return null;
+  const offs = [], cuts = [];
+  let prev = -Infinity;
+  for (const p of parts) {
+    const m = /^(-?\d{1,15}):(-?\d{1,9})$/.exec(p);
+    if (!m) return null;
+    const t = Number(m[1]), o = Number(m[2]);
+    if (!Number.isSafeInteger(t) || !Number.isSafeInteger(o) || Math.abs(o) > 15 * 3600000 || t <= prev) return null;
+    prev = t;
+    if (offs.length) cuts.push(t);
+    offs.push(o);
+  }
+  return { offs, cuts };
+}
+// Integers only (validated above), so they are inlined: D1 allows few bound parameters per statement.
+function trendOffSql(col, o) {
+  if (!o.cuts.length) return String(o.offs[0]);
+  return '(CASE ' + o.cuts.map((c, i) => 'WHEN ' + col + ' < ' + c + ' THEN ' + o.offs[i]).join(' ') + ' ELSE ' + o.offs[o.offs.length - 1] + ' END)';
+}
+function trendKeySql(bucket, col, o) {
+  const t = '(' + col + ' + ' + trendOffSql(col, o) + ')';
   if (bucket === 'day') return "strftime('%Y-%m-%d', " + t + " / 1000, 'unixepoch')";
   if (bucket === 'month') return "strftime('%Y-%m', " + t + " / 1000, 'unixepoch')";
   if (bucket === 'year') return "strftime('%Y', " + t + " / 1000, 'unixepoch')";
@@ -4337,6 +4589,8 @@ async function handleAdminTrends(env, request, url) {
   const from = parseInt(sp.get('from') || '', 10), to = parseInt(sp.get('to') || '', 10), off = parseInt(sp.get('off') || '0', 10);
   if (!Number.isFinite(from) || !Number.isFinite(to) || from < 0 || to <= from || to - from > TREND_MAX_SPAN_MS) return textError(400, 'invalid range');
   if (!Number.isFinite(off) || Math.abs(off) > 15 * 3600000) return textError(400, 'invalid offset');
+  const offSet = parseTrendOffs(sp.get('offs'), off);
+  if (!offSet) return textError(400, 'invalid offset');
   try {
     await ensureAdminIndexes(env);
     await ensureTrendTables(env);
@@ -4348,16 +4602,16 @@ async function handleAdminTrends(env, request, url) {
     for (const [name, table, col, where] of TREND_METRICS) {
       if (name === 'reports' && !indexed) continue;
       const w = where ? ' AND (' + where + ')' : '';
-      add(name, q('SELECT ' + trendKeySql(bucket, col) + ' AS k, COUNT(*) AS n FROM ' + table + ' WHERE ' + col + ' >= ? AND ' + col + ' < ?' + w + ' GROUP BY k', off, lo, to));
+      add(name, q('SELECT ' + trendKeySql(bucket, col, offSet) + ' AS k, COUNT(*) AS n FROM ' + table + ' WHERE ' + col + ' >= ? AND ' + col + ' < ?' + w + ' GROUP BY k', lo, to));
       add(name + ':before', q('SELECT COUNT(*) AS n FROM ' + table + ' WHERE ' + col + ' >= ? AND ' + col + ' < ?' + w, TREND_EPOCH, lo));
     }
     const dFrom = Math.floor(lo / 86400000), dTo = Math.floor(to / 86400000) + 1;
     for (const [nm, like] of [['active_u', 'u:%'], ['active_g', 'g:%']]) {
-      add(nm, q('SELECT ' + trendKeySql(bucket, '(day * 86400000)') + ' AS k, COUNT(DISTINCT id) AS n FROM activity_daily WHERE day >= ? AND day < ? AND id LIKE ? GROUP BY k', off, dFrom, dTo, like));
+      add(nm, q('SELECT ' + trendKeySql(bucket, '(day * 86400000 + 43200000)', offSet) + ' AS k, COUNT(DISTINCT id) AS n FROM activity_daily WHERE day >= ? AND day < ? AND id LIKE ? GROUP BY k', dFrom, dTo, like));
     }
     add('active_since', q('SELECT MIN(day) AS d FROM activity_daily'));
     if (indexed) {
-      add('rbr', q('SELECT ' + trendKeySql(bucket, 'reported_at') + ' AS k, reason AS r, COUNT(*) AS n FROM report_index WHERE reported_at >= ? AND reported_at < ? GROUP BY k, r', off, lo, to));
+      add('rbr', q('SELECT ' + trendKeySql(bucket, 'reported_at', offSet) + ' AS k, reason AS r, COUNT(*) AS n FROM report_index WHERE reported_at >= ? AND reported_at < ? GROUP BY k, r', lo, to));
       add('rtot', q('SELECT reason AS r, COUNT(*) AS t, COALESCE(SUM(dismissed_at IS NULL), 0) AS o FROM report_index WHERE reported_at >= ? GROUP BY r', TREND_EPOCH));
     }
     const res = await env.ADS_DB.batch(stmts);
@@ -4500,7 +4754,11 @@ async function handleAdminUsers(env, request, url) {
   if (more) rows.pop();
   const last = rows[rows.length - 1];
   const next = more && last ? (sort === 'active' ? (last.last_seen || 0) : last.created_at) + '|' + last.sub : null;
-  const users = await Promise.all(rows.map(async (r) => {
+  return json({ users: await adminUserRows(env, rows, now), total, next });
+}
+// Directory rows (admin Users list and the custom-alert recipient list): the D1 row plus what lives in the KV user record.
+async function adminUserRows(env, rows, now) {
+  return Promise.all(rows.map(async (r) => {
     let u = null;
     try { u = await getUserCached(env, r.sub); } catch (e) {}
     return {
@@ -4511,7 +4769,6 @@ async function handleAdminUsers(env, request, url) {
       suspended: !!(u && u.suspended && !u.pendingDeletionAt), deleting: !!(u && u.pendingDeletionAt)
     };
   }));
-  return json({ users, total, next });
 }
 
 // GET /admin/notes?cursor=&q=: published notes (signed-in publishers), newest first, keyset-paginated;
@@ -4637,7 +4894,8 @@ main{position:relative;z-index:1;max-width:720px;margin:0 auto;padding:2px 16px 
 /* controls */
 .btn{--bg:var(--s2);--fg:var(--text);--bd:var(--line2);appearance:none;-webkit-appearance:none;align-items:center;justify-content:center;gap:7px;min-height:44px;padding:0 16px;border-radius:14px;border:1px solid var(--bd);background:var(--bg);color:var(--fg);font-size:14.5px;font-weight:650;letter-spacing:-.005em;line-height:1;text-decoration:none;box-shadow:inset 0 1px 0 rgba(255,255,255,.07);transition:transform .12s,filter .15s}
 .btn:active{transform:scale(.97);filter:brightness(1.14)}
-.btn:disabled{opacity:.5;cursor:default}
+.btn:disabled,.btn[aria-disabled=true]{opacity:.5;cursor:default}
+.btn[aria-disabled=true]:active{transform:none;filter:none}
 .btn.wait::before{content:'';flex:none;width:13px;height:13px;border:2px solid currentColor;border-right-color:transparent;border-radius:50%;animation:spin .8s linear infinite}
 .btn.busy::before{content:"";flex:none;width:14px;height:14px;border-radius:50%;border:2px solid currentColor;border-right-color:transparent;animation:spin .7s linear infinite}
 .btn.busy:disabled{opacity:1}
@@ -4713,6 +4971,7 @@ main{position:relative;z-index:1;max-width:720px;margin:0 auto;padding:2px 16px 
 .card.open{--rows:1fr;--vis:visible;--vd:0s;--rot:180deg}
 .card.urgent{--edge:rgba(255,77,109,.55);--halo:0 0 0 1px rgba(255,77,109,.16),0 0 42px -10px rgba(255,77,109,.5)}
 .card.static{padding:18px}
+.tools-foot{margin:6px 0 0;text-align:center;color:var(--warn);font-size:12px;font-weight:700;letter-spacing:.14em;text-transform:uppercase}
 .card.note{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:14px 16px}
 .head{appearance:none;-webkit-appearance:none;display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:12px 14px;align-items:start;width:100%;padding:16px;border:0;background:none;text-align:left;color:inherit}
 .head:focus-visible{outline-offset:-3px}
@@ -4872,6 +5131,61 @@ main{position:relative;z-index:1;max-width:720px;margin:0 auto;padding:2px 16px 
 .log-top .ago{font-size:13px;color:var(--faint);font-weight:600}
 .log-main{display:flex;flex-direction:column;align-items:flex-start;gap:4px;margin-top:10px}
 .log-main .det{color:var(--muted);font-size:14px;word-break:break-word}
+.log-meta{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}
+.log-when{margin-top:8px;font-size:12.5px;color:var(--faint)}
+.fab{position:fixed;z-index:25;right:max(16px,calc((100vw - 720px)/2 + 16px));bottom:calc(92px + env(safe-area-inset-bottom,0px));width:56px;height:56px;padding:0;border:0;border-radius:20px;background:linear-gradient(180deg,#A0AEFF,#7F90FF);color:var(--accent-ink);box-shadow:0 12px 28px -6px rgba(127,144,255,.55),0 2px 8px rgba(2,3,18,.5);transition:transform .15s,filter .15s}
+.fab:not([hidden]){display:grid;place-items:center;animation:fade .22s ease both}
+.fab:active{transform:scale(.94);filter:brightness(1.1)}
+.fab .ico{width:26px;height:26px}
+.field.ta{display:block;height:auto;min-height:116px;padding:14px 16px;resize:vertical;line-height:1.45;font:inherit;color:inherit}
+.cnt{margin:6px 2px 0;text-align:right;font-size:12.5px;color:var(--faint)}
+.cnt.hot{color:var(--warn)}
+.alrow{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 12px}
+.alrow.top{margin-top:14px}
+.catgrid:not([hidden]){display:flex;flex-wrap:wrap;gap:8px;margin:0 0 4px}
+.recip{margin:12px 2px 0;font-size:14px;color:var(--muted)}
+.recip b{color:var(--text)}
+.recip.err{color:var(--danger)}
+.sel .pick.flag,.field.flag{border-color:var(--danger)}
+.recip-go{appearance:none;-webkit-appearance:none;display:inline-flex;align-items:center;gap:4px;max-width:100%;padding:4px 0;border:0;background:none;color:var(--muted);font:inherit;text-align:left;cursor:pointer}
+.recip-go b{color:var(--accent)}
+.recip-go .ico{flex:none;width:16px;height:16px;transform:rotate(-90deg)}
+.recip-go:active{opacity:.7}
+.alrow[hidden]{display:none}
+.alml{align-self:center;font-size:13px;color:var(--muted)}
+.perbox{margin:0 0 12px;padding:14px;border-radius:18px;border:1px solid var(--line);background:var(--well)}
+.per-h{display:flex;flex-direction:column;align-items:flex-start;gap:3px}
+.per-t{font-size:15px;font-weight:700}
+.per-v{font-size:13px;font-weight:650;color:var(--accent);text-align:left;word-break:break-word}
+.per-s{margin:2px 0 12px;font-size:13px;color:var(--faint)}
+.per-last:not([hidden]){display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-bottom:4px}
+.per-n{width:96px;flex:none;text-align:center;padding:0 12px}
+.per-range{display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(190px,1fr))}
+.per-range .field{appearance:none;-webkit-appearance:none;min-width:0;font:inherit;color:var(--text)}
+select.field{color-scheme:dark;font:inherit;color:var(--text);appearance:none;-webkit-appearance:none;background-image:none;text-overflow:ellipsis}
+select.field::-ms-expand{display:none}
+.per-lab{display:block;margin:0 2px 6px;font-size:13px;font-weight:600;color:var(--muted)}
+.dt-wrap{overflow:hidden}
+.dt-wrap.empty .dt-txt{color:var(--faint)}
+.dt-wrap input{position:absolute;top:0;left:0;width:100%;height:100%;min-height:0;margin:0;padding:0;opacity:0;cursor:pointer;-webkit-appearance:none;appearance:none}
+.dt-wrap input::-webkit-calendar-picker-indicator{position:absolute;top:0;left:0;width:100%;height:100%;margin:0;padding:0;opacity:0;cursor:pointer}
+.per-err{margin-top:8px;font-size:13px;color:var(--danger)}
+.per-err:empty{display:none}
+.log-aud{margin:8px 0 0;font-size:13px;color:var(--muted);word-break:break-word}
+.chip.rchip{height:32px;padding:0 6px 0 12px;gap:2px;border:0;cursor:pointer;font-family:inherit;--c:var(--accent);--cb:var(--accent-bg)}
+.rchip .ico{width:16px;height:16px;transform:rotate(-90deg)}
+.rchip:active{opacity:.7}
+.sheet-top{flex:none;margin:0 0 6px;padding:0 0 12px;border-bottom:1px solid var(--line)}
+.sheet-top .ptitle{margin:0 0 4px}
+.sheet-top .search{margin:10px 0 0}
+.rsub,.rcnt{font-size:13px;color:var(--muted)}
+.rsub:empty,.rcnt:empty,.rchk:empty{display:none}
+.rsub{margin:0 0 2px}
+.sheet-body .rsub{margin:12px 2px 0}
+.rchk{margin-top:10px;padding:10px 14px;border-radius:14px;background:var(--s2);color:var(--muted);font-size:14px;font-weight:600}
+.rchk.good{color:var(--ok);background:var(--ok-bg)}
+.rchk.bad{color:var(--danger);background:var(--danger-bg)}
+.rchk.warn{color:var(--warn);background:var(--warn-bg)}
 .lnk{appearance:none;-webkit-appearance:none;border:0;background:none;padding:0;color:var(--accent);font-weight:650;font-size:15px}
 
 .empty{text-align:center;padding:52px 20px;color:var(--muted)}
@@ -4924,7 +5238,7 @@ body[data-auth=out] #msg{bottom:calc(24px + env(safe-area-inset-bottom,0px))}
 .coc-intro{margin:8px 0 12px;color:var(--muted);font-size:15px}
 .sheet-body.coc-c .tile{margin-left:auto;margin-right:auto}
 .sheet-body.coc-c h2,.sheet-body.coc-c .coc-intro{text-align:center}
-.coc-tags{position:sticky;top:0;z-index:2;display:flex;flex-wrap:nowrap;gap:5px;margin:0 -22px 6px;padding:8px 12px 10px;background:linear-gradient(180deg,#242742,#242742 80%,rgba(36,39,66,0))}
+.coc-tags{position:sticky;top:0;z-index:2;display:flex;flex-wrap:nowrap;gap:5px;margin:0 -22px 6px;padding:8px 22px 10px;background:linear-gradient(180deg,#242742,#242742 80%,rgba(36,39,66,0))}
 .coc-tags button{flex:1 1 auto;min-width:0;appearance:none;-webkit-appearance:none;cursor:pointer;padding:6px 4px;text-align:center;white-space:nowrap;border-radius:999px;background:var(--s2);border:1px solid var(--line2);color:var(--text);font:inherit;font-size:12.5px;font-weight:700;transition:transform .12s,filter .15s}
 .coc-tags button:active{transform:scale(.95);filter:brightness(1.2)}
 .coc-sec{margin:0 0 12px;padding:14px 15px 10px;border-radius:18px;border:1px solid var(--line);background:var(--well)}
@@ -5064,7 +5378,33 @@ body[data-auth=out] #msg{bottom:calc(24px + env(safe-area-inset-bottom,0px))}
       <button class="btn block more" id="aumore" hidden>Load more</button>
     </div>
 
+    <div id="p-alerts" class="pnl">
+      <div class="card static">
+        <div class="sec-head"><span class="tile sev-ad"><span class="ico" data-i="bell"></span></span><div><div class="card-t">Message</div><div class="card-s">Shown in each account's Alerts, word for word. The exact text is kept in Audit.</div></div></div>
+        <textarea class="field ta" id="almsg" rows="4" maxlength="250" placeholder="Write the alert" aria-label="Alert message" autocomplete="off" spellcheck="true"></textarea>
+        <div class="cnt" id="alcnt">0 / 250</div>
+        <div class="alrow top"><span class="sel"><button type="button" class="pick" id="alcls" aria-label="Classification" aria-haspopup="listbox" value="">Choose a classification</button><span class="ico" data-i="chev"></span></span></div>
+        <div class="fine" style="margin-top:0">For the record only. Accounts do not see the classification.</div>
+      </div>
+      <div class="card static">
+        <div class="sec-head"><span class="tile sev-other"><span class="ico" data-i="users"></span></span><div><div class="card-t">Send to</div><div class="card-s">Everyone, one or more groups, or specific accounts.</div></div></div>
+        <div class="alrow sev-ad" id="alaud"></div>
+        <div class="catgrid" id="alcats" hidden></div>
+        <div class="alrow sev-ad" id="almatch" hidden></div>
+        <div id="alper" hidden></div>
+        <div id="alusers" hidden><textarea class="field ta" id="alids" rows="3" placeholder="Author IDs, one per line (up to 50)" aria-label="Author IDs" autocomplete="off" autocapitalize="off" spellcheck="false"></textarea></div>
+        <div class="recip" id="alrecip"></div>
+      </div>
+      <button class="btn primary block" id="alsend" aria-disabled="true">Send alert</button>
+      <button class="btn quiet block" id="alaudit" style="margin-top:10px">See sent alerts in Audit</button>
+    </div>
+
     <div id="p-tools" class="pnl">
+      <div class="card static">
+        <div class="sec-head"><span class="tile sev-ad"><span class="ico" data-i="chart"></span></span><div><div class="card-t">Time zone</div><div class="card-s">Every date and time here, and the Custom alerts date pickers, use this zone.</div></div></div>
+        <select class="field" id="tzsel" aria-label="Time zone"></select>
+        <div class="card-s" id="tzcur" style="margin:8px 2px 0"></div>
+      </div>
       <div class="card static">
         <div class="sec-head"><span class="tile sev-ad"><span class="ico" data-i="image"></span></span><div><div class="card-t">Snapshot previews</div><div class="card-s">Choose which images load when you view a snapshot.</div></div></div>
         <label class="tog"><span class="tog-text"><b>Embedded images</b><small>Load embedded (data:) images in snapshot previews. Off by default.</small></span><input type="checkbox" id="imgs"></label>
@@ -5079,8 +5419,10 @@ body[data-auth=out] #msg{bottom:calc(24px + env(safe-area-inset-bottom,0px))}
         <div class="sec-head"><span class="tile sev-csam"><span class="ico" data-i="trash"></span></span><div><div class="card-t">Purge</div><div class="card-s">The same jobs the cron runs: deletes expired unpublished pages, accounts past their deletion window, stale like/follow timestamps, unreferenced backup images, and old presence, alert, activity and report-index records.</div></div></div>
         <button class="btn danger block" id="purgego">Run purge now</button>
       </div>
+      <div class="tools-foot">Approved Personnel Only</div>
     </div>
   </main>
+  <button type="button" class="fab" id="alfab" aria-label="Send a custom alert" hidden><span class="ico" data-i="bell"></span></button>
 
   <div class="dock"><nav class="nav" aria-label="Sections">
     <i class="pill" id="pill"></i>
@@ -5118,6 +5460,7 @@ var ICON={
   copy:svg('<rect x="9" y="9" width="11" height="11" rx="2.5"/><path d="M15 9V6.5A2.5 2.5 0 0 0 12.5 4h-6A2.5 2.5 0 0 0 4 6.5v6A2.5 2.5 0 0 0 6.5 15H9"/>'),
   ads:svg('<path d="M4 13.5v-4l10-4.5v13l-10-4.5Z"/><path d="M17.5 9.5a3.5 3.5 0 0 1 0 5"/><path d="m6.5 14.5 1.5 4.5h2.5l-1-3.7"/>'),
   audit:svg('<circle cx="12" cy="12" r="8"/><path d="M12 7.6V12l2.9 1.9"/>'),
+  bell:svg('<path d="M6 16.5V11a6 6 0 0 1 12 0v5.5l1.5 1.5h-15z"/><path d="M10 20.3a2 2 0 0 0 4 0"/>'),
   tools:svg('<path d="M4 7h8M17 7h3M4 17h3M12 17h8"/><circle cx="14.5" cy="7" r="2.5"/><circle cx="9.5" cy="17" r="2.5"/>'),
   chart:svg('<path d="M5 20v-9"/><path d="M12 20V4"/><path d="M19 20v-6"/>'),
   check:svg('<circle cx="12" cy="12" r="9"/><path d="m8 12.5 3 3 5-6"/>'),
@@ -5184,9 +5527,9 @@ function refreshFrames(){document.querySelectorAll('iframe').forEach(function(f)
 
 /* ---------- Core state and helpers ---------- */
 var tok=sessionStorage.getItem('adm')||'',next=null,all=[],cur='reports',adCur='',adTotal=0,auNext=null,auAll=[],auFilter='',lkSlug='',lkOwner=false,lkShown='',lkGen=0,navI=(history.state&&history.state.i)||0,navLog=[],sheetH=false,ignorePop=false,openSet={},mt=null,recents=[],curSheet=null,repSub='',fullBusy=false,rIdx=false,rAgg=null,rGen=0,reindexing=false,qT=null;
-var TABS=['overview','reports','lookup','ads','audit','tools'];
-var TITLES={overview:'Overview',reports:'Reports',lookup:'Lookup',ads:'Ads',audit:'Audit',tools:'Tools'};
-var SUBS={overview:'Trends over time, totals and directories',lookup:'Find a page, its owner and history',ads:'Campaigns running on published pages',audit:'Every admin action, newest first',tools:'Previews and maintenance'};
+var TABS=['overview','reports','lookup','ads','audit','tools','alerts'];
+var TITLES={overview:'Overview',reports:'Reports',lookup:'Lookup',ads:'Ads',audit:'Audit',tools:'Tools',alerts:'Custom alerts'};
+var SUBS={overview:'Trends over time, totals and directories',lookup:'Find a page, its owner and history',ads:'Campaigns running on published pages',audit:'Every admin action, newest first',tools:'Previews and maintenance',alerts:'Send a message to accounts'};
 function parseNav(h){
   h=String(h||'');if(h.charAt(0)==='#')h=h.slice(1);if(h.charAt(0)==='/')h=h.slice(1);
   var p=h.split('/'),slug='';
@@ -5199,7 +5542,17 @@ var NAV0=parseNav(location.hash)||parseNav(sessionStorage.getItem('admT'))||{t:'
 cur=NAV0.t;lkSlug=NAV0.slug;lkOwner=!!NAV0.o;
 try{history.scrollRestoration='manual'}catch(e){}
 function el(t,c,x){var e=document.createElement(t);if(c)e.className=c;if(x!=null)e.textContent=x;return e}
-function fmt(t){return t?new Date(t).toLocaleString():'-'}
+var TZ='';try{TZ=localStorage.getItem('bbtz')||''}catch(e){}
+function tzOk(z){try{new Intl.DateTimeFormat('en',{timeZone:z});return true}catch(e){return false}}
+if(TZ&&!tzOk(TZ))TZ='';
+function tzName(){return TZ||(Intl.DateTimeFormat().resolvedOptions().timeZone)||'UTC'}
+var tzF=null,tzFN='';function tzFmt(){var n=tzName();if(tzF&&tzFN===n)return tzF;tzFN=n;tzF=new Intl.DateTimeFormat('en-US',{timeZone:tzName(),hourCycle:'h23',year:'numeric',month:'numeric',day:'numeric',hour:'numeric',minute:'numeric',second:'numeric'});return tzF}
+function tzOff(ms){var p={};tzFmt().formatToParts(new Date(ms)).forEach(function(x){p[x.type]=+x.value});return Date.UTC(p.year,p.month-1,p.day,p.hour,p.minute,p.second)-Math.floor(ms/1000)*1000}
+function tzShift(ms){return ms+tzOff(ms)}
+function tzUtc(loc){return loc-tzOff(loc-tzOff(loc))}
+function tzAbbr(){try{var r='';new Intl.DateTimeFormat('en-US',{timeZone:tzName(),timeZoneName:'short'}).formatToParts(new Date()).forEach(function(x){if(x.type==='timeZoneName')r=x.value});return r||tzName()}catch(e){return tzName()}}
+function fmt(t){return t?new Date(t).toLocaleString(undefined,{timeZone:tzName()}):'-'}
+function fmtD(t){return new Date(t).toLocaleDateString(undefined,{timeZone:tzName()})}
 function num(n){return Number(n||0).toLocaleString()}
 /* Shrink a big number's font until it fits its box (long totals). */
 function fitNum(e){
@@ -5228,7 +5581,7 @@ function fitAll(){fitT=0;fitMO.disconnect();
 function fitSoon(){if(!fitT)fitT=requestAnimationFrame(fitAll)}
 function agoS(t){if(!t)return'-';var s=Math.max(0,(Date.now()-t)/1000);if(s<60)return'now';var m=s/60;if(m<60)return Math.floor(m)+'m';var h=m/60;if(h<24)return Math.floor(h)+'h';var d=h/24;if(d<14)return Math.floor(d)+'d';if(d<60)return Math.floor(d/7)+'w';return Math.floor(d/30)+'mo'}
 function ago(t){if(!t)return'-';var s=Math.max(0,(Date.now()-t)/1000);if(s<60)return'just now';var m=s/60;if(m<60)return Math.floor(m)+'m ago';var h=m/60;if(h<24)return Math.floor(h)+'h ago';var d=h/24;if(d<30)return Math.floor(d)+'d ago';return new Date(t).toLocaleDateString()}
-function dayLabel(t){var d=new Date(t),n=new Date(),a=new Date(d.getFullYear(),d.getMonth(),d.getDate()),b=new Date(n.getFullYear(),n.getMonth(),n.getDate()),diff=Math.round((b-a)/864e5);if(diff===0)return'Today';if(diff===1)return'Yesterday';return d.toLocaleDateString(undefined,{weekday:'long',month:'short',day:'numeric'})}
+function dayLabel(t){var d=new Date(tzShift(t)),n=new Date(tzShift(Date.now())),a=Date.UTC(d.getUTCFullYear(),d.getUTCMonth(),d.getUTCDate()),b=Date.UTC(n.getUTCFullYear(),n.getUTCMonth(),n.getUTCDate()),diff=Math.round((b-a)/864e5);if(diff===0)return'Today';if(diff===1)return'Yesterday';return d.toLocaleDateString(undefined,{weekday:'long',month:'short',day:'numeric',timeZone:'UTC'})}
 function msg(t,k,act){
   var m=$('msg');clearTimeout(mt);
   if(!t){m.className='';m.textContent='';return}
@@ -5242,7 +5595,7 @@ var inflight=0;
 function spin(d){inflight=Math.max(0,inflight+d);$('rf').classList.toggle('spin',inflight>0)}
 function api(path,o){o=o||{};var h={'X-Admin-Token':tok};if(o.body)h['Content-Type']='application/json';
   spin(1);
-  return fetch(path,{method:o.method||'GET',headers:h,body:o.body?JSON.stringify(o.body):undefined}).then(function(r){return r.json().catch(function(){return{}}).then(function(j){spin(-1);if(r.ok&&o.method&&o.method!=='GET'&&path.indexOf('/admin/reports/reindex')<0)staleViews();return{ok:r.ok,s:r.status,j:j}})},function(e){spin(-1);msg('Network error, check your connection');throw e})}
+  return fetch(path,{method:o.method||'GET',headers:h,body:o.body?JSON.stringify(o.body):undefined}).then(function(r){return r.json().catch(function(){return{}}).then(function(j){spin(-1);if(r.ok&&o.method&&o.method!=='GET'&&path.indexOf('/admin/reports/reindex')<0&&!(o.body&&(o.body.preview||o.body.recipients)))staleViews();return{ok:r.ok,s:r.status,j:j}})},function(e){spin(-1);try{e._shown=true}catch(x){}msg('Could not reach the server. Check your connection and try again','err');throw e})}
 // A change made here (dismiss, take down, restore, story, owner, ad, NCMEC) leaves the other tabs showing old
 // numbers until a reload. Clear what they cached so each one refetches the next time it is opened.
 var repStale=false;
@@ -5257,6 +5610,15 @@ function link(label,href){var a=el('a','btn',label);a.href=href;a.target='_blank
 function chip(text,cls){return el('span','chip'+(cls?' '+cls:''),text)}
 function aidRow(c,id){if(!id)return;var d=el('div','kv');d.appendChild(el('b',null,'Author ID'));var v=el('span','aid',id);v.style.cssText='font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:13px;cursor:pointer';v.onclick=function(){try{navigator.clipboard.writeText(id).then(function(){msg('Author ID copied')},function(){msg(id)})}catch(e){msg(id)}};d.appendChild(v);c.appendChild(d)}
 function kv(c,k,v){var d=el('div','kv');d.appendChild(el('b',null,k));d.appendChild(el('span',null,v));c.appendChild(d)}
+// Report counts always say what the reports were for. by = {reason:{total,open}}. skipZero hides empty reasons;
+// compact shows 'Spam x2' instead of 'Spam 2 (1 open)' for tight rows.
+function repChips(c,by,skipZero,compact){['csam','abuse','copyright','spam','other'].forEach(function(k){var v=by&&by[k];if(!v&&skipZero)return;v=v||{total:0,open:0};c.appendChild(chip(trRL[k]+' '+(compact?'x'+num(v.total):num(v.total)+(v.open?' ('+num(v.open)+' open)':'')),'by-sev sev-'+k))})}
+function repKvs(k,d){
+  var rs=d.reportStats;
+  kv(k,'Reports on file',rs?num(rs.total)+(rs.total?' ('+num(rs.open)+' open, '+num(rs.total-rs.open)+' dismissed)':''):String(d.reports));
+  if(rs&&rs.total){var r=el('div','kv');r.appendChild(el('b',null,'By reason'));var s=el('span',null),cs=el('div','chips');cs.style.marginTop='0';repChips(cs,rs.byReason,true);s.appendChild(cs);r.appendChild(s);k.appendChild(r)}
+  else if(!rs&&d.reports)kv(k,'By reason','needs the report index (open the Reports tab once)')
+}
 function slugFrom(v){v=(v||'').trim().toLowerCase();var q=v.indexOf('?');if(q>-1)v=v.slice(0,q);var p=v.split('/').filter(Boolean);v=p.length?p[p.length-1]:'';return v.charAt(0)==='@'?v.slice(1):v}
 function slugEl(s){var d=el('div','slug');d.appendChild(el('span','sl','/'));d.appendChild(document.createTextNode(s));return d}
 function tile(sev,icon){var t=el('span','tile sev-'+sev);t.appendChild(ico(icon));return t}
@@ -5467,11 +5829,11 @@ window.addEventListener('resize',xHintAll);
 function showTab(t){
   cur=t;
   TABS.forEach(function(n){$('p-'+n).classList.toggle('on',n===t)});
-  [].forEach.call(document.querySelectorAll('.tab'),function(b){if(b.getAttribute('data-t')===t)b.setAttribute('aria-current','page');else b.removeAttribute('aria-current')});
-  $('pill').style.transform='translateX('+(TABS.indexOf(t)*100)+'%)';
+  [].forEach.call(document.querySelectorAll('.tab'),function(b){if(b.getAttribute('data-t')===(t==='alerts'?'tools':t))b.setAttribute('aria-current','page');else b.removeAttribute('aria-current')});
+  $('pill').style.transform='translateX('+(TABS.indexOf(t==='alerts'?'tools':t)*100)+'%)';
   $('ttl').textContent=TITLES[t];$('bttl').textContent=TITLES[t];document.title=TITLES[t]+' - Bluebook Admin';
   navChrome();
-  $('rf').hidden=t==='tools';
+  $('rf').hidden=t==='tools'||t==='alerts';$('alfab').hidden=t!=='tools';if(t==='alerts')alRecip();
   setSub();
   if(t==='reports'&&repStale){repStale=false;loadReports(true)}
   if(t==='overview'&&!ovS.loaded){ovS.loaded=true;loadOverview();ovList(true)}
@@ -5480,6 +5842,20 @@ function showTab(t){
   requestAnimationFrame(xHintAll)
 }
 function goTab(t){showTab(t);navPush();window.scrollTo(0,0)}
+function tzInit(){
+  var sel=$('tzsel');if(!sel)return;
+  var zs=[];try{zs=Intl.supportedValuesOf('timeZone')}catch(e){}
+  if(!zs.length)zs=['Africa/Lagos','Africa/Cairo','Africa/Johannesburg','America/New_York','America/Chicago','America/Los_Angeles','America/Sao_Paulo','Asia/Dubai','Asia/Kolkata','Asia/Singapore','Asia/Tokyo','Australia/Sydney','Europe/London','Europe/Paris','Europe/Moscow'];
+  if(zs.indexOf('UTC')<0)zs.unshift('UTC');
+  var dev=Intl.DateTimeFormat().resolvedOptions().timeZone||'UTC';
+  var o=document.createElement('option');o.value='';o.textContent='Auto (this device: '+dev+')';sel.appendChild(o);
+  zs.forEach(function(z){var p=document.createElement('option');p.value=z;p.textContent=z.replace(/_/g,' ');sel.appendChild(p)});
+  sel.value=TZ;if(sel.value!==TZ)sel.value='';
+  function cur(){$('tzcur').textContent='Now: '+fmt(Date.now())+' ('+tzAbbr()+')'}
+  cur();setInterval(cur,30000);
+  sel.onchange=function(){try{if(sel.value)localStorage.setItem('bbtz',sel.value);else localStorage.removeItem('bbtz')}catch(e){}TZ=sel.value;cur();msg('Time zone set to '+(TZ||dev),'ok');setTimeout(function(){location.reload()},700)}
+}
+function auOpenAlerts(){auFilter='custom_alert';var had=auAll.length>0;goTab('audit');if(had)loadAudit(true)}
 function goBack(){if(navI>0)history.back()}
 function loggedIn(ok){
   document.body.dataset.auth=ok?'in':'out';
@@ -5487,7 +5863,85 @@ function loggedIn(ok){
   showTab(cur);navSync();
   if(cur==='lookup'&&lkSlug){$('lkslug').value=lkSlug;doLookup(lkSlug,lkOwner)}
 }
-function bad(o){if(o.s===403||o.s===429){sessionStorage.removeItem('adm');loggedIn(false)}msg(o.j.error||(o.s===403?'Not authorized, check your admin token':o.s===429?'Too many attempts, try again shortly':'Request failed ('+o.s+')'))}
+// Plain-language failure text. errWhy turns a server reply (its message and status) into a sentence that says what went wrong and
+// what to do next; errMsg puts it after what was being attempted; showErr shows it as an error toast.
+var ERR_TXT={
+  'sign-in required':'You are signed out. Sign in again.',
+  'invalid admin token':'The admin token was not accepted. Check it and sign in again.',
+  'invalid token':'The admin token was not accepted. Check it and sign in again.',
+  'missing token':'No admin token was sent. Sign in again.',
+  'too many failed attempts, try again in 5 minutes':'Too many failed sign-in attempts. Wait 5 minutes and try again.',
+  'invalid slug':'That page address is not valid.',
+  'invalid or reserved slug':'That page address is not valid.',
+  'not found':'That item no longer exists. Refresh and try again.',
+  'page not found':'That page no longer exists.',
+  'report not found':'That report no longer exists. Refresh the list.',
+  'account not found':'That account no longer exists.',
+  'author not found':'No account has that author ID.',
+  'no account with that author id':'No account has that author ID.',
+  'no account for this slug':'No account is linked to this page.',
+  'not live':'That page is not live.',
+  'no such image':'That image no longer exists.',
+  'no backup yet':'There is no backup yet.',
+  'invalid json body':'The request was malformed. Reload the page and try again.',
+  'invalid body':'The request was malformed. Reload the page and try again.',
+  'reason required':'A reason is required.',
+  'invalid action':'That action is not available here. Reload the page and try again.',
+  'unknown action':'That action is not available here. Reload the page and try again.',
+  'invalid author id':'That is not a valid author ID (a_ followed by 32 characters).',
+  'invalid audit entry':'That Audit entry is not valid. Refresh Audit and try again.',
+  'invalid alert id':'That alert no longer exists. Refresh and try again.',
+  'invalid timestamp':'That saved copy reference is not valid. Reload the page and try again.',
+  'invalid report key':'That report no longer exists. Refresh the list.',
+  'invalid offset':'The list position is out of date. Refresh and try again.',
+  'invalid cursor':'The list position is out of date. Refresh and try again.',
+  'invalid range':'That date range is not valid. Choose another one.',
+  'invalid bucket':'That time grouping is not valid. Choose another one.',
+  'snapshot not found':'That saved copy no longer exists.',
+  'page content missing':'The stored page content is missing, so it cannot be shown.',
+  'take the ad down first':'Take the ad down first, then try again.',
+  'snapshot missing; cannot restore':'There is no saved copy of this page, so it cannot be restored.',
+  'slug is not admin-taken-down':'This page was not taken down by an admin, so it cannot be restored.',
+  'content no longer exists (past retention); cannot restore':'The saved copy was deleted after its retention period, so it cannot be restored.',
+  'ad is not running':'This ad is not running.',
+  'ad is not paused':'This ad is not paused.',
+  'ad is not active':'This ad is not active.',
+  'already refunded':'This ad was already refunded.',
+  'not registered as an ad':'This page is not registered as an ad.',
+  'ad not found':'That ad no longer exists. Refresh the list.',
+  'classification required':'Choose a classification.',
+  'message required':'Write the alert message.',
+  'message too long':'The message is over 250 characters. Shorten it.',
+  'no accounts match':'No accounts match this audience.',
+  'too many accounts, send to 50 or fewer at a time':'Too many accounts. Send to 50 or fewer at a time.',
+  'enter at least one author id':'Enter at least one author ID.',
+  'choose who receives it':'Choose who receives the alert.',
+  'choose at least one valid category':'Pick at least one group.',
+  'too long to record in audit, shorten the message or choose fewer groups':'This alert is too long to record in Audit. Shorten the message or choose fewer groups.',
+  'trends failed':'Could not calculate trends. Try again in a moment.',
+  'ad action failed':'The ad action did not go through. Try again.'
+};
+var ERR_STATUS={400:'The server could not accept that request. Reload the page and try again.',401:'Your admin session is not authorized. Sign in again.',403:'Your admin session is not authorized. Sign in again.',404:'That item was not found. It may have been removed. Refresh and try again.',405:'The server does not support that action. Reload the page, and if it keeps happening the dashboard and server are out of sync.',409:'This item changed since you loaded it. Refresh and try again.',413:'That is too large for the server to accept.',415:'That file type is not supported.',422:'The server could not process that. Check what you entered and try again.',429:'Too many requests. Wait a minute and try again.'};
+function errWhy(o){
+  var j=(o&&o.j)||{},s=(o&&o.s)||0,e=String(j.error||'').trim(),k=e.toLowerCase();
+  if(k&&ERR_TXT[k])return ERR_TXT[k];
+  if(k.indexOf('unknown author id')===0)return'No account has these author IDs: '+e.slice(e.indexOf(':')+1).trim()+'.';
+  if(k.indexOf('not eligible')===0)return'This ad cannot run yet: '+e.slice(e.indexOf(':')+1).trim()+'.';
+  if(k.indexOf('ids must be an array')===0)return'Too many author IDs. Send to 50 or fewer at a time.';
+  if(k.indexOf('internal error')===0)s=500;
+  var f=!s?'No reply from the server. Check your connection and try again.':ERR_STATUS[s]||(s>=500?'The server hit a problem. Try again in a moment, and if it keeps failing check the Worker logs.':'The server sent an unexpected reply. Try again, and reload the page if it keeps happening.');
+  return k&&k.indexOf('internal error')!==0&&s<500?f+' Details: '+e:f
+}
+function errMsg(o,what){var w=errWhy(o);return what?what+'. '+w:w}
+function showErr(o,what){msg(errMsg(o,what),'err')}
+// Anything uncaught still gets a toast, so a failure is never silent. Errors api() already reported are skipped.
+var errAt=0;
+function errAny(){var t=Date.now();if(t-errAt<3000)return;errAt=t;msg('Something went wrong in the dashboard. Reload the page and try again','err')}
+// A failed fetch was already reported by api(); anything else thrown inside a handler is a bug, so say so instead of blaming the network.
+function netFail(e){if(e&&e._shown)return;errAny()}
+window.addEventListener('error',function(e){if(/ResizeObserver|Script error/i.test(String(e&&e.message)))return;errAny()});
+window.addEventListener('unhandledrejection',function(e){var r=e&&e.reason;if(r&&r._shown)return;errAny()});
+function bad(o,what){if(o.s===403||o.s===429){sessionStorage.removeItem('adm');loggedIn(false)}showErr(o,what)}
 
 /* ---------- Reports ---------- */
 function fqv(){return $('fq').value.trim().toLowerCase().replace(/^\\/?@?/,'')}
@@ -5508,10 +5962,10 @@ function startReindex(){
   if(reindexing)return;reindexing=true;msg('Indexing reports for search\u2026');
   (function step(c){
     api('/admin/reports/reindex',{method:'POST',body:{cursor:c}}).then(function(o){
-      if(!o.ok){reindexing=false;bad(o);return}
+      if(!o.ok){reindexing=false;bad(o,'Could not rebuild the search index');return}
       if(o.j.done){reindexing=false;msg('');loadReports(true);return}
       step(o.j.cursor)
-    }).catch(function(){reindexing=false;msg('Network error, check your connection')})
+    }).catch(function(e){reindexing=false;netFail(e)})
   })('')
 }
 function loadReports(reset){
@@ -5520,7 +5974,7 @@ function loadReports(reset){
   return api('/admin/reports?'+repQuery()).then(function(o){
     if(g!==rGen)return;
     unskel(L);moreBusy($('more'),false);
-    if(!o.ok){bad(o);return}
+    if(!o.ok){bad(o,'Could not load reports');return}
     sessionStorage.setItem('adm',tok);if(document.body.dataset.auth!=='in'){msg('');loggedIn(true)}
     rIdx=o.j.indexed===true;
     if(o.j.agg||reset)rAgg=o.j.agg||null;
@@ -5529,7 +5983,7 @@ function loadReports(reset){
     if(o.j.indexed===false)startReindex();
     if(!o.j.reports.length&&next){return loadReports(false)}
     renderAll()
-  }).catch(function(){if(g!==rGen)return;unskel(L);moreBusy($('more'),false);msg('Network error, check your connection')})
+  }).catch(function(e){if(g!==rGen)return;unskel(L);moreBusy($('more'),false);netFail(e)})
 }
 function setBadge(n,hot,exact){var b=$('nb-reports');if(!n){b.hidden=true;return}b.hidden=false;b.textContent=n>99?'99+':String(n)+(next&&!exact?'+':'');b.className='nb'+(hot?' hot':'')}
 function hasCsam(g){return g.items.some(function(x){return x.isCsam})}
@@ -5627,11 +6081,12 @@ function setSlugStatus(slug,st){all.forEach(function(r){if(r.slug===slug)r.statu
 function renderGroup(g){
   var first=g.items[0],csam=hasCsam(g),sev=csam?'csam':topSev(g);
   var nc=null;g.items.forEach(function(x){if(x.ncmec&&!nc)nc=x.ncmec});
-  var chips=[],seen={};
-  g.items.forEach(function(x){if(!seen[x.reason]){seen[x.reason]=1;chips.push(reasonChip(x.reason,x.isCsam))}});
+  var chips=[],seen={},rc={};
+  g.items.forEach(function(x){rc[x.reason]=(rc[x.reason]||0)+1});
+  g.items.forEach(function(x){if(!seen[x.reason]){seen[x.reason]=1;var c0=reasonChip(x.reason,x.isCsam);if(rc[x.reason]>1)c0.textContent=x.reason+' x'+rc[x.reason];chips.push(c0)}});
   chips.push(stChip(first.status));
   if(g.items.length>1)chips.push(chip(g.items.length+' reports'));
-  if(csam)chips.push(chip(nc?'NCMEC '+new Date(nc.at).toLocaleDateString():'NCMEC not recorded',nc?'good':'bad'));
+  if(csam)chips.push(chip(nc?'NCMEC '+fmtD(nc.at):'NCMEC not recorded',nc?'good':'bad'));
   var card=mkCard({sev:sev,urgent:csam,icon:RICON[sev],slug:g.slug,chips:chips,sub:'Latest report '+ago(first.reportedAt),trail:agoS(first.reportedAt),key:'rep:'+g.key});
   var pad=card.pad;
   g.items.forEach(function(x){
@@ -5657,14 +6112,15 @@ function renderGroup(g){
   else foot.appendChild(btn('Dismiss',null,function(){dismissGroup(g,csam,nc,card.c)}));
   $('list').appendChild(card.c)
 }
-function sendKeys(path,keys){return Promise.all(keys.map(function(k){return api(path,{method:'POST',body:{key:k}})})).then(function(rs){return rs.every(function(r){return r.ok})})}
+var keyErr=null;
+function sendKeys(path,keys){keyErr=null;return Promise.all(keys.map(function(k){return api(path,{method:'POST',body:{key:k}}).then(function(r){if(!r.ok&&!keyErr)keyErr=r;return r})})).then(function(rs){return rs.every(function(r){return r.ok})},function(){keyErr={s:0,j:{}};return false})}
 function dropKeys(keys){all=all.filter(function(r){return keys.indexOf(r.key)<0})}
 function dismissGroup(g,csam,nc,card){
   var keys=g.items.map(function(x){return x.key}),slug=g.slug,removed=g.items.slice();
   if(csam){
     ask({title:'Dismiss /'+slug+'?',text:'CSAM report: only dismiss once the page is handled and NCMEC has been notified.'+(nc?'':'\\n\\nNO NCMEC REPORT IS RECORDED for this page.')+'\\n\\nThe record is hidden but kept for 18 months and can be brought back from Dismissed.',ok:'Dismiss',danger:true}).then(function(ok){
       if(!ok)return;
-      sendKeys('/admin/dismiss',keys).then(function(ok2){if(!ok2){msg('Could not dismiss /'+slug);return}dropKeys(keys);repAggDrop(removed);repRefresh();syncReportAgg();var r=el('div','card note');r.appendChild(el('span',null,'Dismissed /'+slug));r.appendChild(btn('Undo',null,function(){sendKeys('/admin/undismiss',keys).then(function(){loadReports(true)})}));card.replaceWith(r)})
+      sendKeys('/admin/dismiss',keys).then(function(ok2){if(!ok2){showErr(keyErr,'Could not dismiss /'+slug);return}dropKeys(keys);repAggDrop(removed);repRefresh();syncReportAgg();var r=el('div','card note');r.appendChild(el('span',null,'Dismissed /'+slug));r.appendChild(btn('Undo',null,function(){sendKeys('/admin/undismiss',keys).then(function(){loadReports(true)})}));card.replaceWith(r)})
     });
     return}
   // Instant: the card and the counts change on tap. The request goes out after a short Undo window,
@@ -5673,7 +6129,7 @@ function dismissGroup(g,csam,nc,card){
   dropKeys(keys);repAggDrop(removed);renderAll();
   var t=setTimeout(function(){sendKeys('/admin/dismiss',keys).then(function(ok){
     if(ok){syncReportAgg();return}
-    msg('Could not dismiss /'+slug);all=all.concat(removed);rAgg=prevAgg;renderAll()
+    showErr(keyErr,'Could not dismiss /'+slug);all=all.concat(removed);rAgg=prevAgg;renderAll()
   })},8000);
   msg('Dismissed /'+slug,'ok',{label:'Undo',fn:function(){clearTimeout(t);all=all.concat(removed);rAgg=prevAgg;renderAll();msg('Dismissal undone','ok')}})
 }
@@ -5683,7 +6139,7 @@ function undismiss(g,b){
   dropKeys(keys);repAggDrop(removed);renderAll();
   sendKeys('/admin/undismiss',keys).then(function(ok){
     if(ok){syncReportAgg();msg('Report restored to the open list');return}
-    msg('Could not restore the report');all=all.concat(removed);rAgg=prevAgg;renderAll()
+    showErr(keyErr,'Could not restore the report');all=all.concat(removed);rAgg=prevAgg;renderAll()
   })
 }
 
@@ -5694,7 +6150,7 @@ function takedown(slug,csam,done){
   return ask({title:'Take down /'+slug+'?',text:csam?'CSAM report: the page is preserved under deleted/ for 18 months. You must still report to NCMEC.':'The slug will be permanently locked.',ok:'Take down',danger:true,fields:[REASON_F]}).then(function(v){
     if(!v)return;var reason=reasonOf(v);if(!reason)return;
     return api('/publish/'+encodeURIComponent(slug),{method:'DELETE',body:{adminToken:tok,reason:reason}}).then(function(o){
-      if(o.ok){msg('Taken down /'+slug);done('taken down')}else if(o.s===404){msg('Page /'+slug+' is not live');done('missing')}else msg('Could not take down /'+slug+' ('+o.s+')')}).catch(function(){msg('Network error, check your connection')})
+      if(o.ok){msg('Taken down /'+slug);done('taken down')}else if(o.s===404){msg('Page /'+slug+' is not live');done('missing')}else showErr(o,'Could not take down /'+slug)}).catch(function(e){netFail(e)})
   })
 }
 function release(slug,done){
@@ -5704,7 +6160,7 @@ function release(slug,done){
     return api('/publish/'+encodeURIComponent(slug),{method:'DELETE',body:{adminToken:tok,release:true}}).then(function(o){
       if(o.ok){msg('Released /'+slug+', it can be published again');if(done)done()}
       else if(o.s===404)msg('Page /'+slug+' is not live, nothing to release');
-      else msg('Could not release /'+slug+' ('+o.s+')')}).catch(function(){msg('Network error, check your connection')})
+      else showErr(o,'Could not release /'+slug)}).catch(function(e){netFail(e)})
   })
 }
 function restore(slug,csam,ts,done){
@@ -5713,14 +6169,14 @@ function restore(slug,csam,ts,done){
   return ask({title:'Restore /'+slug+'?',text:w,ok:'Restore',danger:csam}).then(function(ok){
     if(!ok)return;
     return api('/admin/restore/'+encodeURIComponent(slug)+(ts?'?ts='+ts:''),{method:'POST'}).then(function(o){
-      if(o.ok){msg('Restored /'+slug);done('live')}else msg(o.j.error||'Could not restore /'+slug)}).catch(function(){msg('Network error, check your connection')})
+      if(o.ok){msg('Restored /'+slug);done('live')}else showErr(o,'Could not restore /'+slug)}).catch(function(e){netFail(e)})
   })
 }
 function recordNcmec(slug,done){
   return ask({title:'Record NCMEC report',text:'For /'+slug+'. Leave the report ID blank if there is none.',ok:'Save record',fields:[{label:'CyberTipline report ID',ph:'Report ID'},{label:'Note',ph:'Optional, up to 200 characters',max:200}]}).then(function(v){
     if(!v)return;
     return api('/admin/ncmec',{method:'POST',body:{slug:slug,reportId:v[0],note:v[1]||''}}).then(function(o){
-      if(o.ok){msg('NCMEC report recorded for /'+slug);if(done)done()}else msg(o.j.error||'Could not save the NCMEC record')})
+      if(o.ok){msg('NCMEC report recorded for /'+slug);if(done)done()}else showErr(o,'Could not save the NCMEC record')})
   })
 }
 function mkView(r,s,row){
@@ -5729,13 +6185,13 @@ function mkView(r,s,row){
     if(fr){fr.remove();fr=null;b.textContent='View';return}
     function open(){
       b.disabled=true;
-      fetch('/admin/snapshot/'+encodeURIComponent(r.slug)+'/'+s.ts,{headers:{'X-Admin-Token':tok}}).then(function(x){return x.text().then(function(t){return{ok:x.ok,t:t}})}).then(function(o){
+      fetch('/admin/snapshot/'+encodeURIComponent(r.slug)+'/'+s.ts,{headers:{'X-Admin-Token':tok}}).then(function(x){return x.text().then(function(t){return{ok:x.ok,s:x.status,t:t}})}).then(function(o){
         b.disabled=false;
-        if(!o.ok){msg('Could not load the snapshot');return}
+        if(!o.ok){var sj={};try{sj=JSON.parse(o.t)}catch(x){}showErr({s:o.s,j:sj},'Could not load the snapshot');return}
         fr=document.createElement('iframe');fr.setAttribute('sandbox','');fr.referrerPolicy='no-referrer';
         fr.className='snap-frame';
         row.appendChild(fr);setFrame(fr,o.t);b.textContent='Hide'
-      }).catch(function(){b.disabled=false;msg('Network error, check your connection')})
+      }).catch(function(e){b.disabled=false;netFail(e)})
     }
     if(r.isCsam)ask({title:'Open CSAM snapshot?',text:'This snapshot is from a CSAM report. It opens as text and styling only unless an images toggle is on in Tools.',ok:'Open',danger:true}).then(function(ok){if(ok)open()});
     else open()
@@ -5750,7 +6206,7 @@ function mkSnaps(slug,status,hitTs,card,csam,done){
     api('/admin/snapshots/'+encodeURIComponent(slug)).catch(function(){t.disabled=false;return null}).then(function(o){
       if(!o)return;
       t.disabled=false;
-      if(!o.ok){msg(o.j.error||'Could not load snapshots');return}
+      if(!o.ok){showErr(o,'Could not load snapshots');return}
       box=el('div','snaps');
       if(!o.j.snapshots.length)box.appendChild(el('div','snap-none','No snapshots for /'+slug));
       o.j.snapshots.forEach(function(s){
@@ -5761,12 +6217,13 @@ function mkSnaps(slug,status,hitTs,card,csam,done){
         line.appendChild(mkView({slug:slug,isCsam:csam},s,d));
         if(status==='taken down')line.appendChild(btn('Restore this copy','sm',function(){return restore(slug,csam,s.ts,done)}));
         d.appendChild(line);
-        var m=el('div','snap-meta');m.appendChild(el('code',null,new Date(s.ts).toISOString()+' / '+s.ts+' / '+Math.round(s.size/1024)+' KB'));
+        var m=el('div','snap-meta');m.appendChild(el('code',null,fmt(s.ts)+' '+tzAbbr()+' / '+s.ts+' / '+Math.round(s.size/1024)+' KB'));
         d.insertBefore(m,line.nextSibling);
         box.appendChild(d)
       });
-      card.appendChild(box)
-    }).catch(function(){t.disabled=false;msg('Network error, check your connection')})
+      card.appendChild(box);
+      if(box.scrollIntoView)box.scrollIntoView({behavior:'smooth',block:'start'})
+    }).catch(function(e){t.disabled=false;netFail(e)})
   });
   return t
 }
@@ -5800,12 +6257,12 @@ function doLookup(v,owner){
   lkAid='';lkSlug=slug;lkOwner=!!owner;setSub();var g=++lkGen;
   api('/admin/lookup?slug='+encodeURIComponent(slug)).then(function(o){
     if(g!==lkGen)return;
-    if(!o.ok){bad(o);return}
+    if(!o.ok){bad(o,'Could not look up that page');return}
     msg('');
     recents=[slug].concat(recents.filter(function(s){return s!==slug})).slice(0,8);renderRecents();
     renderLookup(o.j);navSync();
     if(owner&&o.j.found&&o.j.hasOwner)loadOwner(slug)
-  }).catch(function(){msg('Network error, check your connection')})
+  }).catch(function(e){netFail(e)})
 }
 function renderLookup(d){
   var out=$('lkout');out.textContent='';$('lkowner').textContent='';lkShown=d.slug;
@@ -5816,7 +6273,7 @@ function renderLookup(d){
   if(d.found){var cr=el('div','chips');cr.appendChild(stChip(d.status));if(d.csamHold)cr.appendChild(chip('CSAM hold','bad'));hm.appendChild(cr)}
   hd.appendChild(hm);c.appendChild(hd);
   var k=el('div','kvs');c.appendChild(k);
-  if(!d.found){kv(k,'Published','never');kv(k,'Reports on file',String(d.reports));out.appendChild(c);return}
+  if(!d.found){kv(k,'Published','never');repKvs(k,d);out.appendChild(c);return}
   var refresh=function(){doLookup(d.slug)};
   kv(k,'Title',d.title||'-');
   if(d.desc)kv(k,'Description',d.desc);
@@ -5831,7 +6288,7 @@ function renderLookup(d){
   if(d.story)kv(k,'Story',(d.story.title||'untitled')+' ('+fmt(d.story.createdAt)+')');
   kv(k,'Likes',num(d.likes));
   kv(k,'Ad',d.ad?d.ad.status+', '+d.ad.viewsUsed+' of '+d.ad.viewsTotal+' views':'none');
-  kv(k,'Reports on file',String(d.reports));kv(k,'Snapshots',String(d.snapshots));
+  repKvs(k,d);kv(k,'Snapshots',String(d.snapshots));
   if(d.csamHold)kv(k,'CSAM hold','yes (kept out of purge)');
   if(d.ncmec.length){d.ncmec.forEach(function(n){kv(k,'NCMEC',fmt(n.at)+(n.reportId?' - '+n.reportId:'')+(n.note?' - '+n.note:''))})}
   else if(d.csamHold)kv(k,'NCMEC','not recorded');
@@ -5857,12 +6314,12 @@ function storyAct(slug,action,done){
   var rm=action==='remove';
   return ask({title:rm?'Remove /'+slug+' from stories?':'Show /'+slug+' in stories again?',text:rm?'The page stays online. The owner cannot turn stories back on until you allow it.':'',ok:rm?'Remove':'Allow',danger:rm,fields:rm?[REASON_F]:undefined}).then(function(v){
     if(!v)return;var reason='';if(rm){reason=reasonOf(v);if(!reason)return}
-    return api('/admin/story',{method:'POST',body:{slug:slug,action:action,reason:reason}}).then(function(o){if(o.ok){msg(rm?'Removed /'+slug+' from stories':'Stories allowed again for /'+slug);done()}else msg(o.j.error||(rm?'Could not remove /'+slug+' from stories':'Could not allow stories for /'+slug))})
+    return api('/admin/story',{method:'POST',body:{slug:slug,action:action,reason:reason}}).then(function(o){if(o.ok){msg(rm?'Removed /'+slug+' from stories':'Stories allowed again for /'+slug);done()}else showErr(o,rm?'Could not remove /'+slug+' from stories':'Could not allow stories for /'+slug)})
   })
 }
 function loadOwner(slug){
   api('/admin/owner?slug='+encodeURIComponent(slug)).then(function(o){
-    if(!o.ok){msg(o.j.error||'Could not load the account');return}
+    if(!o.ok){showErr(o,'Could not load the account');return}
     var d=o.j,out=$('lkowner');out.textContent='';
     var c=el('div','card static sev-other');
     if(d.anonymous){c.appendChild(el('div',null,'Anonymous page: no account to act on.'));out.appendChild(c);return}
@@ -5870,7 +6327,7 @@ function loadOwner(slug){
     var hm=el('div');hm.appendChild(el('div','slug',d.email||'(account missing)'));
     var cr=el('div','chips');
     cr.appendChild(chip(d.suspended?'suspended':'active','st '+(d.suspended?'bad':'good')));
-    if(d.pendingDeletionAt)cr.appendChild(chip('deletion '+new Date(d.pendingDeletionAt+2592000000).toLocaleDateString(),'bad'));
+    if(d.pendingDeletionAt)cr.appendChild(chip('deletion '+fmtD(d.pendingDeletionAt+2592000000),'bad'));
     hm.appendChild(cr);hd.appendChild(hm);c.appendChild(hd);
     var st=el('div','stats');
     [['Subscribers',d.subscribers],['Likes',d.likes],['Live pages',d.pages.length],['Strikes',d.strikeCount],['Reports',d.reportStats?d.reportStats.total:null],['Alerts',d.alertTotal]].forEach(function(x){var s=el('div','stat');s.appendChild(el('b',null,x[1]==null?'-':num(x[1])));s.appendChild(el('span',null,x[0]));st.appendChild(s)});
@@ -5921,7 +6378,7 @@ function loadOwner(slug){
         r.appendChild(l);
         var m=el('div','pm');
         if(p.likes!=null){var lk=el('span','lk');lk.appendChild(ico('heart'));lk.appendChild(el('span','n',num(p.likes)));m.appendChild(lk)}
-        if(p.reports)m.appendChild(chip(p.reports+(p.reports===1?' report':' reports'),'bad'));
+        if(p.reports){if(p.byReason)repChips(m,p.byReason,true,true);else m.appendChild(chip(p.reports+(p.reports===1?' report':' reports'),'bad'))}
         if(p.showInStories)m.appendChild(chip('story'));
         if(m.children.length>1){r.className='pgrow stack';r.insertBefore(m,l)}else r.appendChild(m);
         c.appendChild(r)
@@ -5944,7 +6401,7 @@ function ownerAct(slug,action,title,text,danger,okLabel,done){
   return ask({title:title,text:text,ok:okLabel,danger:danger,fields:needs?[REASON_F]:undefined}).then(function(v){
     if(!v)return;var reason='';if(needs){reason=reasonOf(v);if(!reason)return}
     return api('/admin/owner/action',{method:'POST',body:{slug:slug,action:action,reason:reason}}).then(function(o){var OA=OWNER_ACT[action]||['Done','complete the account action'];
-      if(o.ok){msg(OA[0]);done()}else msg(o.j.error||'Could not '+OA[1])})
+      if(o.ok){msg(OA[0]);done()}else showErr(o,'Could not '+OA[1])})
   })
 }
 function takedownAll(pages,done){
@@ -5989,13 +6446,13 @@ function loadAds(reset){
   if(reset){adCur='';adTotal=0;L.textContent='';skel(L,3)}else moreBusy($('admore'),true);
   return api('/admin/ads?status='+encodeURIComponent($('adst').value)+'&q='+encodeURIComponent(adqv())+'&cursor='+encodeURIComponent(adCur)).then(function(o){
     unskel(L);moreBusy($('admore'),false);
-    if(!o.ok){bad(o);return}
+    if(!o.ok){bad(o,'Could not load ads');return}
     if(o.j.total!=null)adTotal=o.j.total;SUBS.ads=num(adTotal)+(adTotal===1?' campaign':' campaigns')+($('adst').value?' - '+$('adst').textContent.toLowerCase():'');if(cur==='ads')setSub();
     o.j.ads.forEach(renderAd);
     if(adFocus){var f=o.j.ads.filter(function(x){return x.slug===adFocus})[0];adFocus='';if(f&&f._c&&f._c.scrollIntoView)f._c.scrollIntoView({behavior:'smooth',block:'start'})}
     adCur=o.j.next;$('admore').hidden=adCur==null;
     if(!L.firstChild)L.appendChild(empty('No ads','No ads match this search or filter.','ads'))
-  }).catch(function(){unskel(L);moreBusy($('admore'),false);msg('Network error, check your connection')})
+  }).catch(function(e){unskel(L);moreBusy($('admore'),false);netFail(e)})
 }
 // The server's result applied to the card on screen: no list reload. Under a status filter a card that no
 // longer matches leaves the list, and the campaign count follows.
@@ -6018,7 +6475,7 @@ function adAct(a,action,refund,o){
   return ask(o).then(function(v){
     if(!v)return;var reason='';if(needs){reason=reasonOf(v);if(!reason)return}
     return api('/admin/ad',{method:'POST',body:{slug:a.slug,action:action,refund:!!refund,reason:reason}}).then(function(r){
-      if(r.ok){msg(r.j.refunded?r.j.refunded+(r.j.refunded===1?' view refunded':' views refunded'):AD_DONE[action]||'Done');adApplied(a,action)}else msg(r.j.error||'Could not '+(AD_VERB[action]||'update')+' the ad')})
+      if(r.ok){msg(r.j.refunded?r.j.refunded+(r.j.refunded===1?' view refunded':' views refunded'):AD_DONE[action]||'Done');adApplied(a,action)}else showErr(r,'Could not '+(AD_VERB[action]||'update')+' the ad')})
   })
 }
 function renderAd(a){
@@ -6043,12 +6500,12 @@ function renderAd(a){
 }
 
 /* ---------- Audit ---------- */
-var ACT_LBL={takedown:'Takedown',release:'Release',restore:'Restore',dismiss:'Dismiss',undismiss:'Undismiss',purge:'Purge',ncmec_recorded:'NCMEC recorded',owner_suspend:'Suspend account',owner_unsuspend:'Unsuspend account',owner_delete:'Delete account','owner_cancel-delete':'Cancel deletion','owner_clear-name':'Clear name','owner_clear-picture':'Clear picture',story_remove:'Story removed',story_allow:'Story allowed',ad_pause:'Ad paused',ad_resume:'Ad resumed',ad_takedown:'Ad taken down',ad_refund:'Ad refunded'};
+var ACT_LBL={takedown:'Takedown',release:'Release',restore:'Restore',dismiss:'Dismiss',undismiss:'Undismiss',purge:'Purge',ncmec_recorded:'NCMEC recorded',owner_suspend:'Suspend account',owner_unsuspend:'Unsuspend account',owner_delete:'Delete account','owner_cancel-delete':'Cancel deletion','owner_clear-name':'Clear name','owner_clear-picture':'Clear picture',story_remove:'Story removed',story_allow:'Story allowed',ad_pause:'Ad paused',ad_resume:'Ad resumed',ad_takedown:'Ad taken down',ad_refund:'Ad refunded',custom_alert:'Custom alert'};
 function actLbl(a){a=String(a||'');if(ACT_LBL[a])return ACT_LBL[a];a=a.replace(/[_-]+/g,' ').trim();return a.charAt(0).toUpperCase()+a.slice(1)}
 function actTone(a){a=String(a||'');if(/take|purge|suspend|delete|ban/.test(a)&&!/unsuspend|cancel/.test(a))return'bad';if(/restore|release|unsuspend|cancel|allow|refund|resume/.test(a))return'good';return''}
 var auT=null,auBusy=false;
 function auqv(){return $('auq').value.trim().toLowerCase().replace(/^[/@]+/,'')}
-function auHit(e,q){if(isAid(q))return!!(aidMap[q]&&aidMap[q].set[e.slug]);return!q||String(e.slug||'').toLowerCase().indexOf(q)>-1||String(e.detail||'').toLowerCase().indexOf(q)>-1}
+function auHit(e,q){if(isAid(q))return!!(aidMap[q]&&aidMap[q].set[e.slug]);return!q||String(e.slug||'').toLowerCase().indexOf(q)>-1||String(e.detail||'').toLowerCase().indexOf(q)>-1||String(e.cls||'').indexOf(q)>-1}
 // The log pages from KV with no server-side search, so a query also pulls in a few older pages (3) to search them.
 function auSearch(){
   var av=auqv();if(isAid(av)&&!aidMap[av])aidResolve(av).then(function(){if(auqv()===av)renderAudit()},function(){});
@@ -6067,10 +6524,10 @@ function loadAudit(reset){
   if(reset){auNext=null;auAll=[];L.textContent='';skel(L,4)}else moreBusy($('aumore'),true);
   return api('/admin/audit'+(auNext?'?cursor='+encodeURIComponent(auNext):'')).then(function(o){
     auBusy=false;unskel(L);moreBusy($('aumore'),false);
-    if(!o.ok){bad(o);return}
+    if(!o.ok){bad(o,'Could not load Audit');return}
     auAll=auAll.concat(o.j.entries);auNext=o.j.nextCursor;$('aumore').hidden=!auNext;
     renderAudit()
-  }).catch(function(){auBusy=false;unskel(L);moreBusy($('aumore'),false);msg('Network error, check your connection')})
+  }).catch(function(e){auBusy=false;unskel(L);moreBusy($('aumore'),false);netFail(e)})
 }
 function renderAudit(){
   var keys=$('aukeys');keys.textContent='';
@@ -6088,7 +6545,20 @@ function renderAudit(){
     var d=el('div','log '+actTone(e.action)),top=el('div','log-top');
     top.appendChild(chip(actLbl(e.action),actTone(e.action)));top.appendChild(el('span','ago',ago(e.at)));
     d.appendChild(top);
-    if(e.slug||e.detail){
+    if(e.action==='custom_alert'){
+      var meta=el('div','log-meta');
+      if(e.cls)meta.appendChild(chip(alLbl(AL_CLS,e.cls),'by-sev sev-ad'));
+      if(e.n!=null){
+        var rb=el('button','chip rchip');rb.type='button';rb.setAttribute('aria-label','View recipients');
+        rb.appendChild(el('span',null,num(e.n)+' recipient'+(e.n===1?'':'s')));rb.appendChild(ico('chev'));
+        rb.onclick=function(){recipSheet({sub:'Sent '+fmt(e.at),sent:e.n,past:true,body:{recipients:true,at:e.at,ts:e.ts||null,message:e.detail||'',cls:e.cls||''}})};
+        meta.appendChild(rb)
+      }
+      d.appendChild(meta);
+      d.appendChild(el('div','log-aud','To: '+alAudLbl(e.aud)));
+      var cm=el('div','log-main');cm.appendChild(el('span','det',e.detail||''));d.appendChild(cm);
+      d.appendChild(el('div','log-when',fmt(e.at)))
+    }else if(e.slug||e.detail){
       var main=el('div','log-main');
       if(e.slug){var lb=el('button','lnk','/'+e.slug);lb.type='button';lb.onclick=function(){openLookup(e.slug)};main.appendChild(lb)}
       if(e.detail)main.appendChild(el('span','det',e.detail));
@@ -6107,6 +6577,299 @@ function renderAudit(){
   }
   if(q&&auNext)L.appendChild(el('div','fine','Showing matches in the entries loaded so far. Load more to search older ones.'))
 }
+
+/* ---------- Custom alerts ---------- */
+// A free-text alert (kind 'notice') to everyone, to groups drawn from the accounts table, or to specific author IDs.
+// Each group can be limited to a period (the last N hours or days, or between two date-times in the chosen time zone), and several groups can be
+// combined as "any" (union) or "all" (intersection). The classification is for the admin record only; it is stored with the
+// audit entry, not shown to accounts.
+var AL_MAX=250;
+var AL_CLS=[['announcement','Announcement'],['update','Product update'],['maintenance','Maintenance'],['policy','Policy or terms'],['safety','Safety'],['support','Support follow-up'],['other','Other']];
+var AL_CATS=[['signup','Signed up'],['seen','Seen in the app'],['away','Gone quiet'],['published','Published a note'],['storied','Shared to stories'],['followed','Gained a follower'],['following','Followed someone'],['liked','Liked a note'],['gotliked','Got a like'],['advertisers','Ran an ad'],['buyers','Bought ad views'],['struck','Got a strike'],['reported','Was reported'],['takendown','Had a note taken down'],['suspended','Was suspended'],['neverpub','Never published'],['neverstory','Never shared to stories'],['neverad','Never ran an ad']];
+// Groups older Audit entries refer to (fixed windows), kept so those entries still read correctly.
+var AL_LEGACY=[['new7','New this week'],['active7','Active in 7 days'],['inactive30','Away 30+ days'],['publishers','Publishers']];
+var AL_WHEN={signup:'When the account was created',seen:'When the account was last seen',away:'How long since the account was last seen',published:'When a note was published',storied:'When a note was shared to stories',followed:'When someone started following',advertisers:'When an ad was started',buyers:'When ad views were bought',struck:'When a strike was recorded',reported:'When a report was filed',following:'When they started following someone',liked:'When a note was liked',gotliked:'When a note of theirs was liked',takendown:'When a note was taken down',suspended:'When the account was suspended'};
+var AL_MODES=[['all','Everyone'],['categories','Groups'],['users','Specific accounts']];
+var AL_QUICK=[['h',12],['h',24],['d',3],['d',7],['d',14],['d',30],['d',90],['d',180]];
+var alMode='all',alCats={},alPer={},alBoxes={},alMatch='any',alRT=null,alGen=0,alCount=null,alUnknown=[],alBusy=false;
+PICKS.alcls=AL_CLS;
+function alLbl(list,v){for(var i=0;i<list.length;i++)if(list[i][0]===v)return list[i][1];return String(v||'')}
+function alCatLbl(k){return alLbl(AL_CATS.concat(AL_LEGACY),k)}
+function alDT(v){return String(v).replace('T',' ')+' '+tzAbbr()}
+function alU(v){var l=Date.parse(String(v)+':00Z');return isNaN(l)?v:new Date(tzUtc(l)).toISOString().slice(0,16)}
+// A period as Audit keeps it ("7d", "12h", "<from>~<to>" in base-36 minutes), in words.
+function alPerLbl(s){
+  s=String(s||'');if(!s)return'';
+  var i=s.indexOf('~');
+  if(i<0){var u=s.charAt(s.length-1),n=s.slice(0,-1);return(u==='h'||u==='d')&&n&&String(parseInt(n,10))===n?'last '+n+(u==='h'?' hours':' days'):''}
+  var d=function(x){return alDT(new Date(tzShift(parseInt(x,36)*60000)).toISOString().slice(0,16))},f=s.slice(0,i),t=s.slice(i+1);
+  return f&&t?d(f)+' to '+d(t):f?'since '+d(f):t?'until '+d(t):''
+}
+function alAudLbl(a){
+  a=String(a||'');if(a==='all')return'Everyone';if(a==='users')return'Specific accounts';
+  var all=a.charAt(0)==='&';if(all)a=a.slice(1);
+  return a.split(',').filter(Boolean).map(function(c){var i=c.indexOf(':'),p=i<0?'':alPerLbl(c.slice(i+1));return alCatLbl(i<0?c:c.slice(0,i))+(p?' ('+p+')':'')}).join(all?' and ':' or ')
+}
+function alText(){return $('almsg').value.replace(/\\s+/g,' ').trim()}
+function alIds(){return($('alids').value||'').toLowerCase().split(/[\\s,;]+/).filter(Boolean).filter(function(v,i,a){return a.indexOf(v)===i})}
+function alPerNew(k){var d=new Date(tzShift(Date.now())),Y=d.getUTCFullYear(),M=d.getUTCMonth(),D=d.getUTCDate(),iso=function(a,b,c,h,m){return new Date(Date.UTC(a,b,c,h,m)).toISOString().slice(0,16)};return k==='away'?{m:'last',n:'30',u:'d',from:iso(Y,M,D-30,0,0),to:''}:{m:'any',n:'7',u:'d',from:iso(Y,M,D,0,0),to:iso(Y,M,D,23,59)}}
+// The period for the server: null for any time, {hours}/{days}, or {from, to} (to is not used by "Gone quiet").
+function alPeriod(k){
+  var p=alPer[k];if(!p||p.m==='any')return null;
+  if(p.m==='last'){var n=parseInt(p.n,10);return p.u==='h'?{hours:n}:{days:n}}
+  var o={};if(p.from)o.from=alU(p.from);if(k!=='away'&&p.to)o.to=alU(p.to);return o
+}
+function alPerWhy(k){
+  var p=alPer[k]||alPerNew(k);
+  if(p.m==='any')return k==='away'?'Choose how long.':'';
+  if(p.m==='last'){var n=parseInt(p.n,10);if(!(n>=1))return'Enter a number of '+(p.u==='h'?'hours':'days')+'.';if(p.u==='h'&&n>168)return'Up to 168 hours, use days for longer.';if(n>730)return'Up to 730 days.';return''}
+  if(k==='away')return p.from?'':'Pick a date and time.';
+  if(!p.from&&!p.to)return'Pick a start, an end, or both.';
+  if(p.from&&p.to&&p.from>p.to)return'The start is after the end.';
+  return''
+}
+function alPerText(k){
+  var p=alPer[k];if(!p||p.m==='any')return'any time';
+  if(p.m==='last')return(k==='away'?'at least ':'last ')+num(parseInt(p.n,10)||0)+(p.u==='h'?' hours':' days');
+  if(k==='away')return p.from?'since '+alDT(p.from):'pick a date';
+  return p.from&&p.to?alDT(p.from)+' to '+alDT(p.to):p.from?'from '+alDT(p.from):p.to?'until '+alDT(p.to):'pick dates'
+}
+function alSel(){return AL_CATS.map(function(c){return c[0]}).filter(function(k){return alCats[k]})}
+function alAudience(){
+  if(alMode==='categories'){
+    var ks=alSel(),per={};
+    ks.forEach(function(k){var p=alPeriod(k);if(p)per[k]=p});
+    return{type:'categories',categories:ks,periods:per,match:alMatch}
+  }
+  if(alMode==='users')return{type:'users',users:alIds()};
+  return{type:'all'}
+}
+function alWhy(a){
+  if(a.type==='categories'){
+    if(!a.categories.length)return'Pick at least one group.';
+    for(var i=0;i<a.categories.length;i++){var w=alPerWhy(a.categories[i]);if(w)return alCatLbl(a.categories[i])+': '+w}
+  }
+  if(a.type==='users'){
+    if(!a.users.length)return'Paste one or more author IDs.';
+    if(a.users.length>50)return'Up to 50 accounts at a time.';
+    if(!a.users.every(isAid))return'Every entry must be an author ID (a_ and 32 characters).'
+  }
+  return''
+}
+// The audience in words, for the confirmation: each group with its period.
+function alAudSummary(a){
+  if(a.type==='all')return'everyone';
+  if(a.type==='users')return'specific accounts';
+  return a.categories.map(function(k){var l=alCatLbl(k).toLowerCase();return AL_WHEN[k]?l+' ('+alPerText(k)+')':l}).join(a.match==='all'&&a.categories.length>1?' and ':' or ')
+}
+// Why the alert cannot be sent yet (null when it can): the text for the toast and the field to flag.
+var alCountWhy='';
+function alBlock(){
+  if(!alText())return{why:'Write the alert message.',id:'almsg'};
+  if(!$('alcls').value)return{why:'Choose a classification.',id:'alcls'};
+  var w=alWhy(alAudience());if(w)return{why:w};
+  if(alUnknown.length)return{why:'Some author IDs were not found. Remove them to continue.'};
+  if(alCount===null)return{why:alCountWhy||'Still counting recipients, try again in a moment.'};
+  if(!(alCount>0))return{why:'No accounts match this audience.'};
+  return null
+}
+function alSync(){
+  var n=$('almsg').value.length,c=$('alcnt');
+  c.textContent=num(n)+' / '+AL_MAX;c.classList.toggle('hot',n>=AL_MAX-20);
+  var b=$('alsend');
+  b.disabled=alBusy;
+  b.setAttribute('aria-disabled',!alBusy&&alBlock()?'true':'false');
+  $('almsg').classList.remove('flag');$('alcls').classList.remove('flag');
+  b.classList.toggle('wait',alBusy)
+}
+// Counts who the current audience reaches (no alert is sent), so the admin sees the number before confirming.
+function alRecip(){
+  clearTimeout(alRT);alCount=null;alCountWhy='';alUnknown=[];
+  var r=$('alrecip'),a=alAudience(),g=++alGen,why=alWhy(a);
+  r.className='recip'+(why&&((a.type==='users'&&a.users.length)||(a.type==='categories'&&a.categories.length))?' err':'');
+  if(why){r.textContent=why;alSync();return}
+  r.textContent='Counting recipients…';alSync();
+  alRT=setTimeout(function(){
+    api('/admin/alert',{method:'POST',body:{preview:true,audience:a}}).then(function(o){
+      if(g!==alGen)return;
+      r.textContent='';r.className='recip';
+      if(!o.ok){r.classList.add('err');alCountWhy=errMsg(o,'Could not count recipients');r.textContent=alCountWhy;alSync();return}
+      alCount=o.j.count||0;alUnknown=o.j.unknown||[];
+      if(alUnknown.length){r.classList.add('err');r.textContent='Not found: '+alUnknown.slice(0,2).join(', ')+(alUnknown.length>2?' and '+(alUnknown.length-2)+' more':'')}
+      else if(!alCount){r.classList.add('err');r.textContent='No accounts match.'}
+      else{var go=el('button','recip-go');go.type='button';go.setAttribute('aria-label','View recipients');go.appendChild(el('b',null,num(alCount)));go.appendChild(document.createTextNode(' account'+(alCount===1?'':'s')+' will receive it'));go.appendChild(ico('chev'));go.onclick=alList;r.appendChild(go)}
+      alSync()
+    },function(){if(g===alGen){r.className='recip err';alCountWhy='Could not count recipients. Check your connection and try again.';r.textContent=alCountWhy}})
+  },320)
+}
+// The recipients behind the count on the Message screen.
+function alList(){
+  var a=alAudience();if(alWhy(a)||!(alCount>0))return;
+  recipSheet({body:{preview:true,list:true,audience:a},past:false})
+}
+// The recipients sheet, shared by the Message screen (who will receive it) and Audit (who did receive it). The top part
+// (title, count, search, result) stays put while the list scrolls. The search matches any part of an author ID; a whole
+// author ID also gets a plain yes or no. o.body is the request (the sheet adds q and cursor); o.past words it as already sent.
+function recipSheet(o){
+  if(curSheet)curSheet.done(false,true);
+  var trig=document.activeElement,back=el('div','sheet-back'),sh=el('div','sheet'),top=el('div','sheet-top'),sb=el('div','sheet-body'),list=el('div'),
+    sub=el('div','rsub',o.sub||''),cnt=el('div','rcnt'),chk=el('div','rchk'),note=el('div','rsub'),inp=el('input','field'),
+    cur='',shown=0,total=0,found=0,g=0,closed=false,q='',qt=null;
+  sh.setAttribute('role','dialog');sh.setAttribute('aria-modal','true');sh.setAttribute('aria-label','Recipients');
+  sh.appendChild(el('div','grab'));
+  top.appendChild(el('div','ptitle','Recipients'));top.appendChild(sub);top.appendChild(cnt);
+  var sr=el('div','search'),fw=el('div','field-wrap');
+  inp.type='text';inp.placeholder='Check an author ID';inp.setAttribute('autocomplete','off');inp.setAttribute('autocapitalize','off');inp.setAttribute('spellcheck','false');inp.setAttribute('enterkeyhint','search');inp.setAttribute('aria-label','Search recipients by author ID');
+  fw.appendChild(ico('search'));fw.appendChild(inp);sr.appendChild(fw);top.appendChild(sr);top.appendChild(chk);
+  sh.appendChild(top);sh.appendChild(sb);
+  sb.appendChild(list);
+  var more=btn('Load more','block more',function(){return load(false)});more.hidden=true;sb.appendChild(more);sb.appendChild(note);
+  var acts=el('div','sheet-actions');acts.appendChild(btn('Close','quiet block',function(){fin()}));sh.appendChild(acts);
+  back.appendChild(sh);document.body.appendChild(back);clearable(inp);
+  function setCnt(){cnt.textContent=q?num(found)+(found===1?' match':' matches')+' among '+num(total)+' recipient'+(total===1?'':'s'):'Showing '+num(shown)+' of '+num(total)}
+  function load(first){
+    var gg=++g;
+    if(first){cur='';shown=0;list.textContent='';chk.textContent='';chk.className='rchk';note.textContent='';more.hidden=true;sb.scrollTop=0;skel(list,4,'row')}
+    return api('/admin/alert',{method:'POST',body:Object.assign({},o.body,{q:q,cursor:cur})}).then(function(r){
+      if(gg!==g||closed)return;
+      unskel(list);
+      if(!r.ok){bad(r,'Could not load the recipients');return}
+      var j=r.j;
+      j.users.forEach(function(u){list.appendChild(ovUserRow(u))});
+      cur=j.next;shown+=j.users.length;more.hidden=cur==null;total=j.count;
+      if(first)found=j.found||0;
+      setCnt();
+      if(first&&j.check){
+        var ck={'in':['good',o.past?'Yes. This account received the alert.':'Yes. This account will receive the alert.'],'out':['bad',o.past?'No. This account did not receive the alert.':'No. This account will not receive the alert.'],'unknown':['warn','No account has this author ID.']}[j.check];
+        if(ck){chk.className='rchk '+ck[0];chk.textContent=ck[1]}
+      }
+      if(first&&!q&&o.sent!=null&&total<o.sent)note.textContent=num(o.sent-total)+' of '+num(o.sent)+' recipients are not listed, their accounts were deleted since.';
+      if(!list.firstChild)list.appendChild(empty(q?'No matches':'No accounts',q?'No recipient has an author ID containing this.':'Nothing matches this audience.',q?'search':'users'))
+    },function(e){if(gg!==g||closed)return;unskel(list);netFail(e)})
+  }
+  inp.oninput=function(){clearTimeout(qt);qt=setTimeout(function(){var v=inp.value.trim().toLowerCase();if(v===q)return;q=v;load(true)},300)};
+  function kd(e){if(e.key==='Escape')fin()}
+  function fin(v,keep){
+    if(curSheet!==me)return;
+    closed=true;clearTimeout(qt);curSheet=null;document.removeEventListener('keydown',kd);
+    back.classList.remove('open');setTimeout(function(){back.remove()},240);
+    try{trig.focus()}catch(e){}
+    sheetClose(keep)
+  }
+  var me={done:fin};curSheet=me;sheetOpen();
+  back.onclick=function(e){if(e.target===back)fin()};
+  document.addEventListener('keydown',kd);
+  requestAnimationFrame(function(){back.classList.add('open')});
+  load(true)
+}
+// The period editor for one group: any time / in the last N hours or days / between two date-times in the chosen time zone.
+// Built once and updated in place, so typing in it never loses focus.
+function alBox(k,label){
+  var p=alPer[k]||(alPer[k]=alPerNew(k)),away=k==='away',box=el('div','perbox');
+  var hd=el('div','per-h'),val=el('span','per-v');hd.appendChild(el('span','per-t',label));hd.appendChild(val);box.appendChild(hd);
+  box.appendChild(el('div','per-s',AL_WHEN[k]));
+  var modes=el('div','alrow sev-ad'),last=el('div','per-last'),range=el('div'),err=el('div','per-err');
+  var ms=away?[['last','For at least'],['range','Since a date']]:[['any','Any time'],['last','In the last'],['range','Between dates']];
+  ms.forEach(function(m){var b=el('button','key');b.type='button';b.setAttribute('data-v',m[0]);b.appendChild(el('span',null,m[1]));b.onclick=function(){p.m=m[0];sync();alRecip()};modes.appendChild(b)});
+  box.appendChild(modes);
+  var ni=el('input','field per-n');ni.type='number';ni.min='1';ni.step='1';ni.setAttribute('inputmode','numeric');ni.setAttribute('aria-label','Amount');ni.value=p.n;
+  ni.oninput=function(){p.n=ni.value;sync();alRecip()};
+  last.appendChild(ni);
+  var us=el('div','alrow sev-ad'),ub=[];
+  us.style.margin='0';
+  [['h','Hours'],['d','Days']].forEach(function(u){var b=el('button','key');b.type='button';b.appendChild(el('span',null,u[1]));b.onclick=function(){p.u=u[0];sync();alRecip()};ub.push([u[0],b]);us.appendChild(b)});
+  last.appendChild(us);box.appendChild(last);
+  var qk=el('div','alrow sev-ad'),qb=[];
+  AL_QUICK.forEach(function(x){var b=el('button','key');b.type='button';b.appendChild(el('span',null,x[1]+x[0]));b.onclick=function(){p.m='last';p.u=x[0];p.n=String(x[1]);ni.value=p.n;sync();alRecip()};qb.push([x,b]);qk.appendChild(b)});
+  last.appendChild(qk);qk.style.flexBasis='100%';
+  function dt(txt,key){var l=el('label'),w=el('div','field tr-date dt-wrap'),tx=el('span','dt-txt'),i=el('input');l.appendChild(el('span','per-lab',txt));i.type='datetime-local';i.value=p[key];i.setAttribute('aria-label',txt);i.oninput=function(){p[key]=i.value;sync();alRecip()};var MO=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];function upd(){var v=i.value,m=/^(\\d{4})-(\\d\\d)-(\\d\\d)T(\\d\\d):(\\d\\d)/.exec(v||'');w.classList.toggle('empty',!m);tx.textContent=m?MO[+m[2]-1]+' '+(+m[3])+', '+m[1]+' at '+m[4]+':'+m[5]:'Select date and time'}upd();i.addEventListener('input',upd);i.addEventListener('change',upd);i.onclick=function(){try{i.showPicker&&i.showPicker()}catch(e){}};w.appendChild(tx);w.appendChild(i);l.appendChild(w);return[l,i,upd]}
+  var rg=el('div','per-range'),f=dt(away?'Not seen since ('+tzAbbr()+')':'From ('+tzAbbr()+')','from'),t=away?null:dt('To ('+tzAbbr()+')','to');
+  rg.appendChild(f[0]);if(t)rg.appendChild(t[0]);range.appendChild(rg);
+  if(!away){
+    var qr=el('div','alrow sev-ad');qr.style.margin='10px 0 0';
+    var iso=function(y,m,d,h,mi){return new Date(Date.UTC(y,m,d,h,mi)).toISOString().slice(0,16)};
+    var nw=new Date(tzShift(Date.now())),Y=nw.getUTCFullYear(),M=nw.getUTCMonth(),D=nw.getUTCDate();
+    [['Today',iso(Y,M,D,0,0),iso(Y,M,D,23,59)],['Yesterday',iso(Y,M,D-1,0,0),iso(Y,M,D-1,23,59)],['This month',iso(Y,M,1,0,0),iso(Y,M+1,0,23,59)],['Last month',iso(Y,M-1,1,0,0),iso(Y,M,0,23,59)]].forEach(function(x){
+      var b=el('button','key');b.type='button';b.appendChild(el('span',null,x[0]));
+      b.onclick=function(){p.m='range';p.from=x[1];p.to=x[2];f[1].value=p.from;t[1].value=p.to;f[2]();t[2]();sync();alRecip()};qr.appendChild(b)
+    });
+    range.appendChild(qr)
+  }
+  box.appendChild(range);box.appendChild(err);
+  function sync(){
+    [].forEach.call(modes.children,function(b){b.setAttribute('aria-pressed',b.getAttribute('data-v')===p.m?'true':'false')});
+    last.hidden=p.m!=='last';range.hidden=p.m!=='range';
+    ub.forEach(function(x){x[1].setAttribute('aria-pressed',p.u===x[0]?'true':'false')});
+    qb.forEach(function(x){x[1].setAttribute('aria-pressed',p.m==='last'&&p.u===x[0][0]&&parseInt(p.n,10)===x[0][1]?'true':'false')});
+    val.textContent=alPerText(k);
+    var w=alPerWhy(k);err.textContent=w&&!(p.m==='last'&&p.n==='')?w:''
+  }
+  box._sync=sync;sync();return box
+}
+function alRender(){
+  var m=$('alaud');m.textContent='';
+  AL_MODES.forEach(function(o){
+    var b=el('button','key');b.type='button';b.setAttribute('aria-pressed',alMode===o[0]?'true':'false');b.appendChild(el('span',null,o[1]));
+    b.onclick=function(){if(alMode===o[0])return;alMode=o[0];alRender();alRecip()};m.appendChild(b)
+  });
+  var c=$('alcats');c.hidden=alMode!=='categories';
+  if(!c.firstChild)AL_CATS.forEach(function(o){
+    var l=el('label','pillck'),i=document.createElement('input');i.type='checkbox';
+    i.onchange=function(){alCats[o[0]]=i.checked;alRender();alRecip()};
+    l.appendChild(i);l.appendChild(el('span',null,o[1]));c.appendChild(l)
+  });
+  // Match row (only with two or more groups) and one period editor per chosen group.
+  var sel=alSel(),mt=$('almatch');mt.hidden=alMode!=='categories'||sel.length<2;
+  if(!mt.firstChild){
+    mt.appendChild(el('span','alml','Reach accounts in'));
+    [['any','Any of these groups'],['all','All of these groups']].forEach(function(o){
+      var b=el('button','key');b.type='button';b.setAttribute('data-v',o[0]);b.appendChild(el('span',null,o[1]));
+      b.onclick=function(){alMatch=o[0];alRender();alRecip()};mt.appendChild(b)
+    })
+  }
+  [].forEach.call(mt.querySelectorAll('.key'),function(b){b.setAttribute('aria-pressed',b.getAttribute('data-v')===alMatch?'true':'false')});
+  var pr=$('alper');pr.hidden=alMode!=='categories'||!sel.length;
+  AL_CATS.forEach(function(o){
+    if(!AL_WHEN[o[0]])return;
+    var on=alMode==='categories'&&!!alCats[o[0]],bx=alBoxes[o[0]];
+    if(on&&!bx){bx=alBoxes[o[0]]=alBox(o[0],o[1])}
+    if(bx){bx.hidden=!on;if(!bx.parentNode)pr.appendChild(bx)}
+  });
+  // keep the boxes in the same order as the group pills
+  AL_CATS.forEach(function(o){var bx=alBoxes[o[0]];if(bx)pr.appendChild(bx)});
+  $('alusers').hidden=alMode!=='users'
+}
+function alSend(){
+  var m=alText(),cls=$('alcls').value,a=alAudience(),n=alCount,who=alAudSummary(a);
+  var blk=alBlock();
+  if(blk){
+    msg(blk.why,'err');
+    var f=blk.id&&$(blk.id);
+    if(f){f.classList.add('flag');try{f.scrollIntoView({block:'center',behavior:'smooth'});if(blk.id==='almsg')f.focus()}catch(e){}}
+    return
+  }
+  return ask({title:'Send this alert?',sev:'ad',icon:'bell',
+    text:'“'+m+'”\\n\\n'+num(n)+' account'+(n===1?'':'s')+' ('+who+'). Classified as '+alLbl(AL_CLS,cls).toLowerCase()+'. It appears in each account\\'s Alerts and in Audit, and can\\'t be recalled.',
+    ok:'Send alert'}).then(function(go){
+    if(!go)return;
+    alBusy=true;alSync();
+    return api('/admin/alert',{method:'POST',body:{message:m,classification:cls,audience:a}}).then(function(o){
+      alBusy=false;
+      if(!o.ok){alSync();bad(o,'Could not send the alert');return}
+      $('almsg').value='';alSync();
+      msg('Sent to '+num(o.j.sent)+' account'+(o.j.sent===1?'':'s'),'ok',{label:'View in Audit',fn:function(){auOpenAlerts()}});
+      alRecip()
+    },function(){alBusy=false;alSync()})
+  })
+}
+$('almsg').oninput=alSync;
+$('alids').oninput=alRecip;
+$('alcls').onclick=function(){pick('alcls',alSync)};
+$('alsend').onclick=alSend;
+tzInit();
+$('alaudit').onclick=function(){auOpenAlerts()};
+$('alfab').onclick=function(){goTab('alerts')};
+alRender();alSync();
 
 /* ---------- Overview ---------- */
 var OV=[
@@ -6131,11 +6894,11 @@ function loadOverview(){
   S.forEach(function(s){s.classList.add('ld')});
   function fail(){ovS.loaded=false;S.forEach(function(s){s.firstChild.textContent='-';s.classList.remove('ld')})}
   return api('/admin/stats').then(function(o){
-    if(!o.ok){fail();bad(o);return}
+    if(!o.ok){fail();bad(o,'Could not load the overview numbers');return}
     var st=o.j.stats;
     S.forEach(function(s){var v=st[s.getAttribute('data-k')];s.firstChild.textContent=v==null?'-':num(v);s.classList.remove('ld')});
-    $('ovnote').textContent='Online means active in the last '+o.j.onlineWindowMin+' minutes. '+(o.j.trackingSince?'Activity tracked since '+new Date(o.j.trackingSince).toLocaleDateString()+'. ':'No activity recorded yet. ')+'Notes cover signed-in publishers only.'
-  }).catch(function(){fail();msg('Network error, check your connection')})
+    $('ovnote').textContent='Online means active in the last '+o.j.onlineWindowMin+' minutes. '+(o.j.trackingSince?'Activity tracked since '+fmtD(o.j.trackingSince)+'. ':'No activity recorded yet. ')+'Notes cover signed-in publishers only.'
+  }).catch(function(e){fail();netFail(e)})
 }
 function ovSync(){
   var users=ovS.view==='users';
@@ -6143,7 +6906,8 @@ function ovSync(){
   $('ovfil').hidden=!users;
   $('ovq').placeholder=users?'Search by author ID':'Search by slug or author ID'
 }
-function ovUser(u){
+function ovUser(u){$('ovlist').appendChild(ovUserRow(u))}
+function ovUserRow(u){
   var r=el('button','pgrow'),l=el('div');r.type='button';
   r.onclick=function(){if(!u.authorId)return;try{navigator.clipboard.writeText(u.authorId).then(function(){msg('Author ID copied')},function(){msg(u.authorId)})}catch(e){msg(u.authorId)}};
   l.appendChild(el('div','slug',u.email||'Account missing'));
@@ -6156,7 +6920,7 @@ function ovUser(u){
   if(u.suspended)m.appendChild(chip('suspended','bad'));
   if(u.deleting)m.appendChild(chip('deleting','warn'));
   if(m.children.length>1){r.className='pgrow stack';r.insertBefore(m,l)}else r.appendChild(m);
-  $('ovlist').appendChild(r)
+  return r
 }
 function ovNote(n){
   var r=el('button','pgrow');r.type='button';r.onclick=function(){openLookup(n.slug)};
@@ -6174,18 +6938,18 @@ function ovList(reset){
   return api('/admin/'+ovS.view+'?'+qs).then(function(o){
     if(g!==ovS.gen)return;
     unskel(L);moreBusy(m,false);
-    if(!o.ok){bad(o);return}
+    if(!o.ok){bad(o,'Could not load the list');return}
     var rows=users?o.j.users:o.j.notes;
     rows.forEach(users?ovUser:ovNote);
     ovS.cur=o.j.next;if(o.j.total!=null)ovS.total=o.j.total;ovS.shown+=rows.length;
     m.hidden=ovS.cur==null;
     $('ovcount').textContent=ovS.total?'Showing '+num(ovS.shown)+' of '+num(ovS.total):'';
     if(!L.firstChild)L.appendChild(empty(users?'No users':'No notes','Nothing matches this search.',users?'users':'reports'))
-  }).catch(function(){if(g!==ovS.gen)return;unskel(L);moreBusy(m,false);msg('Network error, check your connection')})
+  }).catch(function(e){if(g!==ovS.gen)return;unskel(L);moreBusy(m,false);netFail(e)})
 }
 
 /* ---------- Trends: growth and decline over time ---------- */
-var trWIN={day:30,week:12,month:12,year:5},trOPT={day:[7,14,30,90],week:[4,8,12,26],month:[3,6,12,24],year:[2,3,5,10]},trMINV='30 Sep 2026',trUNIT={day:'days',week:'weeks',month:'months',year:'years'},trOFF=-new Date().getTimezoneOffset()*60000,trMIN=Date.UTC(2015,0,1);
+var trWIN={day:30,week:12,month:12,year:5},trOPT={day:[7,14,30,90],week:[4,8,12,26],month:[3,6,12,24],year:[2,3,5,10]},trMINV='30 Sep 2026',trUNIT={day:'days',week:'weeks',month:'months',year:'years'},trOFF=tzOff(Date.now()),trMIN=Date.UTC(2015,0,1);
 var trRL={csam:'Child safety',abuse:'Abuse',copyright:'Copyright',spam:'Spam',other:'Other'},trRO=['csam','abuse','copyright','spam','other'],trRC={csam:'#FF4D6D',abuse:'#FF9A5C',copyright:'#F7C35B',spam:'#97A3F0',other:'#46D6C8'};
 var trM=[
   {k:'signups',l:'New accounts',t:'Accounts',c:'#8B9BFF',cum:1,good:1},
@@ -6233,11 +6997,20 @@ function trLab(bk,s,full){
   var t=d.toLocaleDateString(undefined,o);
   return bk==='week'&&full?'Week of '+t:t
 }
+function trOffs(a,b){
+  var o=tzOff(a),out=[a+':'+o],step=10*864e5,t=a,po=o,n,no,lo,hi,mid;
+  while(t<b){
+    n=Math.min(t+step,b);no=tzOff(n);
+    if(no!==po){lo=t;hi=n;while(hi-lo>1000){mid=lo+Math.floor((hi-lo)/2);if(tzOff(mid)===po)lo=mid;else hi=mid}out.push(hi+':'+no);po=no}
+    t=n
+  }
+  return out.slice(0,120).join(',')
+}
 function trPlan(){
   var bk=trS.bk,N=trWIN[bk],nowStart=trStart(bk,Date.now()+trOFF);
   var last=trS.end==null?nowStart:Math.min(trStart(bk,trS.end),nowStart),starts=[],ends=[],i;
   for(i=-(2*N-1);i<=0;i++){starts.push(trNext(bk,last,i));ends.push(trNext(bk,last,i+1))}
-  return {bk:bk,N:N,starts:starts,ends:ends,live:last===nowStart,from:starts[0]-trOFF,to:ends[2*N-1]-trOFF}
+  return {bk:bk,N:N,starts:starts,ends:ends,live:last===nowStart,from:tzUtc(starts[0]),to:tzUtc(ends[2*N-1])}
 }
 function trNice(m){if(!(m>0))return 1;var e=Math.pow(10,Math.floor(Math.log10(m))),f=m/e;return (f<=1?1:f<=2?2:f<=5?5:10)*e}
 function trShort(n){n=Math.round(n*10)/10;var a=Math.abs(n);if(a>=1e6)return (n/1e6).toFixed(1).replace('.0','')+'M';if(a>=1e3)return (n/1e3).toFixed(1).replace('.0','')+'k';return String(n)}
@@ -6365,18 +7138,18 @@ function trLoad(){
   var g=++trS.gen,p=trPlan();
   trS.plan=p;trNavSync();trMetSync();
   $('trchart').classList.add('busy');
-  return api('/admin/trends?bucket='+p.bk+'&from='+p.from+'&to='+p.to+'&off='+trOFF).then(function(o){
+  return api('/admin/trends?bucket='+p.bk+'&from='+p.from+'&to='+p.to+'&off='+trOFF+'&offs='+trOffs(p.from,p.to)).then(function(o){
     if(g!==trS.gen)return;
     $('trchart').classList.remove('busy');
-    if(!o.ok){bad(o);return}
+    if(!o.ok){bad(o,'Could not load trends');return}
     trS.data=o.j;trBuild();trRender()
-  }).catch(function(){if(g!==trS.gen)return;$('trchart').classList.remove('busy');msg('Network error, check your connection')})
+  }).catch(function(e){if(g!==trS.gen)return;$('trchart').classList.remove('busy');netFail(e)})
 }
 function trNavSync(){
   var p=trS.plan,N=p.N;
   $('trrange').textContent=trLab(p.bk,p.starts[N],true)+(N>1?' - '+trLab(p.bk,p.starts[2*N-1],true):'');
   var ep=trS.data&&trS.data.epoch,noData=ep&&p.from<ep;
-  $('trcmp').textContent='Compared with the previous '+N+' '+(N===1?trUNIT[p.bk].replace(/s$/,''):trUNIT[p.bk])+': '+trLab(p.bk,p.starts[0],true)+(N>1?' - '+trLab(p.bk,p.starts[N-1],true):'')+(noData?' (no data before '+trMINV+')':'');
+  $('trcmp').textContent='Compared with the previous '+N+' '+(N===1?trUNIT[p.bk].replace(/s$/,''):trUNIT[p.bk])+': '+trLab(p.bk,p.starts[0],true)+(N>1?' - '+trLab(p.bk,p.starts[N-1],true):'')+(noData?' (no data before '+trMINV+')':'')+' ('+tzAbbr()+')';
   var offP=p.starts[0]-N*864e5<=trMIN||(trS.data&&p.from<=trS.data.epoch);
   $('trprev').setAttribute('aria-disabled',offP?'true':'false');
   $('trnext').setAttribute('aria-disabled',p.live?'true':'false');
@@ -6387,13 +7160,13 @@ function trNavSync(){
 function trBuild(){
   var d=trS.data,p=trS.plan,keys=p.starts.map(function(s){return trKey(p.bk,s)}),M={},RS={},kix={};
   keys.forEach(function(k,i){kix[k]=i});
-  var ep=(d.epoch||0)+trOFF;
+  var ep=d.epoch?tzShift(d.epoch):0;
   function pre(i){return p.ends[i]<=ep}
   function col(name){var m={};(d.series[name]||[]).forEach(function(r){m[String(r[0])]=r[1]});return keys.map(function(k,i){return pre(i)?null:(m[k]||0)})}
   trM.forEach(function(x){
     if(x.level){
       var a=col(x.k),since=d.activeSince;
-      M[x.k]={flow:a.map(function(v,i){return v==null||since==null||p.ends[i]-trOFF<=since?null:v})};return
+      M[x.k]={flow:a.map(function(v,i){return v==null||since==null||tzUtc(p.ends[i])<=since?null:v})};return
     }
     if(x.k==='reports'&&!d.reportsIndexed){M[x.k]=null;return}
     var f=col(x.k),run=(d.before||{})[x.k]||0;
@@ -6535,6 +7308,8 @@ var COC=[
   ]},
   {h:"Take care",items:[
     ["Everything you do is saved in Audit.","That keeps all of us trustworthy."],
+    ["Custom alerts carry approved messages only.","Send the wording exactly as it was approved, and nothing else. If you are not sure a message is approved, please check with another admin first."],
+    ["Send to the intended audience, and only them.","Before you tap Send alert, look at the groups or author IDs and the recipient count, so the message reaches just the people it was meant for."],
     ["Slow down for permanent actions.","Take down all and Run purge cannot be undone. The purge already runs every night."],
     ["Ads:","pause first, take down if it keeps breaking the rules. You can refund unused views when you take an ad down."],
     ["Not sure? Wait and ask another admin.","Slipped up? Restore it and tell the team. Honest mistakes are fine."]
@@ -6586,7 +7361,7 @@ $('purgego').onclick=function(){
   ask({title:'Run the purge now?',text:'Permanently deletes pages unpublished more than 30 days ago (except held or locked ones), accounts past their 30-day deletion window, stale like/follow timestamps, backup images older than 14 days that no note references, presence records older than 90 days, alerts older than a year, activity log entries older than 800 days, and dismissed CSAM report index rows older than 18 months.',ok:'Run purge',danger:true}).then(function(ok){
     if(!ok)return;
     msg('Running purge\u2026','ok');
-    api('/admin/purge',{method:'POST'}).then(function(o){msg(o.ok?'Purge done, '+o.j.purged+(o.j.purged===1?' item':' items')+' removed':(o.j.error||'Purge failed'))}).catch(function(){msg('Network error, check your connection')})
+    api('/admin/purge',{method:'POST'}).then(function(o){if(o.ok)msg('Purge done, '+o.j.purged+(o.j.purged===1?' item':' items')+' removed','ok');else showErr(o,'Purge failed')}).catch(function(e){netFail(e)})
   })
 };
 $('msg').onclick=function(){msg('')};
@@ -6794,6 +7569,7 @@ export default {
       if (method === 'POST' && pathname === '/admin/ad') return handleAdminAd(env, request);
       if (method === 'POST' && pathname === '/admin/ncmec') return handleAdminNcmec(env, request);
       if (method === 'POST' && pathname === '/admin/undismiss') return handleAdminUndismiss(env, request);
+      if (method === 'POST' && pathname === '/admin/alert') return handleAdminCustomAlert(env, request);
       if (method === 'POST' && pathname === '/admin/dismiss') return handleAdminDismiss(env, request);
       if (method === 'GET' && pathname.startsWith('/admin/snapshot/')) {
         const rest = pathname.slice('/admin/snapshot/'.length).split('/');
