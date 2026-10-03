@@ -3146,9 +3146,10 @@ async function handleAdView(env, request, slug) {
 }
 
 /* ---------------- Alerts ---------------- */
-// Automatic, read-only notices shown to the account under Library > Alerts (reports against their
-// notes, a profile picture or name removed, takedowns, story/ad actions, suspension changes). Nothing
-// here is written by hand: every message is built at the event that causes it. D1 table `alerts`
+// Read-only messages shown to the account under Library > Alerts: automatic notices (reports against
+// their notes, a profile picture or name removed, takedowns, story/ad actions, suspension changes),
+// each built at the event that causes it, plus announcements and updates sent by an admin (kind
+// 'notice', see the custom alert sender below). D1 table `alerts`
 // (created on first use, like report_index). The person can delete an alert from their own list,
 // which only sets dismissed_at; the row stays so the admin page can still show what was sent.
 const ALERTS_PAGE = 30;
@@ -4258,6 +4259,16 @@ async function handleAdminUndismiss(env, request) {
 const CUSTOM_ALERT_MAX = 250;
 const CUSTOM_ALERT_BYTES = 700;
 const CUSTOM_ALERT_KIND = 'notice';
+// Alerts render Markdown, so line breaks are kept (max one blank line in a row). Other control characters and tabs become spaces.
+function normalizeAlertMessage(raw) {
+  return String(raw)
+    .replace(/\r\n?/g, '\n')
+    .replace(/\t/g, '    ')
+    .replace(/[\u0000-\u0009\u000b-\u001f\u007f\u2028\u2029]/g, ' ')
+    .replace(/\n[ \u00a0]*(?=\n)/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
 const CUSTOM_ALERT_USERS_MAX = 50;
 const CUSTOM_ALERT_CLASSES = ['announcement', 'update', 'maintenance', 'policy', 'safety', 'support', 'other'];
 // Each group is one SELECT of account subs (column s) from data the worker already keeps. "col" is the timestamp the
@@ -4428,7 +4439,7 @@ async function handleAdminCustomAlert(env, request) {
   const count = row ? row.n : 0;
   if (body.preview === true && body.list === true) return json(await caRecipientPage(env, a.sql, a.bind, count, body));
   if (body.preview === true) return json({ ok: true, count, unknown: a.unknown || [] });
-  const message = typeof body.message === 'string' ? body.message.replace(/[\u0000-\u001f\u007f]/g, ' ').replace(/\s+/g, ' ').trim() : '';
+  const message = typeof body.message === 'string' ? normalizeAlertMessage(body.message) : '';
   const cls = typeof body.classification === 'string' ? body.classification : '';
   if (!message) return textError(400, 'message required');
   if (message.length > CUSTOM_ALERT_MAX || new TextEncoder().encode(message).length > CUSTOM_ALERT_BYTES) return textError(400, 'message too long');
@@ -4972,6 +4983,8 @@ main{position:relative;z-index:1;max-width:720px;margin:0 auto;padding:2px 16px 
 .card.urgent{--edge:rgba(255,77,109,.55);--halo:0 0 0 1px rgba(255,77,109,.16),0 0 42px -10px rgba(255,77,109,.5)}
 .card.static{padding:18px}
 .tools-foot{margin:6px 0 0;text-align:center;color:var(--warn);font-size:12px;font-weight:700;letter-spacing:.14em;text-transform:uppercase}
+.tools-copy{margin:10px 0 0;text-align:center;color:var(--faint);font-size:12px}
+.tools-ver{margin-top:2px}
 .card.note{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:14px 16px}
 .head{appearance:none;-webkit-appearance:none;display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:12px 14px;align-items:start;width:100%;padding:16px;border:0;background:none;text-align:left;color:inherit}
 .head:focus-visible{outline-offset:-3px}
@@ -5130,7 +5143,7 @@ main{position:relative;z-index:1;max-width:720px;margin:0 auto;padding:2px 16px 
 .log-top{display:flex;align-items:center;justify-content:space-between;gap:8px}
 .log-top .ago{font-size:13px;color:var(--faint);font-weight:600}
 .log-main{display:flex;flex-direction:column;align-items:flex-start;gap:4px;margin-top:10px}
-.log-main .det{color:var(--muted);font-size:14px;word-break:break-word}
+.log-main .det{color:var(--muted);font-size:14px;word-break:break-word;white-space:pre-wrap}
 .log-meta{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}
 .log-when{margin-top:8px;font-size:12.5px;color:var(--faint)}
 .fab{position:fixed;z-index:25;right:max(16px,calc((100vw - 720px)/2 + 16px));bottom:calc(92px + env(safe-area-inset-bottom,0px));width:56px;height:56px;padding:0;border:0;border-radius:20px;background:linear-gradient(180deg,#A0AEFF,#7F90FF);color:var(--accent-ink);box-shadow:0 12px 28px -6px rgba(127,144,255,.55),0 2px 8px rgba(2,3,18,.5);transition:transform .15s,filter .15s}
@@ -5140,6 +5153,64 @@ main{position:relative;z-index:1;max-width:720px;margin:0 auto;padding:2px 16px 
 .field.ta{display:block;height:auto;min-height:116px;padding:14px 16px;resize:vertical;line-height:1.45;font:inherit;color:inherit}
 .cnt{margin:6px 2px 0;text-align:right;font-size:12.5px;color:var(--faint)}
 .cnt.hot{color:var(--warn)}
+.mdrow{display:flex;align-items:center;justify-content:space-between;gap:10px;margin:8px 2px 12px}
+.mdrow .fine{margin:0}
+.mdbtn{appearance:none;-webkit-appearance:none;flex:none;height:34px;padding:0 14px;border-radius:17px;border:1px solid var(--line2);background:var(--s2);color:var(--accent);font-size:13.5px;font-weight:650}
+.mdbtn:active{transform:scale(.97);filter:brightness(1.14)}
+.alprev{--alert-md-bleed:16px;overflow:hidden;padding:14px 16px;border-radius:16px;border:1px solid var(--line);background:var(--well)}
+.alprev-empty{color:var(--faint);font-size:14px}
+.alprev-time{margin-top:10px;font-size:12.5px;color:var(--faint)}
+.alert-md{font-size:14.5px;line-height:1.4;overflow-wrap:anywhere;word-break:break-word}
+.alert-md > * + * { margin-top: .45em }
+.alert-md li > * + * { margin-top: .35em }
+.alert-md-h { font-weight: 700; line-height: 1.3 }
+.alert-md-h1 { font-size: 1.15em }
+.alert-md-h2 { font-size: 1.08em }
+.alert-md-h3, .alert-md-h4 { font-size: 1em }
+.alert-md-h5, .alert-md-h6 { font-size: .95em; opacity: .85 }
+.alert-md-list { margin: 0; padding-left: 1.25em }
+ol.alert-md-list { padding-left: 1.6em }
+.alert-md-list .alert-md-list { margin-top: .15em }
+ul.alert-md-list ul.alert-md-list { list-style: circle }
+ul.alert-md-list ul.alert-md-list ul.alert-md-list { list-style: square }
+.alert-md-list li + li { margin-top: .15em }
+.alert-md-task-li { list-style: none; margin-left: -1.25em }
+.alert-md-task { display: inline-block; box-sizing: border-box; width: 1em; height: 1em; margin-right: .45em; border: 1.5px solid currentColor; border-radius: 3px; opacity: .6; vertical-align: -.12em; position: relative }
+.alert-md-task.on { background: var(--accent); border-color: var(--accent); opacity: 1 }
+.alert-md-task.on::after { content: ""; position: absolute; left: 28%; top: 6%; width: 28%; height: 56%; border: solid var(--accent-ink); border-width: 0 1.5px 1.5px 0; transform: rotate(45deg) }
+.alert-md-quote { margin: 0; padding-left: .7em; border-left: 3px solid rgba(128,128,128,.45) }
+.alert-md-quote > * + * { margin-top: .35em }
+.alert-md-ic { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .92em; padding: .05em .3em; border-radius: 4px; background: rgba(128,128,128,.18) }
+.alert-md-code { margin: 0; padding: .5em .65em; border-radius: 8px; background: rgba(128,128,128,.14); overflow-x: auto; white-space: pre; -webkit-overflow-scrolling: touch }
+.alert-md-code code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .9em; background: none; padding: 0; border: 0; border-radius: 0; box-shadow: none }
+.alert-md-hr { border: none; border-top: 1px solid rgba(128,128,128,.35); margin: .5em 0 }
+.alert-md del { opacity: .75 }
+.alert-md-img { display: block; max-width: 100%; height: auto; margin: .15em 0; border-radius: 8px }
+.alert-md-full { display: block; width: calc(100% + 2 * var(--alert-md-bleed, 0px)); max-width: none; height: auto; margin: .15em calc(-1 * var(--alert-md-bleed, 0px)) }
+.alert-md-car { margin: .3em 0 }
+.alert-md-car-full { margin: .3em calc(-1 * var(--alert-md-bleed, 0px)) }
+.alert-md-car-full .nb-carousel-viewport { border-radius: 0; box-shadow: none }
+.nb-carousel-viewport { width: 100%; aspect-ratio: 16/9; border-radius: 14px; overflow: hidden; position: relative; box-shadow: 0 4px 14px rgba(2,3,18,.5); touch-action: pan-y; cursor: grab; }
+.nb-carousel-track { display: flex; width: 100%; height: 100%; transition: transform .45s cubic-bezier(.4,0,.2,1); }
+.nb-carousel-track.dragging { transition: none; }
+.nb-carousel-slide { flex: 0 0 100%; width: 100%; height: 100%; position: relative; }
+.nb-carousel-slide img { width: 100%; height: 100%; object-fit: cover; display: block; -webkit-user-drag: none; user-select: none; pointer-events: none; }
+.nb-carousel-dots { display: flex; justify-content: center; gap: .4rem; margin-top: .6rem; }
+.nb-carousel-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--line2); border: none; padding: 0; cursor: pointer; transition: background .2s, width .2s; }
+.nb-carousel-dot.active { background: var(--accent); width: 16px; border-radius: 3px; }
+.alert-md-tablewrap { overflow-x: auto; -webkit-overflow-scrolling: touch }
+.alert-md-table { border-collapse: collapse; font-size: .95em }
+.alert-md-table th, .alert-md-table td { border: 1px solid rgba(128,128,128,.35); padding: .25em .55em; text-align: left; vertical-align: top }
+.alert-md-table th { font-weight: 700; background: rgba(128,128,128,.12) }
+.alert-link { color: var(--accent); text-decoration: underline; text-underline-offset: 2px }
+.mdg{display:grid;gap:10px;margin:2px 0 4px;text-align:left}
+.mdg-note{margin:0 0 4px;font-size:14px;color:var(--muted)}
+.mdg-note + .mdg-note{margin-top:-2px}
+.mdex{overflow:hidden;padding:12px 14px;border-radius:14px;border:1px solid var(--line);background:var(--well)}
+.mdex-t{margin:0 0 8px;font-size:12.5px;font-weight:700;letter-spacing:.02em;text-transform:uppercase;color:var(--faint)}
+.mdex-src{margin:0;padding:8px 10px;border-radius:9px;background:rgba(128,128,128,.14);font:13px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:var(--text);white-space:pre-wrap;overflow-wrap:anywhere}
+.mdex-out{--alert-md-bleed:16px;margin-top:8px;padding:0 2px}
+.mdex-out::before{content:"Shows as";display:block;margin:0 0 4px;font-size:12px;font-weight:650;color:var(--faint)}
 .alrow{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 12px}
 .alrow.top{margin-top:14px}
 .catgrid:not([hidden]){display:flex;flex-wrap:wrap;gap:8px;margin:0 0 4px}
@@ -5380,11 +5451,17 @@ body[data-auth=out] #msg{bottom:calc(24px + env(safe-area-inset-bottom,0px))}
 
     <div id="p-alerts" class="pnl">
       <div class="card static">
-        <div class="sec-head"><span class="tile sev-ad"><span class="ico" data-i="bell"></span></span><div><div class="card-t">Message</div><div class="card-s">Shown in each account's Alerts, word for word. The exact text is kept in Audit.</div></div></div>
+        <div class="sec-head"><span class="tile sev-ad"><span class="ico" data-i="bell"></span></span><div><div class="card-t">Message</div><div class="card-s">Shown in each account's Alerts, word for word. Supports Markdown. The exact text is kept in Audit.</div></div></div>
         <textarea class="field ta" id="almsg" rows="4" maxlength="250" placeholder="Write the alert" aria-label="Alert message" autocomplete="off" spellcheck="true"></textarea>
         <div class="cnt" id="alcnt">0 / 250</div>
+        <div class="mdrow"><span class="fine">Supports Markdown formatting.</span><button type="button" class="mdbtn" id="almd">Markdown guide</button></div>
         <div class="alrow top"><span class="sel"><button type="button" class="pick" id="alcls" aria-label="Classification" aria-haspopup="listbox" value="">Choose a classification</button><span class="ico" data-i="chev"></span></span></div>
         <div class="fine" style="margin-top:0">For the record only. Accounts do not see the classification.</div>
+      </div>
+      <div class="card static">
+        <div class="sec-head"><span class="tile sev-other"><span class="ico" data-i="image"></span></span><div><div class="card-t">Preview</div><div class="card-s">How the alert reads in an account's Alerts, updated as you type.</div></div></div>
+        <div class="alprev"><div class="alprev-empty" id="alprevempty">Start typing to see the alert here.</div><div class="alert-md" id="alprevbody" hidden></div><div class="alprev-time" id="alprevtime" hidden>Just now</div></div>
+        <div class="fine" style="margin-top:10px">Images show as placeholders here. Turn on External images in Tools to load them.</div>
       </div>
       <div class="card static">
         <div class="sec-head"><span class="tile sev-other"><span class="ico" data-i="users"></span></span><div><div class="card-t">Send to</div><div class="card-s">Everyone, one or more groups, or specific accounts.</div></div></div>
@@ -5419,7 +5496,9 @@ body[data-auth=out] #msg{bottom:calc(24px + env(safe-area-inset-bottom,0px))}
         <div class="sec-head"><span class="tile sev-csam"><span class="ico" data-i="trash"></span></span><div><div class="card-t">Purge</div><div class="card-s">The same jobs the cron runs: deletes expired unpublished pages, accounts past their deletion window, stale like/follow timestamps, unreferenced backup images, and old presence, alert, activity and report-index records.</div></div></div>
         <button class="btn danger block" id="purgego">Run purge now</button>
       </div>
-      <div class="tools-foot">Approved Personnel Only</div>
+      <div class="tools-foot">Authorized Personnel<br>Only</div>
+      <div class="tools-copy">&copy; 2026 Essential Software</div>
+      <div class="tools-copy tools-ver">v3.10.2026-release</div>
     </div>
   </main>
   <button type="button" class="fab" id="alfab" aria-label="Send a custom alert" hidden><span class="ico" data-i="bell"></span></button>
@@ -5833,7 +5912,7 @@ function showTab(t){
   $('pill').style.transform='translateX('+(TABS.indexOf(t==='alerts'?'tools':t)*100)+'%)';
   $('ttl').textContent=TITLES[t];$('bttl').textContent=TITLES[t];document.title=TITLES[t]+' - Bluebook Admin';
   navChrome();
-  $('rf').hidden=t==='tools'||t==='alerts';$('alfab').hidden=t!=='tools';if(t==='alerts')alRecip();
+  $('rf').hidden=t==='tools'||t==='alerts';$('alfab').hidden=t!=='tools';if(t==='alerts'){alRecip();alPrevLast=null;alPreview()}
   setSub();
   if(t==='reports'&&repStale){repStale=false;loadReports(true)}
   if(t==='overview'&&!ovS.loaded){ovS.loaded=true;loadOverview();ovList(true)}
@@ -6578,6 +6657,575 @@ function renderAudit(){
   if(q&&auNext)L.appendChild(el('div','fine','Showing matches in the entries loaded so far. Load more to search older ones.'))
 }
 
+/* ---------- Markdown (same parser as the app's alert cards) ---------- */
+function _nbMdEsc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;')}
+// Alerts render full Markdown (CommonMark plus the GitHub extensions: tables, task lists, strikethrough, bare-link
+// autolinks, plus reference links, images, nested lists, quotes, code blocks, setext headings, hard breaks).
+// The one deliberate exception is raw HTML: it is shown as plain text, never inserted. Every piece of output is
+// escaped, and only http(s) and mailto links, and http(s) images, are ever made live.
+const _NB_MD_ENTITIES = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: '\\u00a0', copy: '\\u00a9', reg: '\\u00ae', trade: '\\u2122',
+  hellip: '\\u2026', mdash: '\\u2014', ndash: '\\u2013', lsquo: '\\u2018', rsquo: '\\u2019', ldquo: '\\u201c', rdquo: '\\u201d', bull: '\\u2022',
+  middot: '\\u00b7', times: '\\u00d7', divide: '\\u00f7', deg: '\\u00b0', plusmn: '\\u00b1', euro: '\\u20ac', pound: '\\u00a3', yen: '\\u00a5',
+  cent: '\\u00a2', sect: '\\u00a7', para: '\\u00b6', larr: '\\u2190', rarr: '\\u2192', uarr: '\\u2191', darr: '\\u2193', hearts: '\\u2665' };
+function _nbMdDecode(s) {
+  return String(s).replace(/&(#\\d{1,7}|#[xX][0-9a-fA-F]{1,6}|[A-Za-z][A-Za-z0-9]{1,31});/g, (m, g) => {
+    if (g[0] === '#') {
+      const cp = (g[1] === 'x' || g[1] === 'X') ? parseInt(g.slice(2), 16) : parseInt(g.slice(1), 10);
+      return (!cp || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) ? '\\uFFFD' : String.fromCodePoint(cp);
+    }
+    return Object.prototype.hasOwnProperty.call(_NB_MD_ENTITIES, g) ? _NB_MD_ENTITIES[g] : m;
+  });
+}
+function _nbMdText(s) { return _nbMdEsc(_nbMdDecode(s)); }
+function _nbMdUnescape(s) { return _nbMdDecode(String(s).replace(/\\\\([!-\\/:-@\\[-\`{-~])/g, '$1')); }
+function _nbMdSafeHref(dest) {
+  const d = String(dest || '').trim();
+  if (!d || /[\\s\\u0000-\\u001f]/.test(d)) return '';
+  const enc = u => u.replace(/["<>\`]/g, c => '%' + c.charCodeAt(0).toString(16).toUpperCase());
+  if (/^https?:\\/\\//i.test(d) || /^mailto:/i.test(d)) return enc(d);
+  if (/^www\\./i.test(d)) return 'https://' + enc(d);
+  return '';
+}
+function _nbMdSafeImg(dest) {
+  const d = String(dest || '').trim();
+  return (d && !/[\\s\\u0000-\\u001f]/.test(d) && /^https?:\\/\\//i.test(d)) ? d.replace(/["<>\`]/g, c => '%' + c.charCodeAt(0).toString(16).toUpperCase()) : '';
+}
+function _nbMdAnchor(href, innerHtml, title) {
+  return \`<a class="alert-link" href="\${_nbMdEsc(href)}"\${title ? \` title="\${_nbMdEsc(title)}"\` : ''} target="_blank" rel="noopener noreferrer">\${innerHtml}</a>\`;
+}
+function _nbAlertImgFail(img) {
+  if (!img || !img.parentNode) return;
+  const slide = img.closest && img.closest('.nb-carousel-slide');
+  if (slide) { const car = slide.closest('.alert-md-car'); slide.remove(); if (car) _nbMdCarSync(car); return; }
+  if (img.alt) img.replaceWith(document.createTextNode(img.alt)); else img.remove();
+}
+let _nbMdRefs = {};
+function _nbMdRefKey(s) { return String(s).trim().replace(/\\s+/g, ' ').toLowerCase(); }
+
+const _NB_MD_PUNCT = /[\\p{P}\\p{S}]/u;
+const _nbMdIsSpace = ch => ch === undefined || /\\s/.test(ch);
+const _nbMdIsPunct = ch => ch !== undefined && _NB_MD_PUNCT.test(ch);
+function _nbMdSerialize(nodes) { return nodes.map(x => x.t === 'd' ? _nbMdEsc(x.ch.repeat(Math.max(0, x.n))) : x.h).join(''); }
+// CommonMark's delimiter-stack pass for * _ and the GFM ~ strikethrough.
+function _nbMdEmphasis(nodes) {
+  for (let ci = 0; ci < nodes.length; ci++) {
+    const cl = nodes[ci];
+    if (cl.t !== 'd' || !cl.close || cl.n <= 0) continue;
+    let found = -1;
+    for (let oi = ci - 1; oi >= 0; oi--) {
+      const op = nodes[oi];
+      if (op.t !== 'd' || op.ch !== cl.ch || !op.open || op.n <= 0) continue;
+      if (cl.ch === '~') { if (op.n !== cl.n) continue; }
+      else if ((cl.open || op.close) && (op.o + cl.o) % 3 === 0 && !(op.o % 3 === 0 && cl.o % 3 === 0)) continue;
+      found = oi; break;
+    }
+    if (found < 0) continue;
+    const op = nodes[found];
+    const use = cl.ch === '~' ? cl.n : (op.n >= 2 && cl.n >= 2 ? 2 : 1);
+    const inner = _nbMdSerialize(nodes.slice(found + 1, ci));
+    const tag = cl.ch === '~' ? 'del' : use === 2 ? 'strong' : 'em';
+    op.n -= use; cl.n -= use;
+    nodes.splice(found + 1, ci - found - 1, { t: 'h', h: \`<\${tag}>\${inner}</\${tag}>\` });
+    ci = found + 1; // the closer now sits at found + 2; the loop increment lands on it again
+  }
+}
+// Finds the ] that closes the [ at \`start\` (nesting, escapes and code spans respected); -1 if none.
+function _nbMdMatchBracket(src, start) {
+  let depth = 0;
+  for (let k = start; k < src.length; k++) {
+    const c = src[k];
+    if (c === '\\\\') { k++; continue; }
+    if (c === '\`') {
+      let r = k; while (src[r] === '\`') r++;
+      const run = src.slice(k, r);
+      const close = src.indexOf(run, r);
+      if (close !== -1) { k = close + run.length - 1; continue; }
+      k = r - 1; continue;
+    }
+    if (c === '[') depth++;
+    else if (c === ']') { depth--; if (depth === 0) return k; }
+  }
+  return -1;
+}
+const _NB_MD_DEST_RE = /^\\(\\s*(<(?:[^<>\\n\\\\]|\\\\.)*>|(?:[^\\s()\\\\]|\\\\.|\\((?:[^\\s()\\\\]|\\\\.)*\\))*)(?:\\s+("(?:[^"\\\\]|\\\\.)*"|'(?:[^'\\\\]|\\\\.)*'|\\((?:[^()\\\\]|\\\\.)*\\)))?\\s*\\)/;
+// After a label ends at index e: resolve the destination as inline (url "title"), [ref], [] or a bare shortcut.
+function _nbMdResolveLink(src, label, e) {
+  const rest = src.slice(e + 1);
+  let m = rest.match(_NB_MD_DEST_RE);
+  if (m) {
+    let dest = m[1];
+    const angle = dest[0] === '<' && dest[dest.length - 1] === '>';
+    if (angle) dest = dest.slice(1, -1);
+    const title = m[2] ? _nbMdUnescape(m[2].slice(1, -1)) : '';
+    return { href: _nbMdUnescape(angle ? dest.replace(/ /g, '%20') : dest), title, end: e + 1 + m[0].length };
+  }
+  m = rest.match(/^\\[([^\\[\\]]*)\\]/);
+  if (m) {
+    const ref = _nbMdRefs[_nbMdRefKey(m[1] || label)];
+    if (ref) return { href: ref.href, title: ref.title, end: e + 1 + m[0].length };
+    return null;
+  }
+  const ref = _nbMdRefs[_nbMdRefKey(label)];
+  return ref ? { href: ref.href, title: ref.title, end: e + 1 } : null;
+}
+function _nbMdInline(src, inLink) {
+  const nodes = [];
+  let buf = '';
+  const flush = () => { if (buf) { nodes.push({ t: 'h', h: _nbMdText(buf) }); buf = ''; } };
+  const push = h => { flush(); nodes.push({ t: 'h', h }); };
+  const n = src.length;
+  let i = 0;
+  while (i < n) {
+    const c = src[i];
+    if (c === '\\\\') {
+      const nx = src[i + 1];
+      if (nx === '\\n') { buf = buf.replace(/ +$/, ''); push('<br>'); i += 2; continue; }
+      if (nx && /[!-\\/:-@\\[-\`{-~]/.test(nx)) { push(_nbMdEsc(nx)); i += 2; continue; }
+      buf += c; i++; continue;
+    }
+    if (c === '\`') {
+      let r = i; while (src[r] === '\`') r++;
+      const run = src.slice(i, r);
+      let close = r;
+      for (;;) { close = src.indexOf(run, close); if (close === -1 || (src[close + run.length] !== '\`' && src[close - 1] !== '\`')) break; close += 1; }
+      if (close === -1) { buf += run; i = r; continue; }
+      let code = src.slice(r, close).replace(/\\n/g, ' ');
+      if (code.length > 2 && code[0] === ' ' && code[code.length - 1] === ' ' && /[^ ]/.test(code)) code = code.slice(1, -1);
+      push(\`<code class="alert-md-ic">\${_nbMdEsc(code)}</code>\`);
+      i = close + run.length; continue;
+    }
+    if (c === '!' && src[i + 1] === '[') {
+      const e = _nbMdMatchBracket(src, i + 1);
+      const res = e === -1 ? null : _nbMdResolveLink(src, src.slice(i + 2, e), e);
+      if (res) {
+        const alt = _nbMdInline(src.slice(i + 2, e), true).replace(/<[^>]*>/g, '');
+        const sUrl = _nbMdSafeImg(res.href);
+        push(sUrl ? \`<img class="alert-md-img" src="\${_nbMdEsc(sUrl)}" alt="\${alt}"\${res.title ? \` title="\${_nbMdEsc(res.title)}"\` : ''} loading="lazy" onerror="_nbAlertImgFail(this)">\` : alt);
+        i = res.end; continue;
+      }
+      buf += c; i++; continue;
+    }
+    if (c === '[' && !inLink) {
+      const e = _nbMdMatchBracket(src, i);
+      const res = e === -1 ? null : _nbMdResolveLink(src, src.slice(i + 1, e), e);
+      if (res) {
+        const label = _nbMdInline(src.slice(i + 1, e), true);
+        const href = _nbMdSafeHref(res.href);
+        // An image is never a tap target: a link whose label holds an image shows just the image, not linked.
+        push(href && !/<img\\b/.test(label) ? _nbMdAnchor(href, label, res.title) : label);
+        i = res.end; continue;
+      }
+      buf += c; i++; continue;
+    }
+    if (c === '<') {
+      let m = src.slice(i).match(/^<([A-Za-z][A-Za-z0-9+.\\-]{1,31}:[^\\s<>]*)>/);
+      if (m) {
+        const href = _nbMdSafeHref(m[1]);
+        push(href && !inLink ? _nbMdAnchor(href, _nbMdEsc(m[1].replace(/^mailto:/i, ''))) : _nbMdEsc(m[1]));
+        i += m[0].length; continue;
+      }
+      m = src.slice(i).match(/^<([A-Za-z0-9.!#$%&'*+\\/=?^_\`{|}~\\-]+@[A-Za-z0-9](?:[A-Za-z0-9\\-]*[A-Za-z0-9])?(?:\\.[A-Za-z0-9](?:[A-Za-z0-9\\-]*[A-Za-z0-9])?)*)>/);
+      if (m) {
+        push(inLink ? _nbMdEsc(m[1]) : _nbMdAnchor('mailto:' + m[1], _nbMdEsc(m[1])));
+        i += m[0].length; continue;
+      }
+      buf += c; i++; continue;
+    }
+    const prev = src[i - 1];
+    if (/[hHwW]/.test(c) && (prev === undefined || /\\s/.test(prev) || '*_~('.includes(prev))) {
+      const m = src.slice(i).match(/^(?:https?:\\/\\/[^\\s<]+|www\\.[A-Za-z0-9\\-]+(?:\\.[A-Za-z0-9\\-]+)+[^\\s<]*)/i);
+      if (m) {
+        let url = m[0];
+        const pairs = { ')': '(', ']': '[', '}': '{' };
+        const count = (str, ch) => str.split(ch).length - 1;
+        while (url && /[.,;:!?'"*_~)\\]}]$/.test(url)) { // trailing punctuation stays outside; a closing bracket stays only if the URL opened it
+          const ch = url[url.length - 1];
+          if (pairs[ch] && count(url, ch) <= count(url, pairs[ch])) break;
+          url = url.slice(0, -1);
+        }
+        if (url && /^(https?:\\/\\/[^\\s<]|www\\.)/i.test(url)) {
+          push(inLink ? _nbMdEsc(url) : _nbMdAnchor(_nbMdSafeHref(url), _nbMdEsc(url)));
+          i += url.length; continue;
+        }
+      }
+    }
+    if (/[A-Za-z0-9]/.test(c) && !(prev && /[A-Za-z0-9._%+\\-]/.test(prev))) {
+      const m = src.slice(i).match(/^[A-Za-z0-9._%+\\-]+@[A-Za-z0-9\\-]+(?:\\.[A-Za-z0-9\\-]+)+/);
+      if (m && /[A-Za-z0-9]$/.test(m[0])) {
+        push(inLink ? _nbMdEsc(m[0]) : _nbMdAnchor('mailto:' + m[0], _nbMdEsc(m[0])));
+        i += m[0].length; continue;
+      }
+    }
+    if (c === '*' || c === '_' || c === '~') {
+      let r = i; while (src[r] === c) r++;
+      const k = r - i;
+      if (c === '~' && k > 2) { buf += src.slice(i, r); i = r; continue; }
+      const nx = src[r];
+      const nextSpace = _nbMdIsSpace(nx), prevSpace = _nbMdIsSpace(prev);
+      const nextPunct = _nbMdIsPunct(nx), prevPunct = _nbMdIsPunct(prev);
+      const left = !nextSpace && (!nextPunct || prevSpace || prevPunct);
+      const right = !prevSpace && (!prevPunct || nextSpace || nextPunct);
+      const open = c === '_' ? (left && (!right || prevPunct)) : left;
+      const close = c === '_' ? (right && (!left || nextPunct)) : right;
+      flush();
+      nodes.push({ t: 'd', ch: c, n: k, o: k, open, close });
+      i = r; continue;
+    }
+    if (c === '\\n') {
+      buf = buf.replace(/ +$/, '');
+      push('<br>'); i++; continue;
+    }
+    buf += c; i++;
+  }
+  flush();
+  _nbMdEmphasis(nodes);
+  return _nbMdSerialize(nodes);
+}
+
+// ---- blocks ----
+const _NB_MD = {
+  fence: /^( {0,3})(\`{3,}|~{3,})\\s*(.*)$/,
+  head: /^ {0,3}(#{1,6})(?=[ \\t]|$)[ \\t]*(.*?)[ \\t]*$/,
+  hr: /^ {0,3}([-*_])(?:[ \\t]*\\1){2,}[ \\t]*$/,
+  quote: /^ {0,3}>/,
+  list: /^( {0,3})([-*+]|\\d{1,9}[.)])( +|$)(.*)$/,
+  setext: /^ {0,3}(=+|-+)[ \\t]*$/,
+  delim: /^ {0,3}\\|?[ \\t]*:?-+:?[ \\t]*(?:\\|[ \\t]*:?-+:?[ \\t]*)*\\|?[ \\t]*$/,
+  def: /^ {0,3}\\[([^\\[\\]]+)\\]:[ \\t]*(<[^<>\\n]*>|\\S+)(?:[ \\t]+("(?:[^"\\\\]|\\\\.)*"|'(?:[^'\\\\]|\\\\.)*'|\\((?:[^()\\\\]|\\\\.)*\\)))?[ \\t]*$/
+};
+function _nbMdSplitRow(line) {
+  let s = line.trim();
+  if (s[0] === '|') s = s.slice(1);
+  if (s.length && s[s.length - 1] === '|' && s[s.length - 2] !== '\\\\') s = s.slice(0, -1);
+  const cells = []; let cur = '';
+  for (let k = 0; k < s.length; k++) {
+    if (s[k] === '\\\\' && s[k + 1] === '|') { cur += '|'; k++; }
+    else if (s[k] === '|') { cells.push(cur.trim()); cur = ''; }
+    else cur += s[k];
+  }
+  cells.push(cur.trim());
+  return cells;
+}
+function _nbMdTableAt(lines, i) {
+  if (i + 1 >= lines.length || lines[i].indexOf('|') === -1 || !_NB_MD.delim.test(lines[i + 1]) || lines[i + 1].indexOf('-') === -1) return null;
+  if (lines[i + 1].indexOf('|') === -1 && lines[i].indexOf('|') === -1) return null;
+  const head = _nbMdSplitRow(lines[i]), dl = _nbMdSplitRow(lines[i + 1]);
+  if (head.length !== dl.length) return null;
+  return { head, aligns: dl.map(d => d[0] === ':' && d[d.length - 1] === ':' ? 'center' : d[d.length - 1] === ':' ? 'right' : d[0] === ':' ? 'left' : '') };
+}
+function _nbMdBlockStart(lines, i, inPara) {
+  const l = lines[i];
+  if (_NB_MD.fence.test(l) && !(_NB_MD.fence.exec(l)[2][0] === '\`' && _NB_MD.fence.exec(l)[3].indexOf('\`') !== -1)) return true;
+  if (_NB_MD.head.test(l) || _NB_MD.hr.test(l) || _NB_MD.quote.test(l)) return true;
+  const m = l.match(_NB_MD.list);
+  if (m && (!inPara || (m[4].trim() && (/^[-*+]$/.test(m[2]) || /^1[.)]$/.test(m[2]))))) return true;
+  return false;
+}
+function _nbMdParse(lines) {
+  const out = [];
+  const n = lines.length;
+  let i = 0;
+  while (i < n) {
+    const line = lines[i];
+    if (!line.trim()) { i++; continue; }
+    if (/^ {4}/.test(line)) { // indented code
+      const buf = [];
+      while (i < n && (/^ {4}/.test(lines[i]) || (!lines[i].trim() && i + 1 < n && (/^ {4}/.test(lines[i + 1]) || !lines[i + 1].trim())))) { buf.push(lines[i].slice(4)); i++; }
+      while (buf.length && !buf[buf.length - 1].trim()) buf.pop();
+      out.push({ k: 'code', text: buf.join('\\n') });
+      continue;
+    }
+    const f = line.match(_NB_MD.fence);
+    if (f && !(f[2][0] === '\`' && f[3].indexOf('\`') !== -1)) {
+      const ind = f[1].length, ch = f[2][0], len = f[2].length, buf = [];
+      i++;
+      const closeRe = new RegExp('^ {0,3}' + (ch === '\`' ? '\`' : '~') + '{' + len + ',}[ \\\\t]*$');
+      while (i < n && !closeRe.test(lines[i])) { buf.push(lines[i].replace(new RegExp('^ {0,' + ind + '}'), '')); i++; }
+      i++;
+      out.push({ k: 'code', text: buf.join('\\n') });
+      continue;
+    }
+    const h = line.match(_NB_MD.head);
+    if (h) { out.push({ k: 'h', lvl: h[1].length, text: h[2].replace(/(^|[ \\t]+)#+$/, '') }); i++; continue; }
+    if (_NB_MD.hr.test(line)) { out.push({ k: 'hr' }); i++; continue; }
+    if (_NB_MD.quote.test(line)) {
+      const buf = [];
+      while (i < n) {
+        if (_NB_MD.quote.test(lines[i])) { buf.push(lines[i].replace(/^ {0,3}> ?/, '')); i++; }
+        else if (lines[i].trim() && buf.length && buf[buf.length - 1].trim() && !_nbMdBlockStart(lines, i, true)) { buf.push(lines[i]); i++; } // lazy continuation
+        else break;
+      }
+      out.push({ k: 'quote', kids: _nbMdParse(buf) });
+      continue;
+    }
+    const lm = line.match(_NB_MD.list);
+    if (lm) { i = _nbMdList(lines, i, out); continue; }
+    const tb = _nbMdTableAt(lines, i);
+    if (tb) {
+      i += 2;
+      const rows = [];
+      while (i < n && lines[i].trim() && !_nbMdBlockStart(lines, i, false)) {
+        const cells = _nbMdSplitRow(lines[i]);
+        while (cells.length < tb.head.length) cells.push('');
+        rows.push(cells.slice(0, tb.head.length));
+        i++;
+      }
+      out.push({ k: 'table', head: tb.head, aligns: tb.aligns, rows });
+      continue;
+    }
+    const buf = [line.replace(/^ +/, '')]; i++;
+    let done = false;
+    while (i < n && lines[i].trim()) {
+      const su = lines[i].match(_NB_MD.setext);
+      if (su) { out.push({ k: 'h', lvl: su[1][0] === '=' ? 1 : 2, text: buf.join('\\n').replace(/\\s+$/, '') }); i++; done = true; break; }
+      if (_nbMdBlockStart(lines, i, true) || _nbMdTableAt(lines, i)) break;
+      buf.push(lines[i].replace(/^ +/, '')); i++;
+    }
+    if (!done) out.push({ k: 'p', text: buf.join('\\n').replace(/\\s+$/, '') });
+  }
+  return out;
+}
+function _nbMdList(lines, i, out) {
+  const n = lines.length;
+  const first = lines[i].match(_NB_MD.list);
+  const ordered = /\\d/.test(first[2][0]);
+  const markerType = ordered ? first[2].slice(-1) : first[2];
+  const start = ordered ? parseInt(first[2], 10) : 1;
+  const sameType = m => m && (ordered ? (/\\d/.test(m[2][0]) && m[2].slice(-1) === markerType) : m[2] === markerType);
+  const items = [];
+  let loose = false;
+  while (i < n) {
+    const m = lines[i].match(_NB_MD.list);
+    if (!sameType(m) || _NB_MD.hr.test(lines[i])) break;
+    const blankAfter = m[3].length === 0 || !m[4].trim();
+    const spaces = blankAfter ? 1 : (m[3].length > 4 ? 1 : m[3].length);
+    const w = m[1].length + m[2].length + spaces;
+    const body = [blankAfter ? '' : (m[3].length > 4 ? ' '.repeat(m[3].length - 1) : '') + m[4]];
+    i++;
+    let sawBlank = false, sibling = false;
+    while (i < n) {
+      const l = lines[i];
+      if (!l.trim()) {
+        let k = i; while (k < n && !lines[k].trim()) k++;
+        if (k >= n) { i = k; break; }
+        const ind = lines[k].match(/^ */)[0].length;
+        if (ind >= w) { for (; i < k; i++) body.push(''); sawBlank = true; continue; }
+        if (sameType(lines[k].match(_NB_MD.list)) && !_NB_MD.hr.test(lines[k])) { loose = true; i = k; sibling = true; }
+        else i = k;
+        break;
+      }
+      const ind = l.match(/^ */)[0].length;
+      if (ind >= w) { body.push(l.slice(w)); i++; continue; }
+      const lm = l.match(_NB_MD.list);
+      if (lm && !_NB_MD.hr.test(l)) { if (sameType(lm)) sibling = true; break; }
+      if (_nbMdBlockStart(lines, i, true) || !body[body.length - 1].trim()) break;
+      body.push(l.trim()); i++; // lazy paragraph continuation
+    }
+    while (body.length && !body[body.length - 1].trim()) body.pop();
+    const kids = _nbMdParse(body);
+    if (sawBlank && kids.length > 1) loose = true;
+    let task = null;
+    if (kids.length && kids[0].k === 'p') {
+      const tm = kids[0].text.match(/^\\[([ xX])\\](?:[ \\t]+|$)/);
+      if (tm) { task = tm[1] === ' ' ? 'off' : 'on'; kids[0] = { k: 'p', text: kids[0].text.slice(tm[0].length) }; }
+    }
+    items.push({ kids, task });
+    if (!sibling) break;
+  }
+  out.push({ k: 'list', ordered, start, loose, items });
+  return i;
+}
+// Two or more images in a row (only spaces or line breaks between them) become a swipeable carousel, built from the
+// onboarding carousel's classes. A single image at the top level of the alert fills the card edge to edge. Images deeper
+// down (lists, quotes) and in headings keep the inline style. Images are never links or tap targets.
+const _NB_MD_IMG_TAG = '<img class="alert-md-img"[^>]*>';
+const _NB_MD_IMG_RUN = new RegExp('(?:' + _NB_MD_IMG_TAG + '(?:\\\\s|<br>)*){2,}', 'g');
+const _NB_MD_IMG_ONE = new RegExp(_NB_MD_IMG_TAG, 'g');
+function _nbMdMedia(html, top) {
+  if (html.indexOf('<img ') === -1) return html;
+  html = html.replace(_NB_MD_IMG_RUN, run => {
+    const imgs = run.match(_NB_MD_IMG_ONE);
+    return '<div class="alert-md-car' + (top ? ' alert-md-car-full' : '') + '" data-i="0" role="group" aria-label="Images">'
+      + '<div class="nb-carousel-viewport"><div class="nb-carousel-track">'
+      + imgs.map(t => '<div class="nb-carousel-slide">' + t.replace(' class="alert-md-img"', '') + '</div>').join('')
+      + '</div></div><div class="nb-carousel-dots">'
+      + imgs.map((t, i) => '<button type="button" class="nb-carousel-dot' + (i ? '' : ' active') + '" aria-label="Image ' + (i + 1) + '"></button>').join('')
+      + '</div></div>';
+  });
+  return top ? html.replace(/<img class="alert-md-img"/g, '<img class="alert-md-full"') : html;
+}
+function _nbMdRenderBlocks(blocks, tight, top) {
+  return blocks.map(b => {
+    switch (b.k) {
+      case 'p': return tight ? _nbMdMedia(_nbMdInline(b.text)) : \`<div class="alert-md-p">\${_nbMdMedia(_nbMdInline(b.text), top)}</div>\`;
+      case 'h': return \`<div class="alert-md-h alert-md-h\${b.lvl}">\${_nbMdInline(b.text)}</div>\`;
+      case 'hr': return '<hr class="alert-md-hr">';
+      case 'code': return \`<pre class="alert-md-code"><code>\${_nbMdEsc(b.text)}</code></pre>\`;
+      case 'quote': return \`<blockquote class="alert-md-quote">\${_nbMdRenderBlocks(b.kids, false)}</blockquote>\`;
+      case 'list': {
+        const tag = b.ordered ? 'ol' : 'ul';
+        const startAttr = b.ordered && b.start !== 1 ? \` start="\${b.start}"\` : '';
+        return \`<\${tag} class="alert-md-list"\${startAttr}>\` + b.items.map(it => {
+          const box = it.task ? \`<span class="alert-md-task\${it.task === 'on' ? ' on' : ''}" role="checkbox" aria-checked="\${it.task === 'on'}" aria-disabled="true"></span>\` : '';
+          return \`<li\${it.task ? ' class="alert-md-task-li"' : ''}>\${box}\${_nbMdRenderBlocks(it.kids, !b.loose)}</li>\`;
+        }).join('') + \`</\${tag}>\`;
+      }
+      case 'table': {
+        const al = i => b.aligns[i] ? \` style="text-align:\${b.aligns[i]}"\` : '';
+        return '<div class="alert-md-tablewrap"><table class="alert-md-table"><thead><tr>'
+          + b.head.map((c, i) => \`<th\${al(i)}>\${_nbMdInline(c)}</th>\`).join('') + '</tr></thead>'
+          + (b.rows.length ? '<tbody>' + b.rows.map(r => '<tr>' + r.map((c, i) => \`<td\${al(i)}>\${_nbMdInline(c)}</td>\`).join('') + '</tr>').join('') + '</tbody>' : '')
+          + '</table></div>';
+      }
+    }
+    return '';
+  }).join('');
+}
+function _nbMdRender(text) {
+  const lines = String(text == null ? '' : text).replace(/\\r\\n?/g, '\\n').split('\\n')
+    .map(l => l.replace(/^[ \\t]+/, w => w.replace(/\\t/g, '    ')));
+  // reference definitions ([ref]: url "title") are collected, then removed from the text
+  const refs = {}, kept = [];
+  let inFence = false;
+  for (let k = 0; k < lines.length; k++) {
+    const l = lines[k];
+    if (_NB_MD.fence.test(l)) inFence = !inFence;
+    const d = !inFence && l.match(_NB_MD.def);
+    if (d && (k === 0 || !lines[k - 1].trim() || _NB_MD.def.test(lines[k - 1]))) {
+      const key = _nbMdRefKey(d[1]);
+      let dest = d[2]; if (dest[0] === '<' && dest[dest.length - 1] === '>') dest = dest.slice(1, -1);
+      if (!refs[key]) refs[key] = { href: _nbMdUnescape(dest), title: d[3] ? _nbMdUnescape(d[3].slice(1, -1)) : '' };
+      continue;
+    }
+    kept.push(l);
+  }
+  _nbMdRefs = refs;
+  try { return _nbMdRenderBlocks(_nbMdParse(kept), false, true); }
+  finally { _nbMdRefs = {}; }
+}
+
+// ---- image carousel inside alerts ----
+// The same swipe carousel as the onboarding one (translateX track, drag with an 18% threshold, hard stop at the ends, dots),
+// without autoplay. One delegated set of listeners, so alert cards can be re-rendered freely with no per-card setup.
+// The position lives on the carousel element (data-i). The markup comes from _nbMdMedia.
+let _nbMdCarDrag = null;
+function _nbMdCarGo(car, i) {
+  const track = car.querySelector('.nb-carousel-track');
+  const count = track ? track.children.length : 0;
+  if (!count) return;
+  const idx = Math.max(0, Math.min(count - 1, i));
+  car.dataset.i = String(idx);
+  track.style.transform = 'translateX(-' + (idx * 100) + '%)';
+  car.querySelectorAll('.nb-carousel-dot').forEach((d, k) => d.classList.toggle('active', k === idx));
+}
+// After a slide's image fails to load: drop that slide, keep the dots in step, and remove the carousel if nothing is left.
+function _nbMdCarSync(car) {
+  const track = car.querySelector('.nb-carousel-track');
+  const dots = car.querySelector('.nb-carousel-dots');
+  const count = track ? track.children.length : 0;
+  if (!count) { car.remove(); return; }
+  if (dots) {
+    while (dots.children.length > count) dots.lastElementChild.remove();
+    dots.style.display = count < 2 ? 'none' : '';
+  }
+  _nbMdCarGo(car, parseInt(car.dataset.i, 10) || 0);
+}
+document.addEventListener('pointerdown', e => {
+  const vp = e.target && e.target.closest ? e.target.closest('.alert-md-car .nb-carousel-viewport') : null;
+  if (!vp) return;
+  const car = vp.closest('.alert-md-car'), track = vp.querySelector('.nb-carousel-track');
+  if (!track) return;
+  _nbMdCarDrag = { car, vp, track, x: e.clientX, dx: 0, idx: parseInt(car.dataset.i, 10) || 0 };
+  track.classList.add('dragging');
+  try { vp.setPointerCapture(e.pointerId); } catch (err) {}
+});
+document.addEventListener('pointermove', e => {
+  const d = _nbMdCarDrag;
+  if (!d) return;
+  const count = d.track.children.length;
+  let dx = e.clientX - d.x;
+  if (d.idx === 0 && dx > 0) dx = 0;
+  if (d.idx === count - 1 && dx < 0) dx = 0;
+  d.dx = dx;
+  d.track.style.transform = 'translateX(calc(-' + (d.idx * 100) + '% + ' + dx + 'px))';
+});
+function _nbMdCarEnd() {
+  const d = _nbMdCarDrag;
+  if (!d) return;
+  _nbMdCarDrag = null;
+  d.track.classList.remove('dragging');
+  const threshold = d.vp.getBoundingClientRect().width * 0.18;
+  _nbMdCarGo(d.car, d.dx < -threshold ? d.idx + 1 : d.dx > threshold ? d.idx - 1 : d.idx);
+}
+document.addEventListener('pointerup', _nbMdCarEnd);
+document.addEventListener('pointercancel', _nbMdCarEnd);
+document.addEventListener('click', e => {
+  const dot = e.target && e.target.closest ? e.target.closest('.alert-md-car .nb-carousel-dot') : null;
+  if (!dot) return;
+  _nbMdCarGo(dot.closest('.alert-md-car'), Array.prototype.indexOf.call(dot.parentNode.children, dot));
+});
+
+// Keeps line breaks (Markdown needs them), drops other control characters, trims the ends. The server applies the same rules.
+function alNorm(s){return String(s).replace(/\\r\\n?/g,'\\n').replace(/\\t/g,'    ').replace(/[\\u0000-\\u0009\\u000b-\\u001f\\u007f\\u2028\\u2029]/g,' ').replace(/\\n[ \\u00a0]*(?=\\n)/g,'\\n').replace(/\\n{3,}/g,'\\n\\n').trim()}
+var alPrevLast=null;
+// Admin pages never load remote images directly. Images show as placeholders in the preview and guide; with External images on in
+// Tools, the preview fetches them through the worker (fetchExt), so the image hosts see the worker and not the admin.
+var AL_PH='data:image/svg+xml,'+encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 180"><rect width="320" height="180" fill="#2A2F5E"/><circle cx="112" cy="66" r="12" fill="#8188BF" opacity=".55"/><path d="M92 128l42-48 28 32 20-22 46 38z" fill="#8188BF" opacity=".55"/></svg>');
+function alMdHtml(md){return _nbMdRender(md).replace(/(<img [^>]*?)src="([^"]*)"/g,function(m,pre,u){return pre+'src="'+AL_PH+'" data-src="'+u+'"'})}
+function alLoadImgs(root){
+  if(!$('ext').checked)return;
+  [].forEach.call(root.querySelectorAll('img[data-src]'),function(im){
+    var u=im.getAttribute('data-src');
+    fetchExt(u).then(function(du){if(du&&im.isConnected&&im.getAttribute('data-src')===u)im.src=du})
+  })
+}
+function alPreview(){
+  var v=alNorm($('almsg').value);
+  if(v===alPrevLast)return;
+  alPrevLast=v;
+  var b=$('alprevbody'),e=$('alprevempty'),t=$('alprevtime');
+  if(!v){b.innerHTML='';b.hidden=true;t.hidden=true;e.hidden=false;return}
+  e.hidden=true;b.hidden=false;t.hidden=false;
+  try{b.innerHTML=alMdHtml(v);alLoadImgs(b)}catch(x){b.textContent=v}
+}
+var MD_GUIDE=[
+  ['Bold','**bold text**'],
+  ['Italic','*italic text*  or  _italic text_'],
+  ['Bold and italic','***both***'],
+  ['Strikethrough','~~crossed out~~'],
+  ['Inline code','Use \`settings\` to change it'],
+  ['Link','[Read more](https://example.com)'],
+  ['Plain link','https://example.com'],
+  ['Headings','# Big heading\\n## Medium heading\\n### Small heading'],
+  ['Bulleted list','- First\\n- Second\\n  - Nested item'],
+  ['Numbered list','1. First\\n2. Second\\n3. Third'],
+  ['Task list','- [x] Done\\n- [ ] Still to do'],
+  ['Quote','> Quoted text'],
+  ['Code block','\`\`\`\\nline one\\nline two\\n\`\`\`'],
+  ['Table','| Name | Status |\\n| --- | :---: |\\n| Sync | Fixed |\\n| Search | Planned |'],
+  ['Divider','Above\\n\\n---\\n\\nBelow'],
+  ['Image','![Sunset](https://example.com/photo.png)'],
+  ['Image carousel','![First](https://example.com/1.png)\\n![Second](https://example.com/2.png)\\n![Third](https://example.com/3.png)'],
+  ['New line','First line\\nSecond line'],
+  ['Reference link','[Read more][1]\\n\\n[1]: https://example.com'],
+  ['Show a symbol as is','\\\\*not italic\\\\*']
+];
+function alGuide(){
+  var n=el('div','mdg');
+  n.appendChild(el('p','mdg-note','Type the text in the grey box of each example and it will look like the result below it.'));
+  MD_GUIDE.forEach(function(g){
+    var c=el('div','mdex');
+    c.appendChild(el('div','mdex-t',g[0]));
+    c.appendChild(el('pre','mdex-src',g[1]));
+    var o=el('div','mdex-out alert-md');
+    try{o.innerHTML=alMdHtml(g[1])}catch(x){o.textContent=g[1]}
+    c.appendChild(o);n.appendChild(c)
+  });
+  n.appendChild(el('p','mdg-note','One image fills the card edge to edge. Two or more images in a row, with no text between them, become a swipeable carousel. Images only work with https or http links and can\\'t be tapped or linked. Here they show as placeholders.'));
+  n.appendChild(el('p','mdg-note','Raw HTML is not rendered. It shows as plain text. Only http, https and mailto links work.'));
+  n.appendChild(el('p','mdg-note','Every Enter starts a new line. The 250 character limit counts the Markdown symbols too.'));
+  return ask({title:'Markdown guide',sev:'ad',icon:'bell',node:n,ok:'Done',single:true})
+}
 /* ---------- Custom alerts ---------- */
 // A free-text alert (kind 'notice') to everyone, to groups drawn from the accounts table, or to specific author IDs.
 // Each group can be limited to a period (the last N hours or days, or between two date-times in the chosen time zone), and several groups can be
@@ -6610,7 +7258,7 @@ function alAudLbl(a){
   var all=a.charAt(0)==='&';if(all)a=a.slice(1);
   return a.split(',').filter(Boolean).map(function(c){var i=c.indexOf(':'),p=i<0?'':alPerLbl(c.slice(i+1));return alCatLbl(i<0?c:c.slice(0,i))+(p?' ('+p+')':'')}).join(all?' and ':' or ')
 }
-function alText(){return $('almsg').value.replace(/\\s+/g,' ').trim()}
+function alText(){return alNorm($('almsg').value)}
 function alIds(){return($('alids').value||'').toLowerCase().split(/[\\s,;]+/).filter(Boolean).filter(function(v,i,a){return a.indexOf(v)===i})}
 function alPerNew(k){var d=new Date(tzShift(Date.now())),Y=d.getUTCFullYear(),M=d.getUTCMonth(),D=d.getUTCDate(),iso=function(a,b,c,h,m){return new Date(Date.UTC(a,b,c,h,m)).toISOString().slice(0,16)};return k==='away'?{m:'last',n:'30',u:'d',from:iso(Y,M,D-30,0,0),to:''}:{m:'any',n:'7',u:'d',from:iso(Y,M,D,0,0),to:iso(Y,M,D,23,59)}}
 // The period for the server: null for any time, {hours}/{days}, or {from, to} (to is not used by "Gone quiet").
@@ -6675,6 +7323,7 @@ function alBlock(){
 }
 function alSync(){
   var n=$('almsg').value.length,c=$('alcnt');
+  alPreview();
   c.textContent=num(n)+' / '+AL_MAX;c.classList.toggle('hot',n>=AL_MAX-20);
   var b=$('alsend');
   b.disabled=alBusy;
@@ -6863,6 +7512,7 @@ function alSend(){
   })
 }
 $('almsg').oninput=alSync;
+$('almd').onclick=function(){alGuide()};
 $('alids').oninput=alRecip;
 $('alcls').onclick=function(){pick('alcls',alSync)};
 $('alsend').onclick=alSend;
