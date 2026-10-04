@@ -2298,7 +2298,7 @@ async function handleServe(env, slug) {
     "script-src 'unsafe-inline'",
     "style-src 'unsafe-inline'",
     "img-src * data: blob:",
-    "frame-src https://www.youtube.com https://www.instagram.com https://open.spotify.com https://platform.twitter.com https://www.tiktok.com",
+    "frame-src https://www.youtube.com https://www.instagram.com https://open.spotify.com https://platform.twitter.com https://streamable.com",
     "connect-src 'self'",
     "object-src 'none'",
     "base-uri 'none'"
@@ -2706,7 +2706,7 @@ function isAllowedAdImageHost(host) {
 }
 const AD_MAX_IMAGES = 2;
 // Video/social embed src is generated entirely by our own client code
-// (youTubeEmbedUrl/parseSocialUrl + _socialEmbedSpec), which
+// (youTubeEmbedUrl/streamableEmbedUrl/parseSocialUrl + _socialEmbedSpec), which
 // only ever produces these exact hosts — so an exact match is intentional,
 // not a suffix match like the image host list. Anything else means the
 // block's src was set some other way (e.g. a direct API call bypassing the
@@ -2717,11 +2717,11 @@ const AD_ALLOWED_EMBED_HOSTS = new Set([
   'www.instagram.com',  // _socialEmbedSpec('instagram')
   'open.spotify.com'    // _socialEmbedSpec('spotify')
 ]);
-// Share pages may additionally carry X and TikTok embeds (only Share's own add
+// Share pages may additionally carry X and Streamable embeds (only Share's own add
 // buttons can produce them). Kept separate so a Write page can't use them.
 const AD_SHARE_EMBED_HOSTS = new Set([
   'platform.twitter.com', // _socialEmbedSpec('x')
-  'www.tiktok.com'        // _socialEmbedSpec('tiktok')
+  'streamable.com'        // streamableEmbedUrl()
 ]);
 function isAllowedAdEmbedHost(host, kind) {
   return AD_ALLOWED_EMBED_HOSTS.has(host) || (kind === 'share' && AD_SHARE_EMBED_HOSTS.has(host));
@@ -2860,7 +2860,7 @@ async function validateAdEligibility(html) {
   // see AD_ALLOWED_EMBED_HOSTS above for why this is exact-match and why
   // it exists at all (this is the only server-side check on embed src;
   // nothing else in this function looks at video/social blocks). Share pages
-  // also get X and TikTok (AD_SHARE_EMBED_HOSTS). Also caps each platform at
+  // also get X and Streamable (AD_SHARE_EMBED_HOSTS). Also caps each platform at
   // one embed — every allowed host maps to exactly one platform, so counting
   // by host IS counting by platform.
   const embedHostCounts = new Map();
@@ -3690,13 +3690,12 @@ async function handleAdminRestore(env, request, slug) {
 
 // GET /resolve-link?u=<short link>: public, narrow redirect resolver for the editor's
 // embed pickers. Browsers can't read these redirects (CORS), so the worker follows them.
-// Outbound-request endpoint, so: exact host allowlist (TikTok short links, Instagram
-// /share/ links), https only, redirects followed manually (max 4) with every hop
+// Outbound-request endpoint, so: exact host allowlist (Instagram /share/ links,
+// X t.co links), https only, redirects followed manually (max 4) with every hop
 // re-validated, 6 s timeout, body never read, IP rate limit. Returns only
 // {platform, id}; nothing from the upstream response is passed through.
 const RESOLVE_RATE_LIMIT_MAX = 20;
 const RESOLVE_RATE_LIMIT_WINDOW_S = 60;
-const RESOLVE_TIKTOK_HOSTS = new Set(['vm.tiktok.com', 'vt.tiktok.com', 'www.tiktok.com', 'tiktok.com', 'm.tiktok.com', 'www.tiktokv.com', 'tiktokv.com']);
 const RESOLVE_IG_HOSTS = new Set(['instagram.com', 'www.instagram.com', 'm.instagram.com']);
 // t.co is only ever a start point; its redirect target must itself be an allowed host.
 const RESOLVE_X_HOSTS = new Set(['t.co', 'x.com', 'www.x.com', 'twitter.com', 'www.twitter.com', 'mobile.twitter.com', 'm.twitter.com']);
@@ -3708,18 +3707,11 @@ const RESOLVE_HTML_MAX_BYTES = 150 * 1024;
 function resolveHopOk(u) {
   if (u.protocol !== 'https:' || u.username || u.password || (u.port && u.port !== '443')) return false;
   const h = u.hostname.toLowerCase();
-  return RESOLVE_TIKTOK_HOSTS.has(h) || RESOLVE_IG_HOSTS.has(h) || RESOLVE_X_HOSTS.has(h);
+  return RESOLVE_IG_HOSTS.has(h) || RESOLVE_X_HOSTS.has(h);
 }
 function resolveExtract(u) {
   const h = u.hostname.toLowerCase();
   const parts = u.pathname.split('/').filter(Boolean);
-  if (RESOLVE_TIKTOK_HOSTS.has(h)) {
-    for (let i = 0; i < parts.length - 1; i++) {
-      if ((parts[i] === 'video' || parts[i] === 'photo') && /^[0-9]+$/.test(parts[i + 1])) return { platform: 'tiktok', id: parts[i + 1] };
-      if (parts[i] === 'v') { const m = /^([0-9]+)(?:\.html)?$/.exec(parts[i + 1]); if (m) return { platform: 'tiktok', id: m[1] }; }
-    }
-    return null;
-  }
   if (RESOLVE_X_HOSTS.has(h)) {
     for (let i = 0; i < parts.length - 1; i++) {
       if ((parts[i] === 'status' || parts[i] === 'statuses') && /^[0-9]+$/.test(parts[i + 1])) return { platform: 'x', id: parts[i + 1] };
@@ -3737,8 +3729,7 @@ function resolveExtract(u) {
 function resolveStartOk(u) {
   const h = u.hostname.toLowerCase();
   const first = u.pathname.split('/').filter(Boolean)[0];
-  if (h === 'vm.tiktok.com' || h === 'vt.tiktok.com' || h === 't.co') return true;
-  if (h === 'tiktok.com' || h === 'www.tiktok.com' || h === 'm.tiktok.com') return first === 't';
+  if (h === 't.co') return true;
   if (RESOLVE_IG_HOSTS.has(h)) return first === 'share';
   return false;
 }
@@ -3788,8 +3779,8 @@ async function handleResolveLink(env, request, url) {
   for (let hop = 0; hop < 5; hop++) {
     const hit = resolveExtract(cur);
     if (hit) return json(hit, 200, cache);
-    // A hop that doesn't redirect is retried once as a crawler (Instagram / TikTok serve those
-    // their public page), then its canonical / og:url tag is read.
+    // A hop that doesn't redirect is retried once as a crawler (Instagram serves
+    // those its public page), then its canonical / og:url tag is read.
     const uas = cur.hostname.toLowerCase() === 't.co' ? [RESOLVE_UA_PLAIN] : [RESOLVE_UA_BROWSER, RESOLVE_UA_CRAWLER];
     let next = null, lastStatus = 0, failed = false;
     for (const ua of uas) {
