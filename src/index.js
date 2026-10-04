@@ -3758,12 +3758,12 @@ async function handleResolveLink(env, request, url) {
     } catch (e) { return textError(502, 'fetch failed'); }
     try { await res.body?.cancel(); } catch (e) {}
     const loc = res.headers.get('Location');
-    if (!(res.status >= 300 && res.status < 400 && loc)) return textError(502, 'link did not redirect (upstream ' + res.status + ')');
+    if (!(res.status >= 300 && res.status < 400 && loc)) return textError(502, 'no redirect from ' + cur.hostname + cur.pathname.slice(0, 40) + ' (upstream ' + res.status + ')');
     try { cur = new URL(loc, cur); } catch (e) { return textError(502, 'bad redirect'); }
-    if (!resolveHopOk(cur)) return textError(502, 'redirect left allowed hosts');
+    if (!resolveHopOk(cur)) return textError(502, 'redirect left allowed hosts (' + cur.hostname + ')');
   }
   const last = resolveExtract(cur);
-  return last ? json(last, 200, { 'Cache-Control': 'public, max-age=86400' }) : textError(502, 'could not resolve link');
+  return last ? json(last, 200, { 'Cache-Control': 'public, max-age=86400' }) : textError(502, 'too many redirects, ended at ' + cur.hostname + cur.pathname.slice(0, 40));
 }
 
 // GET /admin/img?u=<https url>: admin-only image fetch-through. The admin page
