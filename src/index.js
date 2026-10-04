@@ -2711,14 +2711,53 @@ const AD_MAX_IMAGES = 2;
 // not a suffix match like the image host list. Anything else means the
 // block's src was set some other way (e.g. a direct API call bypassing the
 // editor UI's parsers), which is exactly what this exists to catch: an ad
-// is auto-shown to every user who taps Create, not opt-in like a link.
+// is auto-shown to every user who opens Write or Share, not opt-in like a link.
 const AD_ALLOWED_EMBED_HOSTS = new Set([
   'www.youtube.com',    // youTubeEmbedUrl()
   'www.instagram.com',  // _socialEmbedSpec('instagram')
   'open.spotify.com'    // _socialEmbedSpec('spotify')
 ]);
-function isAllowedAdEmbedHost(host) {
-  return AD_ALLOWED_EMBED_HOSTS.has(host);
+// Share pages may additionally carry X and TikTok embeds (only Share's own add
+// buttons can produce them). Kept separate so a Write page can't use them.
+const AD_SHARE_EMBED_HOSTS = new Set([
+  'platform.twitter.com', // _socialEmbedSpec('x')
+  'www.tiktok.com'        // _socialEmbedSpec('tiktok')
+]);
+function isAllowedAdEmbedHost(host, kind) {
+  return AD_ALLOWED_EMBED_HOSTS.has(host) || (kind === 'share' && AD_SHARE_EMBED_HOSTS.has(host));
+}
+// An ad is either a 'write' page or a 'share' page. The client stamps Share pages
+// with <meta name="nb-kind" content="share"> when it builds the published HTML
+// (nbBuildStaticNoteHtml); anything without the stamp is a Write page, which is also
+// what every page published before Share existed is. GET /ads/next hands each screen
+// only its own kind, since a Share page's blocks only edit properly in Share.
+const AD_KIND_WRITE = 'write';
+const AD_KIND_SHARE = 'share';
+function detectAdKind(html) {
+  return /<meta\s+name=["']nb-kind["']\s+content=["']share["']/i.test(html) ? AD_KIND_SHARE : AD_KIND_WRITE;
+}
+// ads.kind and the per-kind rotation cursors are added lazily, same pattern as the
+// other ensure*() helpers: the first call on an isolate adds the column (old rows
+// become 'write'), seeds the 'write' cursor from the existing single cursor so
+// rotation carries on where it was, and seeds the 'share' cursor at the start.
+let adKindReady = null;
+function ensureAdKind(env) {
+  if (!adKindReady) {
+    adKindReady = (async () => {
+      try {
+        await env.ADS_DB.prepare("ALTER TABLE ads ADD COLUMN kind TEXT NOT NULL DEFAULT 'write'").run();
+      } catch (e) {
+        if (!/duplicate column/i.test(String((e && e.message) || e))) throw e; // already added
+      }
+      await env.ADS_DB.batch([
+        env.ADS_DB.prepare('CREATE TABLE IF NOT EXISTS ad_rotation_cursor_kind (kind TEXT PRIMARY KEY, position INTEGER NOT NULL DEFAULT 0)'),
+        env.ADS_DB.prepare("INSERT OR IGNORE INTO ad_rotation_cursor_kind (kind, position) SELECT 'write', COALESCE((SELECT position FROM ad_rotation_cursor WHERE id = 1), 0)"),
+        env.ADS_DB.prepare("INSERT OR IGNORE INTO ad_rotation_cursor_kind (kind, position) VALUES ('share', 0)"),
+        env.ADS_DB.prepare('CREATE INDEX IF NOT EXISTS ads_kind_status_rotation ON ads (kind, status, rotation_order)')
+      ]);
+    })().catch((e) => { adKindReady = null; throw e; });
+  }
+  return adKindReady;
 }
 
 // Server-side re-check of the eligibility rules — the client can (and
@@ -2732,6 +2771,7 @@ function isAllowedAdEmbedHost(host) {
 // available in this runtime) to walk `.blk` blocks and collect just the
 // two things the rules care about: text-block contents and image srcs.
 async function validateAdEligibility(html) {
+  const kind = detectAdKind(html);
   const textBlockContents = [];
   const imageSrcs = [];
   const embedSrcs = [];
@@ -2819,9 +2859,10 @@ async function validateAdEligibility(html) {
   // Rule: any video/social embed must be one our own editor generates —
   // see AD_ALLOWED_EMBED_HOSTS above for why this is exact-match and why
   // it exists at all (this is the only server-side check on embed src;
-  // nothing else in this function looks at video/social blocks). Also
-  // caps each platform at one embed — each of the 5 allowed hosts maps to
-  // exactly one platform, so counting by host IS counting by platform.
+  // nothing else in this function looks at video/social blocks). Share pages
+  // also get X and TikTok (AD_SHARE_EMBED_HOSTS). Also caps each platform at
+  // one embed — every allowed host maps to exactly one platform, so counting
+  // by host IS counting by platform.
   const embedHostCounts = new Map();
   for (const src of embedSrcs) {
     if (!src) continue; // an empty/placeholder embed slot isn't "containing" an embed
@@ -2829,14 +2870,14 @@ async function validateAdEligibility(html) {
     try { u = new URL(src); } catch (e) { return { ok: false, reason: 'invalid-embed-src' }; }
     if (u.protocol !== 'https:') return { ok: false, reason: 'invalid-embed-src' };
     const host = u.hostname.toLowerCase();
-    if (!isAllowedAdEmbedHost(host)) return { ok: false, reason: 'non-allowed-embed' };
+    if (!isAllowedAdEmbedHost(host, kind)) return { ok: false, reason: 'non-allowed-embed' };
     embedHostCounts.set(host, (embedHostCounts.get(host) || 0) + 1);
   }
   if (Array.from(embedHostCounts.values()).some(c => c > 1)) {
     return { ok: false, reason: 'duplicate-platform-embed' };
   }
 
-  return { ok: true };
+  return { ok: true, kind };
 }
 
 /* ---- D1 helpers ---- */
@@ -2940,6 +2981,7 @@ async function handleAdPublish(env, request) {
     return textError(403, 'invalid token');
   }
 
+  await ensureAdKind(env);
   const existingAd = await env.ADS_DB.prepare('SELECT slug FROM ads WHERE slug = ?').bind(slug).first();
   if (existingAd) return textError(409, 'already registered as an ad. Use PUT to edit or top up separately');
 
@@ -2967,10 +3009,10 @@ async function handleAdPublish(env, request) {
   const rotationOrder = seqRow.assigned;
   const results = await env.ADS_DB.batch([
     env.ADS_DB.prepare(
-      `INSERT INTO ads (slug, owner_sub, views_total, views_used, rotation_order, status, created_at, updated_at)
-       SELECT ?, ?, ?, 0, ?, 'active', ?, ?
+      `INSERT INTO ads (slug, owner_sub, views_total, views_used, rotation_order, status, created_at, updated_at, kind)
+       SELECT ?, ?, ?, 0, ?, 'active', ?, ?, ?
        WHERE (SELECT COALESCE(SUM(delta), 0) FROM view_credits_ledger WHERE owner_sub = ?) >= ?`
-    ).bind(slug, sub, views, rotationOrder, now, now, sub, views),
+    ).bind(slug, sub, views, rotationOrder, now, now, eligibility.kind, sub, views),
     env.ADS_DB.prepare(
       `INSERT INTO view_credits_ledger (owner_sub, delta, reason, slug, created_at)
        SELECT ?, ?, 'allocate', ?, ?
@@ -2979,7 +3021,7 @@ async function handleAdPublish(env, request) {
   ]);
   if (!results[0].meta.changes) return textError(402, 'insufficient view credits');
 
-  return json({ ok: true, slug, viewsTotal: views }, 201);
+  return json({ ok: true, slug, viewsTotal: views, kind: eligibility.kind }, 201);
 }
 
 // Re-validates and swaps the page content for an already-running ad — the
@@ -3001,6 +3043,7 @@ async function handleAdUpdate(env, request, slug) {
   if (!meta || meta.deletedAt) return textError(404, 'not found');
   if (!timingSafeEqual(await sha256Hex(token), meta.tokenHash)) return textError(403, 'invalid token');
 
+  await ensureAdKind(env);
   const ad = await env.ADS_DB.prepare('SELECT slug FROM ads WHERE slug = ?').bind(slug).first();
   if (!ad) return textError(404, 'not registered as an ad');
 
@@ -3011,7 +3054,7 @@ async function handleAdUpdate(env, request, slug) {
   meta.updatedAt = Date.now();
   meta.sizeBytes = html.length;
   await putMeta(env, slug, meta);
-  await env.ADS_DB.prepare('UPDATE ads SET updated_at = ? WHERE slug = ?').bind(Date.now(), slug).run();
+  await env.ADS_DB.prepare('UPDATE ads SET updated_at = ?, kind = ? WHERE slug = ?').bind(Date.now(), eligibility.kind, slug).run();
   return json({ ok: true });
 }
 
@@ -3051,35 +3094,42 @@ async function handleMyAds(env, request) {
   return json({ ads: results || [], creditBalance: balance });
 }
 
-// GET /ads/next — called from the Create screen instead of always loading
-// the pristine template. Public (no session needed — any device browsing
-// Create can be handed the next ad in rotation), returns null when nothing
-// is active so the client falls back to the pristine template exactly as
-// it does today.
+// GET /ads/next[?kind=share] — called from the Write screen (no kind, which is also what
+// every older app version sends) and the Share screen (kind=share) instead of always
+// loading the pristine template. Each kind rotates through its own pool with its own
+// cursor, so a Share ad is only ever handed to Share and a Write ad to Write. Public
+// (no session needed — any device opening those screens can be handed the next ad in
+// rotation), returns null when nothing is active for that kind so the client falls
+// back to the pristine template exactly as it does today.
 async function handleAdNext(env, request) {
-  const activeCount = await env.ADS_DB.prepare("SELECT COUNT(*) AS n FROM ads WHERE status = 'active'").first();
+  let kind = AD_KIND_WRITE;
+  try { if (new URL(request.url).searchParams.get('kind') === AD_KIND_SHARE) kind = AD_KIND_SHARE; } catch (e) {}
+  try { await ensureAdKind(env); } catch (e) { return json({ ad: null }); } // never fail a screen over this
+
+  const activeCount = await env.ADS_DB.prepare("SELECT COUNT(*) AS n FROM ads WHERE status = 'active' AND kind = ?").bind(kind).first();
   if (!activeCount || activeCount.n === 0) return json({ ad: null });
 
-  // One statement, one implicit D1 transaction: advance the cursor to the
-  // next active ad past its current position, wrapping to the first active
-  // ad if the cursor's past the end — or leaving it unmoved (fallback to
-  // its own current value) in the never-expected case both subqueries miss.
-  // This is what makes concurrent Create taps each get a distinct ad
+  // One statement, one implicit D1 transaction: advance this kind's cursor to the
+  // next active ad of that kind past its current position, wrapping to the first
+  // one if the cursor's past the end — or leaving it unmoved (fallback to its own
+  // current value) in the never-expected case both subqueries miss.
+  // This is what makes concurrent taps each get a distinct ad
   // instead of racing onto the same one.
   const cursorRow = await env.ADS_DB.prepare(`
-    UPDATE ad_rotation_cursor
+    UPDATE ad_rotation_cursor_kind
     SET position = COALESCE(
-      (SELECT rotation_order FROM ads WHERE status = 'active' AND rotation_order > ad_rotation_cursor.position ORDER BY rotation_order ASC LIMIT 1),
-      (SELECT rotation_order FROM ads WHERE status = 'active' ORDER BY rotation_order ASC LIMIT 1),
-      ad_rotation_cursor.position
+      (SELECT rotation_order FROM ads WHERE status = 'active' AND kind = ad_rotation_cursor_kind.kind AND rotation_order > ad_rotation_cursor_kind.position ORDER BY rotation_order ASC LIMIT 1),
+      (SELECT rotation_order FROM ads WHERE status = 'active' AND kind = ad_rotation_cursor_kind.kind ORDER BY rotation_order ASC LIMIT 1),
+      ad_rotation_cursor_kind.position
     )
-    WHERE id = 1
+    WHERE kind = ?
     RETURNING position
-  `).first();
+  `).bind(kind).first();
+  if (!cursorRow) return json({ ad: null });
 
   const ad = await env.ADS_DB.prepare(
-    "SELECT slug FROM ads WHERE status = 'active' AND rotation_order = ?"
-  ).bind(cursorRow.position).first();
+    "SELECT slug FROM ads WHERE status = 'active' AND kind = ? AND rotation_order = ?"
+  ).bind(kind, cursorRow.position).first();
   if (!ad) return json({ ad: null }); // lost a race against an unpublish between the two queries above — next tap retries
 
   // Never serve an ad whose page is gone (unpublished, taken down, or its
@@ -4108,18 +4158,22 @@ async function handleAdminStory(env, request) {
   return json({ ok: true });
 }
 
-// GET /admin/ads?status=&q=&cursor= (q: slug part or author ID): ads across all accounts, newest first, keyset-paginated.
+// GET /admin/ads?status=&kind=write|share&q=&cursor= (q: slug part or author ID): ads across all accounts, newest first, keyset-paginated.
 const ADMIN_ADS_PAGE = 30;
 async function handleAdminAds(env, request, url) {
   const g = await adminGate(env, request); if (g) return g;
   await ensureAdminIndexes(env);
+  await ensureAdKind(env);
   const status = url.searchParams.get('status') || '';
   const cur = parseAdminCursor(url.searchParams.get('cursor'));
   const filter = ['active', 'paused', 'exhausted', 'unpublished'].includes(status);
+  const kindQ = url.searchParams.get('kind');
+  const kindFilter = kindQ === 'write' || kindQ === 'share';
   const aid = adminAidQ(url.searchParams.get('q'));
   const q = aid ? '' : (url.searchParams.get('q') || '').toLowerCase().replace(/[^a-z0-9-]/g, '').slice(0, 48);
   const where = [], b = [];
   if (filter) { where.push('a.status = ?'); b.push(status); }
+  if (kindFilter) { where.push('a.kind = ?'); b.push(kindQ); }
   if (aid) { where.push('a.owner_sub = ?'); b.push((await adminSubFromAid(env, aid)) || ''); }
   else if (q) { where.push('a.slug LIKE ?'); b.push('%' + q + '%'); }
   const w = where.length ? ' WHERE ' + where.join(' AND ') : '';
@@ -4128,7 +4182,7 @@ async function handleAdminAds(env, request, url) {
   // feeds the "of N" count.
   const stmts = [
     env.ADS_DB.prepare(
-      'SELECT a.slug, a.owner_sub, a.views_total, a.views_used, a.status, a.created_at, ' +
+      'SELECT a.slug, a.owner_sub, a.views_total, a.views_used, a.status, a.created_at, a.kind, ' +
       '(SELECT COUNT(*) FROM ad_viewers v WHERE v.slug = a.slug) AS unique_viewers ' +
       'FROM ads a' + w + curSql + ' ORDER BY a.created_at DESC, a.slug DESC LIMIT ?'
     ).bind(...b, ...(cur ? [cur.key, cur.id] : []), ADMIN_ADS_PAGE + 1)
@@ -4148,7 +4202,7 @@ async function handleAdminAds(env, request, url) {
   return json({
     ads: rows.map(r => ({
       slug: r.slug, ownerEmail: emails[r.owner_sub], viewsTotal: r.views_total, viewsUsed: r.views_used,
-      status: r.status, createdAt: r.created_at, uniqueViewers: r.unique_viewers
+      status: r.status, createdAt: r.created_at, uniqueViewers: r.unique_viewers, kind: r.kind === 'share' ? 'share' : 'write'
     })),
     total: cur ? null : res[0].results[0].t,
     next: more && last ? last.created_at + '|' + last.slug : null
@@ -5437,6 +5491,7 @@ body[data-auth=out] #msg{bottom:calc(24px + env(safe-area-inset-bottom,0px))}
       <div class="search"><div class="field-wrap"><span class="ico" data-i="search"></span><input class="field" id="adq" placeholder="Filter by slug or author ID" autocomplete="off" autocapitalize="off" spellcheck="false"></div></div>
       <div class="filters">
         <span class="sel"><button type="button" class="pick" id="adst" aria-label="Ad status" aria-haspopup="listbox" value="">All ads</button><span class="ico" data-i="chev"></span></span>
+        <span class="sel"><button type="button" class="pick" id="adkind" aria-label="Ad type" aria-haspopup="listbox" value="">Write &amp; Share</button><span class="ico" data-i="chev"></span></span>
       </div>
       <div id="adlist"></div>
       <button class="btn block more" id="admore" hidden>Load more</button>
@@ -5786,7 +5841,7 @@ function ask(o){
   })
 }
 
-var PICKS={ovsort:[['new', 'Newest first'], ['old', 'Oldest first'], ['active', 'Last active']],ovfilter:[['', 'All users'], ['online', 'Online now'], ['active24', 'Active 24h']],fstatus:[['', 'Any status'], ['live', 'live'], ['taken down', 'taken down'], ['unpublished', 'unpublished'], ['missing', 'missing']],fsort:[['new', 'Newest first'], ['most', 'Most reported'], ['old', 'Oldest first']],adst:[['', 'All ads'], ['active', 'Active'], ['paused', 'Paused'], ['exhausted', 'Used up'], ['unpublished', 'Down']]};
+var PICKS={ovsort:[['new', 'Newest first'], ['old', 'Oldest first'], ['active', 'Last active']],ovfilter:[['', 'All users'], ['online', 'Online now'], ['active24', 'Active 24h']],fstatus:[['', 'Any status'], ['live', 'live'], ['taken down', 'taken down'], ['unpublished', 'unpublished'], ['missing', 'missing']],fsort:[['new', 'Newest first'], ['most', 'Most reported'], ['old', 'Oldest first']],adst:[['', 'All ads'], ['active', 'Active'], ['paused', 'Paused'], ['exhausted', 'Used up'], ['unpublished', 'Down']],adkind:[['', 'Write & Share'], ['write', 'Write'], ['share', 'Share']]};
 function pickSet(id,v){
   var b=$(id),o=PICKS[id].filter(function(x){return x[0]===v})[0]||PICKS[id][0];
   b.value=o[0];b.textContent=o[1]
@@ -6512,21 +6567,23 @@ function aidFetch(v,cur){
 function aidResolve(v){return aidMap[v]?Promise.resolve(aidMap[v]):aidFetch(v,'')}
 function aidMore(v){var r=aidMap[v];return r&&r.next?aidFetch(v,r.next):Promise.resolve(r)}
 var adT=null,adFocus='';
+// " - active - share" style suffix for the Ads subtitle: the status and type filters that are on.
+function adFiltLbl(){var t=[];if($('adst').value)t.push($('adst').textContent.toLowerCase());if($('adkind').value)t.push($('adkind').textContent.toLowerCase());return t.length?' - '+t.join(' - '):''}
 function adqv(){return $('adq').value.trim().toLowerCase().replace(/^[/@]+/,'')}
 // Lookup's "Ads tab": show the ad of one note, opened, in the Ads screen (status filter reset so it cannot be hidden).
 function openAd(slug){
   openSet['ad:'+slug]=true;adFocus=slug;
-  $('adq').value=slug;pickSet('adst','');
+  $('adq').value=slug;pickSet('adst','');pickSet('adkind','');
   $('adlist').textContent='';adCur='';
   goTab('ads');if(cur==='ads'&&!$('adlist').firstChild)loadAds(true)
 }
 function loadAds(reset){
   var L=$('adlist');
   if(reset){adCur='';adTotal=0;L.textContent='';skel(L,3)}else moreBusy($('admore'),true);
-  return api('/admin/ads?status='+encodeURIComponent($('adst').value)+'&q='+encodeURIComponent(adqv())+'&cursor='+encodeURIComponent(adCur)).then(function(o){
+  return api('/admin/ads?status='+encodeURIComponent($('adst').value)+'&kind='+encodeURIComponent($('adkind').value)+'&q='+encodeURIComponent(adqv())+'&cursor='+encodeURIComponent(adCur)).then(function(o){
     unskel(L);moreBusy($('admore'),false);
     if(!o.ok){bad(o,'Could not load ads');return}
-    if(o.j.total!=null)adTotal=o.j.total;SUBS.ads=num(adTotal)+(adTotal===1?' campaign':' campaigns')+($('adst').value?' - '+$('adst').textContent.toLowerCase():'');if(cur==='ads')setSub();
+    if(o.j.total!=null)adTotal=o.j.total;SUBS.ads=num(adTotal)+(adTotal===1?' campaign':' campaigns')+adFiltLbl();if(cur==='ads')setSub();
     o.j.ads.forEach(renderAd);
     if(adFocus){var f=o.j.ads.filter(function(x){return x.slug===adFocus})[0];adFocus='';if(f&&f._c&&f._c.scrollIntoView)f._c.scrollIntoView({behavior:'smooth',block:'start'})}
     adCur=o.j.next;$('admore').hidden=adCur==null;
@@ -6542,7 +6599,7 @@ function adApplied(a,action){
   if(f&&a.status!==f){
     if(a._c)a._c.remove();
     adTotal=Math.max(0,adTotal-1);
-    SUBS.ads=num(adTotal)+(adTotal===1?' campaign':' campaigns')+' - '+$('adst').textContent.toLowerCase();if(cur==='ads')setSub();
+    SUBS.ads=num(adTotal)+(adTotal===1?' campaign':' campaigns')+adFiltLbl();if(cur==='ads')setSub();
     if(!$('adlist').firstChild)$('adlist').appendChild(empty('No ads','No ads match this filter.','ads'))
   }else renderAd(a)
 }
@@ -6564,7 +6621,7 @@ function renderAd(a){
   var ml=el('div','meter-l');ml.appendChild(el('span',null,num(a.viewsUsed)+' of '+num(a.viewsTotal)+' views'));ml.appendChild(el('span',null,pct+'%'));m.appendChild(ml);
   var card=mkCard({sev:'ad',icon:'ads',slug:a.slug,chips:[stChip(a.status)],sub:a.ownerEmail||'account missing',extra:m,key:'ad:'+a.slug});
   var k=el('div','kvs');
-  kv(k,'Unique viewers',num(a.uniqueViewers));kv(k,'Views left',num(left));kv(k,'Created',fmt(a.createdAt));
+  kv(k,'Type',a.kind==='share'?'Share':'Write');kv(k,'Unique viewers',num(a.uniqueViewers));kv(k,'Views left',num(left));kv(k,'Created',fmt(a.createdAt));
   card.pad.appendChild(k);
   var tools=el('div','tools');tools.appendChild(btn('Lookup',null,function(){openLookup(a.slug)}));card.pad.appendChild(tools);
   var foot=card.foot;
@@ -7987,6 +8044,7 @@ $('ovfilter').onclick=function(){pick('ovfilter',function(){ovS.fil=$('ovfilter'
 $('ovq').oninput=function(){clearTimeout(ovS.t);ovS.t=setTimeout(function(){ovS.q=$('ovq').value.trim().toLowerCase();ovList(true)},300)};
 [].forEach.call($('ovseg').children,function(b){b.onclick=function(){var v=b.getAttribute('data-v');if(ovS.view===v)return;ovS.view=v;ovS.q='';$('ovq').value='';ovSync();ovList(true)}});
 $('adst').onclick=function(){pick('adst',function(){loadAds(true)})};
+$('adkind').onclick=function(){pick('adkind',function(){loadAds(true)})};
 $('auq').oninput=function(){clearTimeout(auT);auT=setTimeout(auSearch,300)};
 $('adq').oninput=function(){clearTimeout(adT);adT=setTimeout(function(){loadAds(true)},300)};
 $('fstatus').onclick=function(){pick('fstatus',renderAll)};
