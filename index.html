@@ -611,6 +611,7 @@ body[data-auth=out] #msg{bottom:calc(24px + env(safe-area-inset-bottom,0px))}
       <div class="search"><div class="field-wrap"><span class="ico" data-i="search"></span><input class="field" id="adq" placeholder="Filter by slug or author ID" autocomplete="off" autocapitalize="off" spellcheck="false"></div></div>
       <div class="filters">
         <span class="sel"><button type="button" class="pick" id="adst" aria-label="Ad status" aria-haspopup="listbox" value="">All ads</button><span class="ico" data-i="chev"></span></span>
+        <span class="sel"><button type="button" class="pick" id="adkind" aria-label="Ad type" aria-haspopup="listbox" value="">Write &amp; Share</button><span class="ico" data-i="chev"></span></span>
       </div>
       <div id="adlist"></div>
       <button class="btn block more" id="admore" hidden>Load more</button>
@@ -743,12 +744,12 @@ pages['letters-to-lisbon'].story.images.cards.push({url:'https://images.example.
 users['omar.haddad@example.com'].alerts.push({at:E_REL,kind:'release',strike:false,dismissedAt:null,message:'Your note \u201cRetired draft\u201d was unpublished by an admin. Its address is free, so you can publish it again. Its likes were removed.'});
 (function(){var m='Your note \u201cOld post\u201d was taken down. '+aRs('spam')+' Its address can\u2019t be reused. '+AR;users['tom.becker@example.com'].alerts.push({at:E_OLD,kind:'takedown',strike:true,dismissedAt:null,message:m});users['tom.becker@example.com'].strikes.unshift({at:E_OLD,kind:'takedown',message:m,dismissedAt:null})})();
 var stale={timestamps:4,images:6,presence:9,activity:14};
-function Ad(slug,st,used,tot,uv,owner){ads[slug]={slug:slug,status:st,viewsUsed:used,viewsTotal:tot,uniqueViewers:uv,createdAt:Math.max(pages[slug].createdAt+H,J(N-ri(3,Math.min(40,Math.floor((N-pages[slug].createdAt)/D)-1))*D,slug+'ad')),ownerEmail:owner,refunded:false}}
+function Ad(slug,st,used,tot,uv,owner,kind){ads[slug]={slug:slug,kind:kind||'write',status:st,viewsUsed:used,viewsTotal:tot,uniqueViewers:uv,createdAt:Math.max(pages[slug].createdAt+H,J(N-ri(3,Math.min(40,Math.floor((N-pages[slug].createdAt)/D)-1))*D,slug+'ad')),ownerEmail:owner,refunded:false}}
 Ad('letters-to-lisbon','active',3120,5000,2480,'lena.fischer@example.com');
-Ad('wedding-moodboard','paused',640,2000,590,'priya.nair@example.com');
+Ad('wedding-moodboard','paused',640,2000,590,'priya.nair@example.com','share');
 Ad('sunday-sourdough','exhausted',1000,1000,870,'maya.chen@example.com');
 Ad('study-cards-bio','unpublished',200,1500,180,'dev.patel@example.com');
-Ad('trail-journal','active',90,800,85,'maya.chen@example.com');
+Ad('trail-journal','active',90,800,85,'maya.chen@example.com','share');
 R('cheap-watches-now','spam','Selling counterfeit goods, link spam.',5);R('cheap-watches-now','spam','Same spam as before.',3);R('cheap-watches-now','abuse','Misleading offers aimed at new users.',2);
 R('win-free-gift','spam','Fake prize page.',9);
 R('sunday-sourdough','copyright','Photos look copied from my blog.',30);
@@ -848,7 +849,7 @@ function route(path,o){
     else if(a==='clear-name'){us.displayName='';strike(us.email,'profile_name','Your display name was removed. '+aRs(rs)+' You can set a new one. '+AR);A('owner_clear-name',b.slug,rs)}
     else if(a==='clear-picture'){us.hasProfileImage=false;strike(us.email,'profile_picture','Your profile picture was removed. '+aRs(rs)+' You can upload a new one. '+AR);A('owner_clear-picture',b.slug,rs)}
     else return err(400,'Unknown action');return ok({})}
-  if(p==='/admin/ads'){var st=q.get('status'),sq=(q.get('q')||'').toLowerCase(),L2=Object.keys(ads).map(function(s){return ads[s]}).filter(function(x){return(!st||x.status===st)&&(!sq||(/^a_[a-f0-9]{32}$/.test(sq)?((users[x.ownerEmail]||{}).authorId===sq):x.slug.indexOf(sq)>-1))});return ok({ads:L2,total:L2.length,next:null})}
+  if(p==='/admin/ads'){var st=q.get('status'),kd=q.get('kind'),sq=(q.get('q')||'').toLowerCase(),L2=Object.keys(ads).map(function(s){return ads[s]}).filter(function(x){return(!st||x.status===st)&&(!kd||x.kind===kd)&&(!sq||(/^a_[a-f0-9]{32}$/.test(sq)?((users[x.ownerEmail]||{}).authorId===sq):x.slug.indexOf(sq)>-1))});return ok({ads:L2,total:L2.length,next:null})}
   if(p==='/admin/ad'){var ad=ads[b.slug];if(!ad)return err(404,'ad not found');var ba=b.action,as=ad.status;if((ba==='pause'||ba==='takedown')&&!reasonOf(b))return err(400,'reason required');if(ba==='pause'&&as!=='active')return err(409,'ad is not active');if(ba==='resume'&&as!=='paused')return err(409,'ad is not paused');if(ba==='takedown'&&as!=='active'&&as!=='paused')return err(409,'ad is not running');if(ba==='refund'&&(as==='active'||as==='paused'))return err(409,'take the ad down first');if(ba!=='pause'&&ba!=='resume'&&ba!=='takedown'&&ba!=='refund')return err(400,'invalid action');var left=ad.viewsTotal-ad.viewsUsed,res={};
     if(b.action==='pause')ad.status='paused';else if(b.action==='resume')ad.status='active';
     else if(b.action==='takedown'){ad.status='unpublished';if(b.refund&&left>0){res.refunded=left;ad.refunded=true}}
@@ -1248,7 +1249,7 @@ function ask(o){
   })
 }
 
-var PICKS={ovsort:[['new', 'Newest first'], ['old', 'Oldest first'], ['active', 'Last active']],ovfilter:[['', 'All users'], ['online', 'Online now'], ['active24', 'Active 24h']],fstatus:[['', 'Any status'], ['live', 'live'], ['taken down', 'taken down'], ['unpublished', 'unpublished'], ['missing', 'missing']],fsort:[['new', 'Newest first'], ['most', 'Most reported'], ['old', 'Oldest first']],adst:[['', 'All ads'], ['active', 'Active'], ['paused', 'Paused'], ['exhausted', 'Used up'], ['unpublished', 'Down']]};
+var PICKS={ovsort:[['new', 'Newest first'], ['old', 'Oldest first'], ['active', 'Last active']],ovfilter:[['', 'All users'], ['online', 'Online now'], ['active24', 'Active 24h']],fstatus:[['', 'Any status'], ['live', 'live'], ['taken down', 'taken down'], ['unpublished', 'unpublished'], ['missing', 'missing']],fsort:[['new', 'Newest first'], ['most', 'Most reported'], ['old', 'Oldest first']],adst:[['', 'All ads'], ['active', 'Active'], ['paused', 'Paused'], ['exhausted', 'Used up'], ['unpublished', 'Down']],adkind:[['', 'Write & Share'], ['write', 'Write'], ['share', 'Share']]};
 function pickSet(id,v){
   var b=$(id),o=PICKS[id].filter(function(x){return x[0]===v})[0]||PICKS[id][0];
   b.value=o[0];b.textContent=o[1]
@@ -1974,21 +1975,23 @@ function aidFetch(v,cur){
 function aidResolve(v){return aidMap[v]?Promise.resolve(aidMap[v]):aidFetch(v,'')}
 function aidMore(v){var r=aidMap[v];return r&&r.next?aidFetch(v,r.next):Promise.resolve(r)}
 var adT=null,adFocus='';
+// " - active - share" style suffix for the Ads subtitle: the status and type filters that are on.
+function adFiltLbl(){var t=[];if($('adst').value)t.push($('adst').textContent.toLowerCase());if($('adkind').value)t.push($('adkind').textContent.toLowerCase());return t.length?' - '+t.join(' - '):''}
 function adqv(){return $('adq').value.trim().toLowerCase().replace(/^[/@]+/,'')}
 // Lookup's "Ads tab": show the ad of one note, opened, in the Ads screen (status filter reset so it cannot be hidden).
 function openAd(slug){
   openSet['ad:'+slug]=true;adFocus=slug;
-  $('adq').value=slug;pickSet('adst','');
+  $('adq').value=slug;pickSet('adst','');pickSet('adkind','');
   $('adlist').textContent='';adCur='';
   goTab('ads');if(cur==='ads'&&!$('adlist').firstChild)loadAds(true)
 }
 function loadAds(reset){
   var L=$('adlist');
   if(reset){adCur='';adTotal=0;L.textContent='';skel(L,3)}else moreBusy($('admore'),true);
-  return api('/admin/ads?status='+encodeURIComponent($('adst').value)+'&q='+encodeURIComponent(adqv())+'&cursor='+encodeURIComponent(adCur)).then(function(o){
+  return api('/admin/ads?status='+encodeURIComponent($('adst').value)+'&kind='+encodeURIComponent($('adkind').value)+'&q='+encodeURIComponent(adqv())+'&cursor='+encodeURIComponent(adCur)).then(function(o){
     unskel(L);moreBusy($('admore'),false);
     if(!o.ok){bad(o,'Could not load ads');return}
-    if(o.j.total!=null)adTotal=o.j.total;SUBS.ads=num(adTotal)+(adTotal===1?' campaign':' campaigns')+($('adst').value?' - '+$('adst').textContent.toLowerCase():'');if(cur==='ads')setSub();
+    if(o.j.total!=null)adTotal=o.j.total;SUBS.ads=num(adTotal)+(adTotal===1?' campaign':' campaigns')+adFiltLbl();if(cur==='ads')setSub();
     o.j.ads.forEach(renderAd);
     if(adFocus){var f=o.j.ads.filter(function(x){return x.slug===adFocus})[0];adFocus='';if(f&&f._c&&f._c.scrollIntoView)f._c.scrollIntoView({behavior:'smooth',block:'start'})}
     adCur=o.j.next;$('admore').hidden=adCur==null;
@@ -2004,7 +2007,7 @@ function adApplied(a,action){
   if(f&&a.status!==f){
     if(a._c)a._c.remove();
     adTotal=Math.max(0,adTotal-1);
-    SUBS.ads=num(adTotal)+(adTotal===1?' campaign':' campaigns')+' - '+$('adst').textContent.toLowerCase();if(cur==='ads')setSub();
+    SUBS.ads=num(adTotal)+(adTotal===1?' campaign':' campaigns')+adFiltLbl();if(cur==='ads')setSub();
     if(!$('adlist').firstChild)$('adlist').appendChild(empty('No ads','No ads match this filter.','ads'))
   }else renderAd(a)
 }
@@ -2026,7 +2029,7 @@ function renderAd(a){
   var ml=el('div','meter-l');ml.appendChild(el('span',null,num(a.viewsUsed)+' of '+num(a.viewsTotal)+' views'));ml.appendChild(el('span',null,pct+'%'));m.appendChild(ml);
   var card=mkCard({sev:'ad',icon:'ads',slug:a.slug,chips:[stChip(a.status)],sub:a.ownerEmail||'account missing',extra:m,key:'ad:'+a.slug});
   var k=el('div','kvs');
-  kv(k,'Unique viewers',num(a.uniqueViewers));kv(k,'Views left',num(left));kv(k,'Created',fmt(a.createdAt));
+  kv(k,'Type',a.kind==='share'?'Share':'Write');kv(k,'Unique viewers',num(a.uniqueViewers));kv(k,'Views left',num(left));kv(k,'Created',fmt(a.createdAt));
   card.pad.appendChild(k);
   var tools=el('div','tools');tools.appendChild(btn('Lookup',null,function(){openLookup(a.slug)}));card.pad.appendChild(tools);
   var foot=card.foot;
@@ -3449,6 +3452,7 @@ $('ovfilter').onclick=function(){pick('ovfilter',function(){ovS.fil=$('ovfilter'
 $('ovq').oninput=function(){clearTimeout(ovS.t);ovS.t=setTimeout(function(){ovS.q=$('ovq').value.trim().toLowerCase();ovList(true)},300)};
 [].forEach.call($('ovseg').children,function(b){b.onclick=function(){var v=b.getAttribute('data-v');if(ovS.view===v)return;ovS.view=v;ovS.q='';$('ovq').value='';ovSync();ovList(true)}});
 $('adst').onclick=function(){pick('adst',function(){loadAds(true)})};
+$('adkind').onclick=function(){pick('adkind',function(){loadAds(true)})};
 $('auq').oninput=function(){clearTimeout(auT);auT=setTimeout(auSearch,300)};
 $('adq').oninput=function(){clearTimeout(adT);adT=setTimeout(function(){loadAds(true)},300)};
 $('fstatus').onclick=function(){pick('fstatus',renderAll)};
