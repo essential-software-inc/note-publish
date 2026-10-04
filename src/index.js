@@ -3697,12 +3697,18 @@ async function handleAdminRestore(env, request, slug) {
 const RESOLVE_RATE_LIMIT_MAX = 20;
 const RESOLVE_RATE_LIMIT_WINDOW_S = 60;
 const RESOLVE_TIKTOK_HOSTS = new Set(['vm.tiktok.com', 'vt.tiktok.com', 'www.tiktok.com', 'tiktok.com', 'm.tiktok.com', 'www.tiktokv.com', 'tiktokv.com']);
-const RESOLVE_IG_HOSTS = new Set(['instagram.com', 'www.instagram.com']);
+const RESOLVE_IG_HOSTS = new Set(['instagram.com', 'www.instagram.com', 'm.instagram.com']);
+// t.co is only ever a start point; its redirect target must itself be an allowed host.
+const RESOLVE_X_HOSTS = new Set(['t.co', 'x.com', 'www.x.com', 'twitter.com', 'www.twitter.com', 'mobile.twitter.com', 'm.twitter.com']);
+const RESOLVE_UA_BROWSER = 'Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36';
+const RESOLVE_UA_CRAWLER = 'facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)';
+const RESOLVE_UA_PLAIN = 'curl/8.5.0'; // t.co answers a plain client with a real 301 (browsers get an HTML page)
+const RESOLVE_HTML_MAX_BYTES = 150 * 1024;
 
 function resolveHopOk(u) {
   if (u.protocol !== 'https:' || u.username || u.password || (u.port && u.port !== '443')) return false;
   const h = u.hostname.toLowerCase();
-  return RESOLVE_TIKTOK_HOSTS.has(h) || RESOLVE_IG_HOSTS.has(h);
+  return RESOLVE_TIKTOK_HOSTS.has(h) || RESOLVE_IG_HOSTS.has(h) || RESOLVE_X_HOSTS.has(h);
 }
 function resolveExtract(u) {
   const h = u.hostname.toLowerCase();
@@ -3714,7 +3720,13 @@ function resolveExtract(u) {
     }
     return null;
   }
-  if (parts[0] === 'share') return null; // still an unresolved share link
+  if (RESOLVE_X_HOSTS.has(h)) {
+    for (let i = 0; i < parts.length - 1; i++) {
+      if ((parts[i] === 'status' || parts[i] === 'statuses') && /^[0-9]+$/.test(parts[i + 1])) return { platform: 'x', id: parts[i + 1] };
+    }
+    return null;
+  }
+  if (!RESOLVE_IG_HOSTS.has(h) || parts[0] === 'share') return null; // not Instagram, or still an unresolved share link
   for (let i = 0; i < parts.length - 1; i++) {
     if (['p', 'reel', 'reels', 'tv'].includes(parts[i]) && /^[A-Za-z0-9_-]+$/.test(parts[i + 1])) {
       return { platform: 'instagram', id: parts[i + 1] };
@@ -3725,10 +3737,41 @@ function resolveExtract(u) {
 function resolveStartOk(u) {
   const h = u.hostname.toLowerCase();
   const first = u.pathname.split('/').filter(Boolean)[0];
-  if (h === 'vm.tiktok.com' || h === 'vt.tiktok.com') return true;
-  if (h === 'tiktok.com' || h === 'www.tiktok.com') return first === 't';
+  if (h === 'vm.tiktok.com' || h === 'vt.tiktok.com' || h === 't.co') return true;
+  if (h === 'tiktok.com' || h === 'www.tiktok.com' || h === 'm.tiktok.com') return first === 't';
   if (RESOLVE_IG_HOSTS.has(h)) return first === 'share';
   return false;
+}
+// Fallback when a hop answers 200 instead of redirecting: the page's canonical / og:url tag
+// often names the post. Only an allowed-host URL that resolveExtract accepts is ever used.
+function resolveFromHtml(html, base) {
+  const tags = html.match(/<(?:link|meta)[^>]+>/gi) || [];
+  for (const tag of tags) {
+    if (!/(?:rel|property)\s*=\s*["'](?:canonical|og:url)["']/i.test(tag)) continue;
+    const m = /(?:href|content)\s*=\s*["']([^"']+)["']/i.exec(tag);
+    if (!m) continue;
+    try {
+      const u = new URL(m[1].replace(/&amp;/g, '&'), base);
+      if (!resolveHopOk(u)) continue;
+      const hit = resolveExtract(u);
+      if (hit) return hit;
+    } catch (e) {}
+  }
+  return null;
+}
+async function resolveReadCapped(res) {
+  const reader = res.body.getReader();
+  const dec = new TextDecoder();
+  let out = '', total = 0;
+  for (;;) {
+    let r;
+    try { r = await reader.read(); } catch (e) { break; }
+    if (r.done) break;
+    total += r.value.byteLength;
+    out += dec.decode(r.value, { stream: true });
+    if (total >= RESOLVE_HTML_MAX_BYTES) { try { await reader.cancel(); } catch (e) {} break; }
+  }
+  return out;
 }
 async function handleResolveLink(env, request, url) {
   const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
@@ -3741,29 +3784,39 @@ async function handleResolveLink(env, request, url) {
   let cur;
   try { cur = new URL(url.searchParams.get('u') || ''); } catch (e) { return textError(400, 'invalid url'); }
   if (cur.href.length > 512 || !resolveHopOk(cur) || !resolveStartOk(cur)) return textError(400, 'url not supported');
+  const cache = { 'Cache-Control': 'public, max-age=86400' };
   for (let hop = 0; hop < 5; hop++) {
     const hit = resolveExtract(cur);
-    if (hit) return json(hit, 200, { 'Cache-Control': 'public, max-age=86400' });
-    let res;
-    try {
-      res = await fetch(cur.href, {
-        method: 'GET',
-        redirect: 'manual',
-        headers: {
-          'Accept': 'text/html',
-          'User-Agent': 'Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36'
-        },
-        signal: AbortSignal.timeout(6000)
-      });
-    } catch (e) { return textError(502, 'fetch failed'); }
-    try { await res.body?.cancel(); } catch (e) {}
-    const loc = res.headers.get('Location');
-    if (!(res.status >= 300 && res.status < 400 && loc)) return textError(502, 'no redirect from ' + cur.hostname + cur.pathname.slice(0, 40) + ' (upstream ' + res.status + ')');
-    try { cur = new URL(loc, cur); } catch (e) { return textError(502, 'bad redirect'); }
-    if (!resolveHopOk(cur)) return textError(502, 'redirect left allowed hosts (' + cur.hostname + ')');
+    if (hit) return json(hit, 200, cache);
+    // A hop that doesn't redirect is retried once as a crawler (Instagram / TikTok serve those
+    // their public page), then its canonical / og:url tag is read.
+    const uas = cur.hostname.toLowerCase() === 't.co' ? [RESOLVE_UA_PLAIN] : [RESOLVE_UA_BROWSER, RESOLVE_UA_CRAWLER];
+    let next = null, lastStatus = 0, failed = false;
+    for (const ua of uas) {
+      let res;
+      try {
+        res = await fetch(cur.href, { method: 'GET', redirect: 'manual', headers: { 'Accept': 'text/html', 'User-Agent': ua }, signal: AbortSignal.timeout(5000) });
+      } catch (e) { failed = true; continue; }
+      lastStatus = res.status;
+      const loc = res.headers.get('Location');
+      if (res.status >= 300 && res.status < 400 && loc) {
+        try { await res.body?.cancel(); } catch (e) {}
+        try { next = new URL(loc, cur); } catch (e) { return textError(502, 'bad redirect'); }
+        break;
+      }
+      if (res.ok && res.body && /html/i.test(res.headers.get('Content-Type') || '')) {
+        const found = resolveFromHtml(await resolveReadCapped(res), cur);
+        if (found) return json(found, 200, cache);
+      } else {
+        try { await res.body?.cancel(); } catch (e) {}
+      }
+    }
+    if (!next) return textError(502, failed && !lastStatus ? 'fetch failed' : 'no redirect from ' + cur.hostname + cur.pathname.slice(0, 40) + ' (upstream ' + lastStatus + ')');
+    if (!resolveHopOk(next)) return textError(502, 'redirect left allowed hosts (' + next.hostname + ')');
+    cur = next;
   }
   const last = resolveExtract(cur);
-  return last ? json(last, 200, { 'Cache-Control': 'public, max-age=86400' }) : textError(502, 'too many redirects, ended at ' + cur.hostname + cur.pathname.slice(0, 40));
+  return last ? json(last, 200, cache) : textError(502, 'too many redirects, ended at ' + cur.hostname + cur.pathname.slice(0, 40));
 }
 
 // GET /admin/img?u=<https url>: admin-only image fetch-through. The admin page
