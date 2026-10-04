@@ -3688,6 +3688,84 @@ async function handleAdminRestore(env, request, slug) {
   return json({ ok: true });
 }
 
+// GET /resolve-link?u=<short link>: public, narrow redirect resolver for the editor's
+// embed pickers. Browsers can't read these redirects (CORS), so the worker follows them.
+// Outbound-request endpoint, so: exact host allowlist (TikTok short links, Instagram
+// /share/ links), https only, redirects followed manually (max 4) with every hop
+// re-validated, 6 s timeout, body never read, IP rate limit. Returns only
+// {platform, id}; nothing from the upstream response is passed through.
+const RESOLVE_RATE_LIMIT_MAX = 20;
+const RESOLVE_RATE_LIMIT_WINDOW_S = 60;
+const RESOLVE_TIKTOK_HOSTS = new Set(['vm.tiktok.com', 'vt.tiktok.com', 'www.tiktok.com', 'tiktok.com', 'm.tiktok.com', 'www.tiktokv.com', 'tiktokv.com']);
+const RESOLVE_IG_HOSTS = new Set(['instagram.com', 'www.instagram.com']);
+
+function resolveHopOk(u) {
+  if (u.protocol !== 'https:' || u.username || u.password || (u.port && u.port !== '443')) return false;
+  const h = u.hostname.toLowerCase();
+  return RESOLVE_TIKTOK_HOSTS.has(h) || RESOLVE_IG_HOSTS.has(h);
+}
+function resolveExtract(u) {
+  const h = u.hostname.toLowerCase();
+  const parts = u.pathname.split('/').filter(Boolean);
+  if (RESOLVE_TIKTOK_HOSTS.has(h)) {
+    for (let i = 0; i < parts.length - 1; i++) {
+      if ((parts[i] === 'video' || parts[i] === 'photo') && /^[0-9]+$/.test(parts[i + 1])) return { platform: 'tiktok', id: parts[i + 1] };
+      if (parts[i] === 'v') { const m = /^([0-9]+)(?:\.html)?$/.exec(parts[i + 1]); if (m) return { platform: 'tiktok', id: m[1] }; }
+    }
+    return null;
+  }
+  if (parts[0] === 'share') return null; // still an unresolved share link
+  for (let i = 0; i < parts.length - 1; i++) {
+    if (['p', 'reel', 'reels', 'tv'].includes(parts[i]) && /^[A-Za-z0-9_-]+$/.test(parts[i + 1])) {
+      return { platform: 'instagram', id: parts[i + 1] };
+    }
+  }
+  return null;
+}
+function resolveStartOk(u) {
+  const h = u.hostname.toLowerCase();
+  const first = u.pathname.split('/').filter(Boolean)[0];
+  if (h === 'vm.tiktok.com' || h === 'vt.tiktok.com') return true;
+  if (h === 'tiktok.com' || h === 'www.tiktok.com') return first === 't';
+  if (RESOLVE_IG_HOSTS.has(h)) return first === 'share';
+  return false;
+}
+async function handleResolveLink(env, request, url) {
+  const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
+  const key = 'ratelimit:resolve:' + ip;
+  const raw = await env.REPORTS.get(key);
+  const count = raw ? parseInt(raw, 10) || 0 : 0;
+  if (count >= RESOLVE_RATE_LIMIT_MAX) return textError(429, 'too many requests, slow down');
+  await env.REPORTS.put(key, String(count + 1), { expirationTtl: RESOLVE_RATE_LIMIT_WINDOW_S });
+
+  let cur;
+  try { cur = new URL(url.searchParams.get('u') || ''); } catch (e) { return textError(400, 'invalid url'); }
+  if (cur.href.length > 512 || !resolveHopOk(cur) || !resolveStartOk(cur)) return textError(400, 'url not supported');
+  for (let hop = 0; hop < 5; hop++) {
+    const hit = resolveExtract(cur);
+    if (hit) return json(hit, 200, { 'Cache-Control': 'public, max-age=86400' });
+    let res;
+    try {
+      res = await fetch(cur.href, {
+        method: 'GET',
+        redirect: 'manual',
+        headers: {
+          'Accept': 'text/html',
+          'User-Agent': 'Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36'
+        },
+        signal: AbortSignal.timeout(6000)
+      });
+    } catch (e) { return textError(502, 'fetch failed'); }
+    try { await res.body?.cancel(); } catch (e) {}
+    const loc = res.headers.get('Location');
+    if (!(res.status >= 300 && res.status < 400 && loc)) return textError(502, 'link did not redirect (upstream ' + res.status + ')');
+    try { cur = new URL(loc, cur); } catch (e) { return textError(502, 'bad redirect'); }
+    if (!resolveHopOk(cur)) return textError(502, 'redirect left allowed hosts');
+  }
+  const last = resolveExtract(cur);
+  return last ? json(last, 200, { 'Cache-Control': 'public, max-age=86400' }) : textError(502, 'could not resolve link');
+}
+
 // GET /admin/img?u=<https url>: admin-only image fetch-through. The admin page
 // uses this so external images in a snapshot preview load from the worker, not
 // from the admin's browser (hosts see Cloudflare, not the admin's IP). It is an
@@ -8090,6 +8168,9 @@ export default {
     try {
       if (method === 'GET' && pathname.startsWith('/check-slug/')) {
         return handleCheckSlug(env, decodeURIComponent(pathname.slice('/check-slug/'.length)), request);
+      }
+      if (method === 'GET' && pathname === '/resolve-link') {
+        return handleResolveLink(env, request, url);
       }
       if (method === 'GET' && pathname.startsWith('/meta/')) {
         return handleMeta(env, decodeURIComponent(pathname.slice('/meta/'.length)));
