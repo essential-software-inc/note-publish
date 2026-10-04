@@ -2298,7 +2298,7 @@ async function handleServe(env, slug) {
     "script-src 'unsafe-inline'",
     "style-src 'unsafe-inline'",
     "img-src * data: blob:",
-    "frame-src https://www.youtube.com https://www.instagram.com https://open.spotify.com",
+    "frame-src https://www.youtube.com https://www.instagram.com https://open.spotify.com https://platform.twitter.com https://www.tiktok.com",
     "connect-src 'self'",
     "object-src 'none'",
     "base-uri 'none'"
