@@ -2707,24 +2707,20 @@ function isAllowedAdImageHost(host) {
 const AD_MAX_IMAGES = 2;
 // Video/social embed src is generated entirely by our own client code
 // (youTubeEmbedUrl/streamableEmbedUrl/parseSocialUrl + _socialEmbedSpec), which
-// only ever produces these exact hosts — so an exact match is intentional,
+// only ever produces these exact hosts (the same five for Write and Share ads) — so an exact match is intentional,
 // not a suffix match like the image host list. Anything else means the
 // block's src was set some other way (e.g. a direct API call bypassing the
 // editor UI's parsers), which is exactly what this exists to catch: an ad
 // is auto-shown to every user who opens Write or Share, not opt-in like a link.
 const AD_ALLOWED_EMBED_HOSTS = new Set([
-  'www.youtube.com',    // youTubeEmbedUrl()
-  'www.instagram.com',  // _socialEmbedSpec('instagram')
-  'open.spotify.com'    // _socialEmbedSpec('spotify')
-]);
-// Share pages may additionally carry X and Streamable embeds (only Share's own add
-// buttons can produce them). Kept separate so a Write page can't use them.
-const AD_SHARE_EMBED_HOSTS = new Set([
+  'www.youtube.com',      // youTubeEmbedUrl()
+  'www.instagram.com',    // _socialEmbedSpec('instagram')
+  'open.spotify.com',     // _socialEmbedSpec('spotify')
   'platform.twitter.com', // _socialEmbedSpec('x')
   'streamable.com'        // streamableEmbedUrl()
 ]);
-function isAllowedAdEmbedHost(host, kind) {
-  return AD_ALLOWED_EMBED_HOSTS.has(host) || (kind === 'share' && AD_SHARE_EMBED_HOSTS.has(host));
+function isAllowedAdEmbedHost(host) {
+  return AD_ALLOWED_EMBED_HOSTS.has(host);
 }
 // An ad is either a 'write' page or a 'share' page. The client stamps Share pages
 // with <meta name="nb-kind" content="share"> when it builds the published HTML
@@ -2859,8 +2855,8 @@ async function validateAdEligibility(html) {
   // Rule: any video/social embed must be one our own editor generates —
   // see AD_ALLOWED_EMBED_HOSTS above for why this is exact-match and why
   // it exists at all (this is the only server-side check on embed src;
-  // nothing else in this function looks at video/social blocks). Share pages
-  // also get X and Streamable (AD_SHARE_EMBED_HOSTS). Also caps each platform at
+  // nothing else in this function looks at video/social blocks). Write and Share
+  // ads get the same five platforms. Also caps each platform at
   // one embed — every allowed host maps to exactly one platform, so counting
   // by host IS counting by platform.
   const embedHostCounts = new Map();
@@ -2870,7 +2866,7 @@ async function validateAdEligibility(html) {
     try { u = new URL(src); } catch (e) { return { ok: false, reason: 'invalid-embed-src' }; }
     if (u.protocol !== 'https:') return { ok: false, reason: 'invalid-embed-src' };
     const host = u.hostname.toLowerCase();
-    if (!isAllowedAdEmbedHost(host, kind)) return { ok: false, reason: 'non-allowed-embed' };
+    if (!isAllowedAdEmbedHost(host)) return { ok: false, reason: 'non-allowed-embed' };
     embedHostCounts.set(host, (embedHostCounts.get(host) || 0) + 1);
   }
   if (Array.from(embedHostCounts.values()).some(c => c > 1)) {
