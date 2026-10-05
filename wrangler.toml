@@ -2,6 +2,11 @@ name = "note-publish"
 main = "src/index.js"
 compatibility_date = "2026-09-01"
 
+# "1" makes GET /ads/next require an attested ad key. Set to "0" or remove to turn off.
+# PLAY_INTEGRITY_SA is a SECRET: keep it in the dashboard, never in this file.
+[vars]
+PLAY_INTEGRITY_ENFORCE = "1"
+
 [[kv_namespaces]]
 binding = "ACCOUNTS"
 id = "c1191cb259ad4fbbb10750965994008a"
