@@ -423,6 +423,7 @@ select.field::-ms-expand{display:none}
 .sheet-top{flex:none;margin:0 0 6px;padding:0 0 12px;border-bottom:1px solid var(--line)}
 .sheet-top .ptitle{margin:0 0 4px}
 .sheet-top .search{margin:10px 0 0}
+.sheet-top .filters{margin:8px 0 0;padding:0 0 2px}
 .rsub,.rcnt{font-size:13px;color:var(--muted)}
 .rsub:empty,.rcnt:empty,.rchk:empty{display:none}
 .rsub{margin:0 0 2px}
@@ -573,6 +574,7 @@ body[data-auth=out] #msg{bottom:calc(24px + env(safe-area-inset-bottom,0px))}
       <div class="filters" id="ovfil">
         <span class="sel"><button type="button" class="pick" id="ovsort" aria-label="Sort" aria-haspopup="listbox" value="new">Newest first</button><span class="ico" data-i="chev"></span></span>
         <span class="sel"><button type="button" class="pick" id="ovfilter" aria-label="Show" aria-haspopup="listbox" value="">All users</button><span class="ico" data-i="chev"></span></span>
+        <span class="sel" hidden><button type="button" class="pick" id="ovnsort" aria-label="Sort" aria-haspopup="listbox" value="new">Newest first</button><span class="ico" data-i="chev"></span></span>
       </div>
       <div class="sec-t" id="ovcount"></div>
       <div id="ovlist"></div>
@@ -589,7 +591,7 @@ body[data-auth=out] #msg{bottom:calc(24px + env(safe-area-inset-bottom,0px))}
       <div class="search"><div class="field-wrap"><span class="ico" data-i="search"></span><input class="field" id="fq" placeholder="Filter by slug or author ID" autocomplete="off" autocapitalize="off" spellcheck="false"></div></div>
       <div class="filters">
         <span class="sel"><button type="button" class="pick" id="fstatus" aria-label="Status" aria-haspopup="listbox" value="">Any status</button><span class="ico" data-i="chev"></span></span>
-        <span class="sel"><button type="button" class="pick" id="fsort" aria-label="Sort" aria-haspopup="listbox" value="new">Newest first</button><span class="ico" data-i="chev"></span></span>
+        <span class="sel"><button type="button" class="pick" id="fsort" aria-label="Sort" aria-haspopup="listbox" value="new">Default order</button><span class="ico" data-i="chev"></span></span>
         <label class="pillck"><input type="checkbox" id="fgroup" checked><span>Group by slug</span></label>
         <label class="pillck"><input type="checkbox" id="fdis"><span>Dismissed</span></label>
       </div>
@@ -612,6 +614,7 @@ body[data-auth=out] #msg{bottom:calc(24px + env(safe-area-inset-bottom,0px))}
       <div class="filters">
         <span class="sel"><button type="button" class="pick" id="adst" aria-label="Ad status" aria-haspopup="listbox" value="">All ads</button><span class="ico" data-i="chev"></span></span>
         <span class="sel"><button type="button" class="pick" id="adkind" aria-label="Ad type" aria-haspopup="listbox" value="">Write &amp; Share</button><span class="ico" data-i="chev"></span></span>
+        <span class="sel"><button type="button" class="pick" id="adsort" aria-label="Sort" aria-haspopup="listbox" value="new">Newest first</button><span class="ico" data-i="chev"></span></span>
       </div>
       <div id="adlist"></div>
       <button class="btn block more" id="admore" hidden>Load more</button>
@@ -723,6 +726,8 @@ U('omar.haddad@example.com','Omar Haddad',{joined:300,seen:1100,x:{pendingDeleti
 U('priya.nair@example.com','Priya Nair',{joined:60,subs:15,credit:400});
 U('tom.becker@example.com','Tom Becker',{joined:450,seen:400,x:{suspended:true}});
 U('alex.rivera@example.com','Alex Rivera',{joined:15,seen:6});
+var RC={'maya.chen@example.com':'K7M2QX4P','lena.fischer@example.com':'H3TR9WNB','dev.patel@example.com':'P5CZ8D2F','priya.nair@example.com':'X4YB6JGA'};Object.keys(RC).forEach(function(e){users[e].referralCode=RC[e]});
+users['sam.ortiz@example.com'].referredBy='maya.chen@example.com';users['alex.rivera@example.com'].referredBy='lena.fischer@example.com';users['priya.nair@example.com'].referredBy='dev.patel@example.com';users['omar.haddad@example.com'].referredBy='lena.fischer@example.com';users['omar.haddad@example.com'].refVoid={at:J(N-45*D,'pd'),reason:'account'};
 var t=users['tom.becker@example.com'];var tk='Your note \u201cLyrics collection\u201d was taken down. '+aRs('copyright')+' Its address can\u2019t be reused. '+AR,sp='Your account was suspended. '+aRs('copyright');t.strikes.push({at:E_TD,kind:'takedown',message:tk,dismissedAt:null},{at:E_SP,kind:'suspended',message:sp,dismissedAt:null});t.alerts.push({at:E_SP,kind:'suspended',strike:true,dismissedAt:null,message:sp},{at:E_TD,kind:'takedown',strike:true,dismissedAt:null,message:tk});
 P('sunday-sourdough','Sunday sourdough notes','maya.chen@example.com',{likes:84,story:1,age:40,desc:'Hydration ratios and a starter diary',tags:['baking','food']});
 P('trail-journal','Trail journal: Cascades','maya.chen@example.com',{likes:31,age:25,tags:['hiking']});
@@ -771,7 +776,10 @@ function pstatus(s){return pages[s]?pages[s].status:'missing'}
 var SLUG_RE=/^[a-z0-9-]{3,48}$/,AID_RE=/^a_[a-f0-9]{32}$/,RKEY_RE=/^rpt:(\d{13}):([a-z0-9-]{3,48}):[a-f0-9]{8}$/;
 function ok(j,s){return new Response(JSON.stringify(j||{}),{status:s||200,headers:{'Content-Type':'application/json'}})}
 function err(s,m){return ok({error:m},s)}
-function strike(email,kind,msg,at){var u=users[email];if(!u)return;var o={at:at||Date.now(),kind:kind,message:msg,dismissedAt:null};u.strikes.push(o);u.alerts.unshift({at:o.at,kind:kind,strike:true,dismissedAt:null,message:msg})}
+var sidN=0;function sid(){sidN++;var h=('000000000000'+sidN.toString(16)).slice(-12);return'5a1b0c2d-0000-4000-8000-'+h}
+function strike(email,kind,msg,at){var u=users[email];if(!u)return;var o={id:sid(),at:at||Date.now(),kind:kind,message:msg,dismissedAt:null,excusedAt:null};u.strikes.push(o);u.alerts.unshift({at:o.at,kind:kind,strike:true,dismissedAt:null,message:msg})}
+function rview(x){var v=x.refVoid;return{email:x.email,authorId:x.authorId,at:x.createdAt+D,voidedAt:v?v.at:null,voidReason:v?v.reason:null,counts:!v&&Object.keys(pages).some(function(s){return pages[s].owner===x.email&&pages[s].status==='live'})}}
+function refInfo(u){var kids=Object.keys(users).map(function(e){return users[e]}).filter(function(x){return x.referredBy===u.email}),pb=u.referredBy&&users[u.referredBy]?users[u.referredBy]:null,bv=u.refVoid;return{code:u.referralCode||null,invited:kids.length,qualified:kids.filter(function(x){return rview(x).counts}).length,referredBy:pb?{email:pb.email,authorId:pb.authorId,at:u.createdAt+D,voidedAt:bv?bv.at:null,voidReason:bv?bv.reason:null}:null,referred:kids.map(rview)}}
 function ownerOf(slug){var p=pages[slug];return p&&p.owner&&users[p.owner]?users[p.owner]:null}
 function snap(p,src,at){p.snaps.unshift({ts:at,source:src,size:p.sizeBytes})}
 function art(seed,kind){var h=hash(seed),a=h%360,b=(a+50)%360,card=kind==='card',w=card?480:320,hh=card?300:320;
@@ -794,7 +802,7 @@ function owner(slug){
   var u=users[p.owner],mine=Object.keys(pages).filter(function(s){return pages[s].owner===u.email}),rep=reports.filter(function(r){return pages[r.slug]&&pages[r.slug].owner===u.email});
   var by={};rep.forEach(function(r){var k=r.isCsam?'csam':r.reason;by[k]=by[k]||{total:0,open:0};by[k].total++;if(!r.dismissedAt)by[k].open++});
   var open=rep.filter(function(r){return!r.dismissedAt}).length,pgs={};rep.forEach(function(r){pgs[r.slug]=1});
-  return{email:u.email,authorId:u.authorId,displayName:u.displayName,suspended:!!u.suspended,pendingDeletionAt:u.pendingDeletionAt||null,hasProfileImage:u.hasProfileImage,subscribers:u.subscribers,likes:mine.reduce(function(a,s){return a+pages[s].likes},0),strikeCount:u.strikes.length,strikes:u.strikes.slice().sort(function(a,c){return a.at-c.at}),alertTotal:u.alerts.length,alerts:u.alerts.slice().sort(function(a,c){return c.at-a.at}).slice(0,300).map(function(x){return{kind:x.kind,message:x.message,at:x.at,dismissedAt:x.dismissedAt||null,strike:!!x.strike}}),createdAt:u.createdAt,lastSignInAt:u.lastSignInAt,ads:Object.keys(ads).filter(function(s){return ads[s].ownerEmail===u.email}).length,creditBalance:u.credit,backup:u.backup,ledger:u.ledger.slice().sort(function(a,c){return c.at-a.at}).slice(0,20),reportStats:{total:rep.length,open:open,pages:mine.filter(function(s){return pages[s].status==='live'}).length,byReason:by},pages:mine.filter(function(s){return pages[s].status==='live'}).map(function(s){var q=pages[s];return{slug:s,title:q.title,updatedAt:q.updatedAt,likes:q.likes,showInStories:q.showInStories,reports:reports.filter(function(r){return r.slug===s&&!r.dismissedAt}).length,byReason:rstats(reports.filter(function(r){return r.slug===s&&!r.dismissedAt})).byReason}})}
+  return{referral:refInfo(u),email:u.email,authorId:u.authorId,displayName:u.displayName,suspended:!!u.suspended,pendingDeletionAt:u.pendingDeletionAt||null,hasProfileImage:u.hasProfileImage,subscribers:u.subscribers,adTier:(u.subscribers>=400?4:u.subscribers>=100?3:u.subscribers>=25?2:u.subscribers>=5?1:0),likes:mine.reduce(function(a,s){return a+pages[s].likes},0),strikeCount:u.strikes.filter(function(x){return !x.excusedAt}).length,strikes:u.strikes.slice().sort(function(a,c){return a.at-c.at}).map(function(x){if(!x.id)x.id=sid();return{id:x.id,kind:x.kind,message:x.message,at:x.at,dismissedAt:x.dismissedAt||null,excusedAt:x.excusedAt||null,counting:!x.excusedAt&&x.at>Date.now()-60*864e5}}),alertTotal:u.alerts.length,alerts:u.alerts.slice().sort(function(a,c){return c.at-a.at}).slice(0,300).map(function(x){return{kind:x.kind,message:x.message,at:x.at,dismissedAt:x.dismissedAt||null,strike:!!x.strike}}),createdAt:u.createdAt,lastSignInAt:u.lastSignInAt,ads:Object.keys(ads).filter(function(s){return ads[s].ownerEmail===u.email}).length,creditBalance:u.credit,backup:u.backup,ledger:u.ledger.slice().sort(function(a,c){return c.at-a.at}).slice(0,20),reportStats:{total:rep.length,open:open,pages:mine.filter(function(s){return pages[s].status==='live'}).length,byReason:by},pages:mine.filter(function(s){return pages[s].status==='live'}).map(function(s){var q=pages[s];return{slug:s,title:q.title,updatedAt:q.updatedAt,likes:q.likes,showInStories:q.showInStories,reports:reports.filter(function(r){return r.slug===s&&!r.dismissedAt}).length,byReason:rstats(reports.filter(function(r){return r.slug===s&&!r.dismissedAt})).byReason}})}
 }
 function stats(){
   var us=Object.keys(users).map(function(e){return users[e]}),live=Object.keys(pages).filter(function(s){return pages[s].status==='live'}),av=Object.keys(ads).map(function(s){return ads[s]});
@@ -815,6 +823,11 @@ function trends(q){
   var rt={};reports.forEach(function(x){var t=rt[x.reason]||(rt[x.reason]={reason:x.reason,total:0,open:0});t.total++;if(!x.dismissedAt)t.open++});
   return{epoch:ep,activeSince:ep,before:before,series:out,reportsByReason:rr,reportsIndexed:true,reportTotals:Object.keys(rt).map(function(k){return rt[k]})}
 }
+var MCS={most_subs:['subs',-1],least_subs:['subs',1],most_posts:['notes',-1],least_posts:['notes',1],most_likes:['likes',-1],least_likes:['likes',1]};
+function mcs(so){return so&&MCS.hasOwnProperty(so)?MCS[so]:null}
+function mcnt(email,k){if(!email)return 0;var u=users[email],own=Object.keys(pages).filter(function(s){return pages[s].owner===email&&pages[s].status==='live'});return k==='subs'?(u?u.subscribers:0):k==='likes'?own.reduce(function(a,s){return a+pages[s].likes},0):own.length}
+// Count for a row that is a note: its own likes, or its owner's subscribers / notes.
+function scnt(slug,owner,k){return k==='likes'?((pages[slug]||{}).likes||0):mcnt(owner,k)}
 function aidSlugs(email){var o={};Object.keys(pages).forEach(function(k){if(pages[k].owner===email&&pages[k].status==='live')o[k]=1});reports.forEach(function(r){var g=pages[r.slug];if(g&&g.owner===email)o[r.slug]=1});return Object.keys(o).sort()}
 function body(o){try{return JSON.parse(o.body||'{}')}catch(e){return{}}}
 function route(path,o){
@@ -825,8 +838,10 @@ function route(path,o){
     rpB=rpIn.filter(function(x){if(!rpQ)return true;if(/^a_[a-f0-9]{32}$/.test(rpQ)){var g=pages[x.slug],w=g&&users[g.owner];return!!w&&w.authorId===rpQ&&aidSlugs(w.email).indexOf(x.slug)>=0}var z=rpQ.replace(/[^a-z0-9-]/g,'');return!z||x.slug.indexOf(z)>=0}),
     rpL=rpB.filter(function(x){return!rpR||x.reason===rpR}),rpC={};
     rpIn.forEach(function(x){rpC[x.slug]=(rpC[x.slug]||0)+1});
-    rpL.sort(function(a,c){return rpS==='old'?a.reportedAt-c.reportedAt:rpS==='most'?(rpC[c.slug]-rpC[a.slug])||(a.slug<c.slug?-1:a.slug>c.slug?1:0)||(c.reportedAt-a.reportedAt):c.reportedAt-a.reportedAt});
-    var rpO={reports:rpL.map(function(x){var pg=pages[x.slug];return Object.assign({},x,{status:pstatus(x.slug),ncmec:x.isCsam&&pg&&pg.ncmec.length?pg.ncmec[pg.ncmec.length-1]:null})}),nextCursor:null,indexed:true};
+    var rpM=mcs(rpS),rpCsl={};rpIn.forEach(function(x){if(x.isCsam)rpCsl[x.slug]=1});
+    var rpK=function(x){var g=pages[x.slug];return rpM[0]==='likes'?(g?g.likes:0):mcnt(g?g.owner:null,rpM[0])};
+    rpL.sort(function(a,c){if(rpM)return(rpCsl[c.slug]?1:0)-(rpCsl[a.slug]?1:0)||(rpK(a)-rpK(c))*rpM[1]||(a.slug<c.slug?-1:a.slug>c.slug?1:0)||(c.reportedAt-a.reportedAt);return rpS==='old'?a.reportedAt-c.reportedAt:rpS==='most'?(rpC[c.slug]-rpC[a.slug])||(a.slug<c.slug?-1:a.slug>c.slug?1:0)||(c.reportedAt-a.reportedAt):c.reportedAt-a.reportedAt});
+    var rpO={reports:rpL.map(function(x){var pg=pages[x.slug];return Object.assign({},x,{status:pstatus(x.slug),sortCount:rpM?rpK(x):undefined,ncmec:x.isCsam&&pg&&pg.ncmec.length?pg.ncmec[pg.ncmec.length-1]:null})}),nextCursor:null,indexed:true};
     if(rpF){var rpBy={},rpT=0,rpP={},rpCs={};rpB.forEach(function(x){rpBy[x.reason]=(rpBy[x.reason]||0)+1;rpT++});rpIn.forEach(function(x){rpP[x.slug]=1;if(x.isCsam)rpCs[x.slug]=1});rpO.agg={total:rpT,byReason:rpBy,pages:Object.keys(rpP).length,csam:Object.keys(rpCs).length}}
     return ok(rpO)}
   if(p==='/admin/dismiss'||p==='/admin/undismiss'){var dis=p==='/admin/dismiss';if(dis&&o.body&&typeof o.body==='string'){try{JSON.parse(o.body)}catch(e){return err(400,'invalid JSON body')}}var dk=typeof b.key==='string'?b.key:'';if(!RKEY_RE.test(dk))return err(400,'invalid report key');var r=reports.filter(function(x){return x.key===dk})[0];if(!r)return dis?ok({ok:true}):err(404,'report not found');if(dis){if(r.isCsam)r.dismissedAt=Date.now();else reports=reports.filter(function(x){return x!==r})}else{if(!r.dismissedAt)return ok({ok:true});r.dismissedAt=null}A(dis?'dismiss':'undismiss',r.slug,'');return ok({ok:true})}
@@ -842,6 +857,7 @@ function route(path,o){
   if(p==='/admin/lookup'){var lsl=(q.get('slug')||'').toLowerCase();return SLUG_RE.test(lsl)?ok(lookup(lsl)):err(400,'invalid slug')}
   if(p==='/admin/owner'){var od=owner((q.get('slug')||'').toLowerCase());return od.error?err(od.status||404,od.error):ok(od)}
   if(p==='/admin/story'){var ssl=typeof b.slug==='string'?b.slug.toLowerCase():'';if(!SLUG_RE.test(ssl))return err(400,'invalid slug');var pg6=pages[ssl];if(!pg6||pg6.status!=='live')return err(404,'not live');if(b.action==='remove'&&!reasonOf(b))return err(400,'reason required');if(b.action!=='remove'&&b.action!=='allow')return err(400,'invalid action');if(b.action==='remove'){pg6.showInStories=false;pg6.storyBlocked=true;pg6.story=null;A('story_remove',b.slug,reasonOf(b));if(pg6.owner)strike(pg6.owner,'story','Your note '+aNm(pg6)+' was removed from stories. '+aRs(reasonOf(b))+' Your note is still published. '+AR)}else{pg6.storyBlocked=false;A('story_allow',b.slug,reasonOf(b));if(pg6.owner)note(pg6.owner,'story','Your note '+aNm(pg6)+' can be shown in stories again.')}return ok({ok:true})}
+  if(p==='/admin/strike'){var xsl=typeof b.slug==='string'?b.slug.toLowerCase():'';if(!SLUG_RE.test(xsl))return err(400,'invalid slug');var xu=ownerOf(xsl);if(!xu)return err(404,'no account for this slug');var xid=typeof b.id==='string'?b.id:'';if(!/^[0-9a-f-]{36}$/.test(xid))return err(400,'invalid alert id');var xa=b.action;if(xa!=='excuse'&&xa!=='restore')return err(400,'invalid action');var xr=reasonOf(b);if(xa==='excuse'&&!xr)return err(400,'reason required');var xs=xu.strikes.filter(function(t){return t.id===xid})[0];if(!xs)return err(404,'strike not found for this account');if(xa==='excuse'&&xs.excusedAt)return err(409,'already excused');if(xa==='restore'&&!xs.excusedAt)return err(409,'not excused');xs.excusedAt=xa==='excuse'?Date.now():null;A('strike_'+xa,b.slug,(xr||'')+' ['+xid.slice(0,8)+']');note(xu.email,'excused',xa==='excuse'?'A strike on your account was excused and no longer counts against your ad access. '+aRs(xr):'A strike that had been excused was reinstated, so it counts toward your ad access again until it is 60 days old.');return ok({ok:true})}
   if(p==='/admin/owner/action'){var osl=typeof b.slug==='string'?b.slug.toLowerCase():'';if(!SLUG_RE.test(osl))return err(400,'invalid slug');var us=ownerOf(osl);if(!us)return err(404,'no account for this slug');var a=b.action;if((a==='suspend'||a==='clear-name'||a==='clear-picture')&&!reasonOf(b))return err(400,'reason required');
     var wasAd=!!us.adminDeleted,rs=reasonOf(b);
     if(a==='suspend'){us.suspended=true;strike(us.email,'suspended','Your account was suspended. '+aRs(rs));A('owner_suspend',b.slug,rs)}
@@ -850,9 +866,12 @@ function route(path,o){
     else if(a==='cancel-delete'){us.pendingDeletionAt=null;if(us.adminDeleted){us.adminDeleted=false;us.suspended=false;note(us.email,'unsuspended','Your account deletion was cancelled and your account restored. '+AR)}A('owner_cancel-delete',b.slug,rs)}
     else if(a==='clear-name'){us.displayName='';strike(us.email,'profile_name','Your display name was removed. '+aRs(rs)+' You can set a new one. '+AR);A('owner_clear-name',b.slug,rs)}
     else if(a==='clear-picture'){us.hasProfileImage=false;strike(us.email,'profile_picture','Your profile picture was removed. '+aRs(rs)+' You can upload a new one. '+AR);A('owner_clear-picture',b.slug,rs)}
-    else return err(400,'invalid action');return ok({ok:true,suspended:!!us.suspended,pendingDeletionAt:us.pendingDeletionAt||null})}
-  if(p==='/admin/ads'){var st=q.get('status'),kd=q.get('kind'),sq=(q.get('q')||'').toLowerCase(),L2=Object.keys(ads).map(function(s){return ads[s]}).filter(function(x){return(!st||x.status===st)&&(!kd||x.kind===kd)&&(!sq||(/^a_[a-f0-9]{32}$/.test(sq)?((users[x.ownerEmail]||{}).authorId===sq):x.slug.indexOf(sq)>-1))});return ok({ads:L2.map(function(x){return{slug:x.slug,ownerEmail:x.ownerEmail,viewsTotal:x.viewsTotal,viewsUsed:x.viewsUsed,status:x.status,createdAt:x.createdAt,uniqueViewers:x.uniqueViewers,kind:x.kind}}),total:L2.length,next:null})}
-  if(p==='/admin/ad'){var asl=typeof b.slug==='string'?b.slug.toLowerCase():'';if(!SLUG_RE.test(asl))return err(400,'invalid slug');var ad=ads[asl];if(!ad)return err(404,'ad not found');var ba=b.action,as=ad.status;if((ba==='pause'||ba==='takedown')&&!reasonOf(b))return err(400,'reason required');if(ba==='pause'&&as!=='active')return err(409,'ad is not active');if(ba==='resume'&&as!=='paused')return err(409,'ad is not paused');if(ba==='takedown'&&as!=='active'&&as!=='paused')return err(409,'ad is not running');if(ba==='refund'&&(as==='active'||as==='paused'))return err(409,'take the ad down first');if(ba!=='pause'&&ba!=='resume'&&ba!=='takedown'&&ba!=='refund')return err(400,'invalid action');var left=ad.viewsTotal-ad.viewsUsed,res={};
+    else return err(400,'invalid action');if(a==='suspend'||a==='delete'){if(us.referredBy&&!us.refVoid)us.refVoid={at:Date.now(),reason:'account'}}else if((a==='unsuspend'||a==='cancel-delete')&&us.refVoid&&us.refVoid.reason==='account'&&!(us.suspended||us.pendingDeletionAt))us.refVoid=null;return ok({ok:true,suspended:!!us.suspended,pendingDeletionAt:us.pendingDeletionAt||null})}
+  if(p==='/admin/referral'){var fsl=typeof b.slug==='string'?b.slug.toLowerCase():'';if(!SLUG_RE.test(fsl))return err(400,'invalid slug');var fo=ownerOf(fsl);if(!fo)return err(404,'no account for this slug');var fa=b.action;if(fa!=='void'&&fa!=='restore')return err(400,'invalid action');var fr=reasonOf(b);if(fa==='void'&&!fr)return err(400,'reason required');var tg=fo;if(b.aid){tg=Object.keys(users).map(function(e){return users[e]}).filter(function(x){return x.authorId===String(b.aid).toLowerCase()})[0];if(!tg)return err(404,'no account for that author ID')}var rb=tg.referredBy&&users[tg.referredBy];if(!rb||(b.aid&&rb.email!==fo.email))return err(404,'referral not found');
+    if(fa==='void'){if(tg.refVoid&&tg.refVoid.reason==='admin')return err(409,'already voided');tg.refVoid={at:Date.now(),reason:'admin'}}else{if(!tg.refVoid)return err(409,'not voided');if(tg.refVoid.reason!=='admin')return err(409,'this referral is paused because the account is suspended or being deleted; it returns when that ends');tg.refVoid=null}
+    A('referral_'+fa,b.slug,fr+(b.aid?' ['+String(b.aid).slice(0,10)+']':''));note(rb.email,'referral',fa==='void'?'A friend\u2019s invite no longer counts toward your ad access. '+aRs(fr):'A friend\u2019s invite counts toward your ad access again.');return ok({ok:true})}
+  if(p==='/admin/ads'){var st=q.get('status'),kd=q.get('kind'),sq=(q.get('q')||'').toLowerCase(),L2=Object.keys(ads).map(function(s){return ads[s]}).filter(function(x){return(!st||x.status===st)&&(!kd||x.kind===kd)&&(!sq||(/^a_[a-f0-9]{32}$/.test(sq)?((users[x.ownerEmail]||{}).authorId===sq):x.slug.indexOf(sq)>-1))});var acs=mcs(q.get('sort'));if(acs)L2.sort(function(a,b2){return(scnt(a.slug,a.ownerEmail,acs[0])-scnt(b2.slug,b2.ownerEmail,acs[0]))*acs[1]||b2.createdAt-a.createdAt});return ok({ads:L2.map(function(x){return{ownerSubs:mcnt(x.ownerEmail,'subs'),ownerNotes:mcnt(x.ownerEmail,'notes'),likes:(pages[x.slug]||{}).likes||0,slug:x.slug,ownerEmail:x.ownerEmail,viewsTotal:x.viewsTotal,viewsUsed:x.viewsUsed,status:x.status,createdAt:x.createdAt,uniqueViewers:x.uniqueViewers,kind:x.kind}}),total:L2.length,next:null})}
+  if(p==='/admin/ad'){var asl=typeof b.slug==='string'?b.slug.toLowerCase():'';if(!SLUG_RE.test(asl))return err(400,'invalid slug');var ad=ads[asl];if(!ad)return err(404,'ad not found');var ba=b.action,as=ad.status;if((ba==='pause'||ba==='takedown')&&!reasonOf(b))return err(400,'reason required');if(ba==='pause'&&as!=='active')return err(409,'ad is not active');if(ba==='resume'&&as!=='paused')return err(409,'ad is not paused');if(ba==='resume'&&users[ad.ownerEmail]&&(users[ad.ownerEmail].suspended||users[ad.ownerEmail].pendingDeletionAt))return err(409,'the owner account is suspended or being deleted');if(ba==='takedown'&&as!=='active'&&as!=='paused')return err(409,'ad is not running');if(ba==='refund'&&(as==='active'||as==='paused'))return err(409,'take the ad down first');if(ba!=='pause'&&ba!=='resume'&&ba!=='takedown'&&ba!=='refund')return err(400,'invalid action');var left=ad.viewsTotal-ad.viewsUsed,res={};
     if(b.action==='pause')ad.status='paused';else if(b.action==='resume')ad.status='active';
     else if(b.action==='takedown'){ad.status='unpublished';if(b.refund===true&&left>0&&!ad.refunded){res.refunded=left;ad.refunded=true}}
     else if(b.action==='refund'){if(!ad.refunded&&left>0){res.refunded=left;ad.refunded=true}}
@@ -922,10 +941,10 @@ function route(path,o){
       if(!b.message||cC.indexOf(b.cls)<0||isNaN(rAt))return err(400,'invalid audit entry');
       cR=cE.filter(function(e){return users[e].alerts.some(function(a){return a.kind==='notice'&&a.message===b.message&&a.cls===b.cls&&a.at>=rLo&&a.at<=rHi})})}
     if((b.preview&&b.list)||b.recipients){
-      var cl=cR.map(function(e){return users[e]}).sort(function(x,y){return y.createdAt-x.createdAt}),
+      var cl=cR.map(function(e){return users[e]}).sort(function(x,y){var s=mcs(b.sort);return s?(mcnt(x.email,s[0])-mcnt(y.email,s[0]))*s[1]||y.createdAt-x.createdAt:y.createdAt-x.createdAt}),
         cq=String(b.q||'').trim().toLowerCase().replace(/^@/,'').replace(/[^a-z0-9_]/g,'').slice(0,34),
         cf=cq?cl.filter(function(x){return x.authorId.indexOf(cq)>=0}):cl,
-        co=parseInt(b.cursor,10)||0,pg2=cf.slice(co,co+30),cres={users:pg2.map(function(x){return{email:x.email,name:x.displayName,authorId:x.authorId,createdAt:x.createdAt,notes:cLive(x).length,lastSeen:x.lastSeen,lastSignInAt:x.lastSignInAt,online:x.online,suspended:!!(x.suspended&&!x.pendingDeletionAt),deleting:!!x.pendingDeletionAt}}),count:cl.length,next:co+30<cf.length?String(co+30):null};
+        co=parseInt(b.cursor,10)||0,pg2=cf.slice(co,co+30),cres={users:pg2.map(function(x){return{email:x.email,name:x.displayName,authorId:x.authorId,createdAt:x.createdAt,notes:cLive(x).length,subs:x.subscribers,likes:mcnt(x.email,'likes'),lastSeen:x.lastSeen,lastSignInAt:x.lastSignInAt,online:x.online,suspended:!!(x.suspended&&!x.pendingDeletionAt),deleting:!!x.pendingDeletionAt}}),count:cl.length,next:co+30<cf.length?String(co+30):null};
       if(cq&&!co){cres.found=cf.length;if(/^a_[a-f0-9]{32}$/.test(cq))cres.check=cf.length?'in':(cE.some(function(e){return users[e].authorId===cq})?'out':'unknown')}
       return ok(cres)}
     if(b.preview)return ok({ok:true,count:cR.length,unknown:cU});
@@ -942,10 +961,10 @@ function route(path,o){
   if(p==='/admin/audit')return ok({entries:audit.slice().sort(function(a,c){return c.at-a.at}),nextCursor:null});
   if(p==='/admin/stats')return ok(stats());
   if(p==='/admin/users'||p==='/admin/notes'){var qq=(q.get('q')||'').toLowerCase(),isU=p==='/admin/users';
-    if(isU){var f=q.get('f'),so=q.get('sort'),L3=Object.keys(users).map(function(e){return users[e]}).filter(function(x){return(!qq||x.authorId.toLowerCase().indexOf(qq)===0)&&(f!=='online'||x.online)&&(f!=='active24'||N-x.lastSeen<D)});L3.sort(function(a,b2){return so==='old'?a.createdAt-b2.createdAt:so==='active'?b2.lastSeen-a.lastSeen:b2.createdAt-a.createdAt});
-      return ok({users:L3.map(function(x){return{email:x.email,name:x.displayName,authorId:x.authorId,createdAt:x.createdAt,notes:Object.keys(pages).filter(function(s){return pages[s].owner===x.email&&pages[s].status==='live'}).length,lastSeen:x.lastSeen,lastSignInAt:x.lastSignInAt,online:x.online,suspended:!!(x.suspended&&!x.pendingDeletionAt),deleting:!!x.pendingDeletionAt}}),next:null,total:L3.length})}
-    var L4=Object.keys(pages).map(function(s){return pages[s]}).filter(function(x){return x.status==='live'&&(!qq||(/^a_[a-f0-9]{32}$/.test(qq)?((users[x.owner]||{}).authorId===qq):x.slug.indexOf(qq.replace(/[^a-z0-9-]/g,''))===0))}).sort(function(a,b2){return b2.createdAt-a.createdAt});
-    return ok({notes:L4.map(function(x){return{slug:x.slug,title:x.title,createdAt:x.createdAt,story:x.showInStories}}),next:null,total:L4.length})}
+    if(isU){var f=q.get('f'),so=q.get('sort'),L3=Object.keys(users).map(function(e){return users[e]}).filter(function(x){return(!qq||x.authorId.toLowerCase().indexOf(qq)===0)&&(f!=='online'||x.online)&&(f!=='active24'||N-x.lastSeen<D)});var ucs=mcs(so);L3.sort(function(a,b2){return ucs?(mcnt(a.email,ucs[0])-mcnt(b2.email,ucs[0]))*ucs[1]||b2.createdAt-a.createdAt:so==='old'?a.createdAt-b2.createdAt:so==='active'?b2.lastSeen-a.lastSeen:b2.createdAt-a.createdAt});
+      return ok({users:L3.map(function(x){return{email:x.email,name:x.displayName,authorId:x.authorId,createdAt:x.createdAt,notes:Object.keys(pages).filter(function(s){return pages[s].owner===x.email&&pages[s].status==='live'}).length,subs:x.subscribers,likes:mcnt(x.email,'likes'),lastSeen:x.lastSeen,lastSignInAt:x.lastSignInAt,online:x.online,suspended:!!(x.suspended&&!x.pendingDeletionAt),deleting:!!x.pendingDeletionAt,referredBy:x.referredBy&&users[x.referredBy]?{email:x.referredBy,authorId:users[x.referredBy].authorId}:null,referralCode:x.referralCode||null}}),next:null,total:L3.length})}
+    var ncs=mcs(q.get('sort')),L4=Object.keys(pages).map(function(s){return pages[s]}).filter(function(x){return x.status==='live'&&(!qq||(/^a_[a-f0-9]{32}$/.test(qq)?((users[x.owner]||{}).authorId===qq):x.slug.indexOf(qq.replace(/[^a-z0-9-]/g,''))===0))}).sort(function(a,b2){return ncs?(scnt(a.slug,a.owner,ncs[0])-scnt(b2.slug,b2.owner,ncs[0]))*ncs[1]||b2.createdAt-a.createdAt:b2.createdAt-a.createdAt});
+    return ok({notes:L4.map(function(x){return{slug:x.slug,title:x.title,createdAt:x.createdAt,story:x.showInStories,likes:x.likes,authorSubs:mcnt(x.owner,'subs'),authorNotes:mcnt(x.owner,'notes')}}),next:null,total:L4.length})}
   if(p==='/admin/trends'){var tb=q.get('bucket')||'day',tf=parseInt(q.get('from')||'',10),tt=parseInt(q.get('to')||'',10),to2=parseInt(q.get('off')||'0',10);if(['day','week','month','year'].indexOf(tb)<0)return err(400,'invalid bucket');if(!isFinite(tf)||!isFinite(tt)||tf<0||tt<=tf||tt-tf>70*366*864e5)return err(400,'invalid range');if(!isFinite(to2)||Math.abs(to2)>15*36e5)return err(400,'invalid offset');var tr=trends(q);tr.bucket=tb;tr.from=tf;tr.to=tt;tr.off=to2;return ok(tr)}
   if(p==='/admin/purge'){var n=0;Object.keys(pages).forEach(function(s){var x=pages[s];if(x.status==='unpublished'&&!x.csamHold&&N-x.deletedAt>30*D){delete pages[s];n++}});Object.keys(users).forEach(function(e){var x=users[e];if(x.pendingDeletionAt&&N-x.pendingDeletionAt>30*D){delete users[e];n++}});Object.keys(users).forEach(function(e){var a=users[e].alerts,k=a.length;users[e].alerts=a.filter(function(x){return N-x.at<=365*D});n+=k-users[e].alerts.length});var rl=reports.length;reports=reports.filter(function(x){return!(x.isCsam&&x.dismissedAt&&N-x.dismissedAt>548*D)});n+=rl-reports.length;Object.keys(stale).forEach(function(k){n+=stale[k];stale[k]=0});A('purge','',n+' removed');return ok({purged:n})}
   return err(404,'Not found in demo')
@@ -1251,7 +1270,13 @@ function ask(o){
   })
 }
 
-var PICKS={ovsort:[['new', 'Newest first'], ['old', 'Oldest first'], ['active', 'Last active']],ovfilter:[['', 'All users'], ['online', 'Online now'], ['active24', 'Active 24h']],fstatus:[['', 'Any status'], ['live', 'live'], ['taken down', 'taken down'], ['unpublished', 'unpublished'], ['missing', 'missing']],fsort:[['new', 'Newest first'], ['most', 'Most reported'], ['old', 'Oldest first']],adst:[['', 'All ads'], ['active', 'Active'], ['paused', 'Paused'], ['exhausted', 'Used up'], ['unpublished', 'Down']],adkind:[['', 'Write & Share'], ['write', 'Write'], ['share', 'Share']]};
+var CSORT=[['most_subs','Most subscribers'],['least_subs','Least subscribers'],['most_posts','Most notes'],['least_posts','Least notes'],['most_likes','Most likes'],['least_likes','Least likes']];
+// "12 subscribers" / "1 note" / "84 likes" for a count k (subs | posts | likes).
+function cntWord(k,n){return num(n)+(k==='subs'?(n===1?' subscriber':' subscribers'):k==='posts'?(n===1?' note':' notes'):(n===1?' like':' likes'))}
+function isCsort(so){return /^(most|least)_(subs|posts|likes)$/.test(so||'')}
+// What a count sort on the Reports list ordered a card by: the reported note's likes, or its owner's subscribers / notes.
+function repCnt(r){var so=$('fsort').value;if(!isCsort(so)||r.sortCount==null)return '';var k=so.split('_')[1];return ' - '+(k==='likes'?'':'owner has ')+cntWord(k,r.sortCount)}
+var PICKS={ovnsort:[['new','Newest first']].concat(CSORT),adsort:[['new','Newest first']].concat(CSORT),ovsort:[['new', 'Newest first'], ['old', 'Oldest first'], ['active', 'Last active']].concat(CSORT),ovfilter:[['', 'All users'], ['online', 'Online now'], ['active24', 'Active 24h']],fstatus:[['', 'Any status'], ['live', 'live'], ['taken down', 'taken down'], ['unpublished', 'unpublished'], ['missing', 'missing']],fsort:[['new', 'Default order'], ['most', 'Most reported'], ['old', 'Oldest first']].concat(CSORT),adst:[['', 'All ads'], ['active', 'Active'], ['paused', 'Paused'], ['exhausted', 'Used up'], ['unpublished', 'Down']],adkind:[['', 'Write & Share'], ['write', 'Write'], ['share', 'Share']]};
 function pickSet(id,v){
   var b=$(id),o=PICKS[id].filter(function(x){return x[0]===v})[0]||PICKS[id][0];
   b.value=o[0];b.textContent=o[1]
@@ -1501,7 +1526,7 @@ function repQuery(first){
   if(next&&!first)p.push('cursor='+encodeURIComponent(next));
   return p.join('&')
 }
-function repFilter(){if(rIdx)loadReports(true);else renderAll()}
+function repFilter(){if(rIdx)loadReports(true);else{if(isCsort($('fsort').value))msg('Sorting by counts works once the search index has finished building');renderAll()}}
 function startReindex(){
   if(reindexing)return;reindexing=true;msg('Indexing reports for search…');
   (function step(c){
@@ -1562,9 +1587,10 @@ function repGroups(base){
   var fr=$('freason').value,grp=$('fgroup').checked,so=$('fsort').value;
   var items=base.filter(function(r){return!fr||r.reason===fr});
   var groups=[],idx={};
-  items.forEach(function(r){var k=grp?r.slug:r.key;if(idx[k]==null){idx[k]=groups.length;groups.push({slug:r.slug,key:k,items:[]})}groups[idx[k]].items.push(r)});
+  items.forEach(function(r){var k=grp?r.slug:r.key;if(idx[k]==null){idx[k]=groups.length;groups.push({slug:r.slug,key:k,ord:groups.length,items:[]})}groups[idx[k]].items.push(r)});
   groups.sort(function(a,b){
     var x=hasCsam(a),y=hasCsam(b);if(x!==y)return x?-1:1;
+    if(isCsort(so))return a.ord-b.ord; // the server already ordered these by the count; CSAM groups still come first
     var an=a.items[0].reportedAt,bn=b.items[0].reportedAt;
     if(so==='most'&&a.items.length!==b.items.length)return b.items.length-a.items.length;
     if(so==='old')return an-bn;
@@ -1631,7 +1657,7 @@ function renderGroup(g){
   chips.push(stChip(first.status));
   if(g.items.length>1)chips.push(chip(g.items.length+' reports'));
   if(csam)chips.push(chip(nc?'NCMEC '+fmtD(nc.at):'NCMEC not recorded',nc?'good':'bad'));
-  var card=mkCard({sev:sev,urgent:csam,icon:RICON[sev],slug:g.slug,chips:chips,sub:'Latest report '+ago(first.reportedAt),trail:agoS(first.reportedAt),key:'rep:'+g.key});
+  var card=mkCard({sev:sev,urgent:csam,icon:RICON[sev],slug:g.slug,chips:chips,sub:'Latest report '+ago(first.reportedAt)+repCnt(first),trail:agoS(first.reportedAt),key:'rep:'+g.key});
   var pad=card.pad;
   g.items.forEach(function(x){
     var r=el('div','rep'),top=el('div','rep-top');
@@ -1861,10 +1887,36 @@ function storyAct(slug,action,done){
     return api('/admin/story',{method:'POST',body:{slug:slug,action:action,reason:reason}}).then(function(o){if(o.ok){msg(rm?'Removed /'+slug+' from stories':'Stories allowed again for /'+slug);done()}else showErr(o,rm?'Could not remove /'+slug+' from stories':'Could not allow stories for /'+slug)})
   })
 }
+function strikeAct(slug,x,done){
+  var ex=!x.excusedAt;
+  return ask({title:ex?'Excuse this strike?':'Count this strike again?',text:ex?'It stops counting toward the ad hold right away and stays on the record, marked excused. The owner gets an alert with your reason.':'It counts toward the ad hold again until it is 60 days old. The owner is told.',ok:ex?'Excuse':'Count again',danger:!ex,fields:ex?[REASON_F]:undefined}).then(function(v){
+    if(!v)return;var reason='';if(ex){reason=reasonOf(v);if(!reason)return}
+    return api('/admin/strike',{method:'POST',body:{slug:slug,id:x.id,action:ex?'excuse':'restore',reason:reason}}).then(function(o){if(o.ok){msg(ex?'Strike excused':'Strike counts again');done()}else showErr(o,ex?'Could not excuse the strike':'Could not restore the strike')})
+  })
+}
+function refAct(slug,aid,restore,done){
+  return ask({title:restore?'Count this referral again?':'Void this referral?',text:restore?'It counts toward the referrer ad access again. The referrer is told.':'It stops counting toward the referrer ad access. The referrer gets an alert with your reason.',ok:restore?'Restore':'Void',danger:!restore,fields:restore?undefined:[REASON_F]}).then(function(v){
+    if(!v)return;var reason='';if(!restore){reason=reasonOf(v);if(!reason)return}
+    var b={slug:slug,action:restore?'restore':'void',reason:reason};if(aid)b.aid=aid;
+    return api('/admin/referral',{method:'POST',body:b}).then(function(o){if(o.ok){msg(restore?'Referral counts again':'Referral voided');done()}else showErr(o,restore?'Could not restore the referral':'Could not void the referral')})
+  })
+}
+function refRow(slug,x,lead,aid,again){
+  var r=el('div','pgrow stack'),l=el('div');
+  l.appendChild(el('div','slug',lead+(x.email||'account missing')));
+  if(x.authorId)l.appendChild(el('small','aid',x.authorId));
+  l.appendChild(el('small',null,'Joined with the code '+ago(x.at)+(x.voidedAt?(x.voidReason==='admin'?' - voided '+ago(x.voidedAt):' - paused while the account is suspended or being deleted'):'')));
+  var m=el('div','pm');
+  if(x.voidedAt)m.appendChild(chip(x.voidReason==='admin'?'voided':'paused','bad'));else if(x.counts===true)m.appendChild(chip('counting','good'));else if(x.counts===false)m.appendChild(chip('not yet'));
+  r.appendChild(m);r.appendChild(l);
+  if((!x.voidedAt||x.voidReason==='admin')&&(aid!==null)){r.appendChild(btn(x.voidedAt?'Restore':'Void referral',null,function(){return refAct(slug,aid,!!x.voidedAt,again)}))}
+  return r
+}
 function loadOwner(slug){
   api('/admin/owner?slug='+encodeURIComponent(slug)).then(function(o){
     if(!o.ok){showErr(o,'Could not load the account');return}
     var d=o.j,out=$('lkowner');out.textContent='';
+    var again0=function(){loadOwner(slug)};
     var c=el('div','card static sev-other');
     if(d.anonymous){c.appendChild(el('div',null,'Anonymous page: no account to act on.'));out.appendChild(c);return}
     var hd=el('div','lk-head compact');hd.appendChild(tile(d.suspended?'csam':'other','user'));
@@ -1874,13 +1926,24 @@ function loadOwner(slug){
     if(d.pendingDeletionAt)cr.appendChild(chip('deletion '+fmtD(d.pendingDeletionAt+2592000000),'bad'));
     hm.appendChild(cr);hd.appendChild(hm);c.appendChild(hd);
     var st=el('div','stats');
-    [['Subscribers',d.subscribers],['Likes',d.likes],['Live pages',d.pages.length],['Strikes',d.strikeCount],['Reports',d.reportStats?d.reportStats.total:null],['Alerts',d.alertTotal]].forEach(function(x){var s=el('div','stat');s.appendChild(el('b',null,x[1]==null?'-':num(x[1])));s.appendChild(el('span',null,x[0]));st.appendChild(s)});
+    [['Subscribers',d.subscribers],['Likes',d.likes],['Live pages',d.pages.length],['Ad tier',d.adTier],['Strikes',d.strikeCount],['Reports',d.reportStats?d.reportStats.total:null],['Alerts',d.alertTotal]].forEach(function(x){var s=el('div','stat');s.appendChild(el('b',null,x[1]==null?'-':num(x[1])));s.appendChild(el('span',null,x[0]));st.appendChild(s)});
     c.appendChild(st);
     var k=el('div','kvs');c.appendChild(k);
     aidRow(k,d.authorId);
     kv(k,'Signed up',fmt(d.createdAt));kv(k,'Last sign-in',fmt(d.lastSignInAt));kv(k,'Ads',String(d.ads));kv(k,'Credit balance',num(d.creditBalance));
     kv(k,'Display name',d.displayName||'-');
     kv(k,'Backup',d.backup?num(d.backup.images)+(d.backup.imagesMore?'+':'')+' images - '+Math.round(d.backup.sizeBytes/1024)+' KB - '+ago(d.backup.updatedAt):'none');
+    var rf=d.referral;
+    if(rf){
+      c.appendChild(el('div','sec-t','Referrals'));
+      var rk=el('div','kvs');c.appendChild(rk);
+      kv(rk,'Invite code',rf.code||'-');kv(rk,'Invited',num(rf.invited)+' ('+num(rf.qualified)+' counting)');
+      if(rf.referredBy)c.appendChild(refRow(slug,rf.referredBy,'Referred by ',undefined,again0));
+      if(rf.referred&&rf.referred.length){
+        c.appendChild(el('div','fine','Accounts that joined with this code'+(rf.invited>rf.referred.length?' (latest '+num(rf.referred.length)+')':'')+'. A friend counts once they publish a note and have been active on two days.'));
+        rf.referred.forEach(function(x){c.appendChild(refRow(slug,x,'',x.authorId||null,again0))})
+      }
+    }
     c.appendChild(el('div','sec-t','Reports against this account'));
     var rs=d.reportStats;
     if(!rs)c.appendChild(el('div','fine','Report totals are unavailable until the report index is built (open the Reports tab once).'));
@@ -1892,12 +1955,17 @@ function loadOwner(slug){
     }
     c.appendChild(el('div','sec-t','Strikes ('+num(d.strikeCount||0)+')'));
     if(!d.strikes||!d.strikes.length)c.appendChild(el('div','fine','No strikes. Reports alone are not strikes; takedowns, story or ad removals, profile removals and suspensions are.'));
-    else d.strikes.forEach(function(x,i){
-      var r=el('div','pgrow stack'),l=el('div');
-      l.appendChild(el('div','amsg',x.message));
-      l.appendChild(el('small',null,fmt(x.at)+' - '+ago(x.at)+(x.dismissedAt?' - deleted by user '+ago(x.dismissedAt):'')));
-      var m=el('div','pm');m.appendChild(chip('strike #'+(i+1),'bad'));m.appendChild(chip(x.kind.replace(/_/g,' ')));r.appendChild(m);r.appendChild(l);c.appendChild(r)
-    });
+    else{
+      c.appendChild(el('div','fine','A strike holds ad packages back for 60 days, then stops counting by itself. Excusing one removes it from the hold now (for a wrongful takedown, say) and tells the owner.'));
+      d.strikes.forEach(function(x,i){
+        var r=el('div','pgrow stack'),l=el('div');
+        l.appendChild(el('div','amsg',x.message));
+        l.appendChild(el('small',null,fmt(x.at)+' - '+ago(x.at)+(x.excusedAt?' - excused '+ago(x.excusedAt):!x.counting?' - past 60 days, no longer counts':'')+(x.dismissedAt?' - deleted by user '+ago(x.dismissedAt):'')));
+        var m=el('div','pm');m.appendChild(chip('strike #'+(i+1),x.excusedAt||!x.counting?null:'bad'));m.appendChild(chip(x.kind.replace(/_/g,' ')));if(x.excusedAt)m.appendChild(chip('excused','good'));r.appendChild(m);r.appendChild(l);
+        if(x.excusedAt||x.counting){var sb=btn(x.excusedAt?'Count again':'Excuse strike',null,function(){return strikeAct(slug,x,function(){loadOwner(slug)})});r.appendChild(sb)}
+        c.appendChild(r)
+      })
+    }
     if(d.hasProfileImage){c.appendChild(el('div','sec-t','Profile picture'));var pw=el('div','media');pw.appendChild(mediaTile('Profile picture',function(){return loadMedia(slug,'profile')},true));c.appendChild(pw)}
     if(d.ledger&&d.ledger.length){
       c.appendChild(el('div','sec-t','Credit ledger'));
@@ -1990,7 +2058,7 @@ function openAd(slug){
 function loadAds(reset){
   var L=$('adlist');
   if(reset){adCur='';adTotal=0;L.textContent='';skel(L,3)}else moreBusy($('admore'),true);
-  return api('/admin/ads?status='+encodeURIComponent($('adst').value)+'&kind='+encodeURIComponent($('adkind').value)+'&q='+encodeURIComponent(adqv())+'&cursor='+encodeURIComponent(adCur)).then(function(o){
+  return api('/admin/ads?status='+encodeURIComponent($('adst').value)+'&kind='+encodeURIComponent($('adkind').value)+'&sort='+encodeURIComponent($('adsort').value)+'&q='+encodeURIComponent(adqv())+'&cursor='+encodeURIComponent(adCur)).then(function(o){
     unskel(L);moreBusy($('admore'),false);
     if(!o.ok){bad(o,'Could not load ads');return}
     if(o.j.total!=null)adTotal=o.j.total;SUBS.ads=num(adTotal)+(adTotal===1?' campaign':' campaigns')+adFiltLbl();if(cur==='ads')setSub();
@@ -2029,9 +2097,9 @@ function renderAd(a){
   var pct=a.viewsTotal?Math.min(100,Math.round(a.viewsUsed/a.viewsTotal*100)):0;
   var m=el('div'),bar=el('div','meter'),i=document.createElement('i');i.style.width=pct+'%';bar.appendChild(i);m.appendChild(bar);
   var ml=el('div','meter-l');ml.appendChild(el('span',null,num(a.viewsUsed)+' of '+num(a.viewsTotal)+' views'));ml.appendChild(el('span',null,pct+'%'));m.appendChild(ml);
-  var card=mkCard({sev:'ad',icon:'ads',slug:a.slug,chips:[stChip(a.status)],sub:a.ownerEmail||'account missing',extra:m,key:'ad:'+a.slug});
+  var card=mkCard({sev:'ad',icon:'ads',slug:a.slug,chips:[stChip(a.status)],sub:(a.ownerEmail||'account missing')+(a.ownerSubs==null?'':' - '+num(a.ownerSubs)+(a.ownerSubs===1?' subscriber':' subscribers')+' - '+num(a.ownerNotes)+(a.ownerNotes===1?' note':' notes')),extra:m,key:'ad:'+a.slug});
   var k=el('div','kvs');
-  kv(k,'Type',a.kind==='share'?'Share':'Write');kv(k,'Unique viewers',num(a.uniqueViewers));kv(k,'Views left',num(left));kv(k,'Created',fmt(a.createdAt));
+  kv(k,'Type',a.kind==='share'?'Share':'Write');if(a.likes!=null)kv(k,'Likes',num(a.likes));kv(k,'Unique viewers',num(a.uniqueViewers));kv(k,'Views left',num(left));kv(k,'Created',fmt(a.createdAt));
   card.pad.appendChild(k);
   var tools=el('div','tools');tools.appendChild(btn('Lookup',null,function(){openLookup(a.slug)}));card.pad.appendChild(tools);
   var foot=card.foot;
@@ -2046,7 +2114,7 @@ function renderAd(a){
 }
 
 /* ---------- Audit ---------- */
-var ACT_LBL={takedown:'Takedown',release:'Release',restore:'Restore',dismiss:'Dismiss',undismiss:'Undismiss',purge:'Purge',ncmec_recorded:'NCMEC recorded',owner_suspend:'Suspend account',owner_unsuspend:'Unsuspend account',owner_delete:'Delete account','owner_cancel-delete':'Cancel deletion','owner_clear-name':'Clear name','owner_clear-picture':'Clear picture',story_remove:'Story removed',story_allow:'Story allowed',ad_pause:'Ad paused',ad_resume:'Ad resumed',ad_takedown:'Ad taken down',ad_refund:'Ad refunded',custom_alert:'Custom alert'};
+var ACT_LBL={takedown:'Takedown',release:'Release',restore:'Restore',dismiss:'Dismiss',undismiss:'Undismiss',purge:'Purge',ncmec_recorded:'NCMEC recorded',owner_suspend:'Suspend account',owner_unsuspend:'Unsuspend account',owner_delete:'Delete account','owner_cancel-delete':'Cancel deletion','owner_clear-name':'Clear name','owner_clear-picture':'Clear picture',story_remove:'Story removed',story_allow:'Story allowed',strike_excuse:'Strike excused',strike_restore:'Strike reinstated',referral_void:'Referral voided',referral_restore:'Referral restored',ad_pause:'Ad paused',ad_resume:'Ad resumed',ad_takedown:'Ad taken down',ad_refund:'Ad refunded',custom_alert:'Custom alert'};
 function actLbl(a){a=String(a||'');if(ACT_LBL[a])return ACT_LBL[a];a=a.replace(/[_-]+/g,' ').trim();return a.charAt(0).toUpperCase()+a.slice(1)}
 function actTone(a){a=String(a||'');if(/take|purge|suspend|delete|ban/.test(a)&&!/unsuspend|cancel/.test(a))return'bad';if(/restore|release|unsuspend|cancel|allow|refund|resume/.test(a))return'good';return''}
 var auT=null,auBusy=false;
@@ -2830,13 +2898,16 @@ function recipSheet(o){
   if(curSheet)curSheet.done(false,true);
   var trig=document.activeElement,back=el('div','sheet-back'),sh=el('div','sheet'),top=el('div','sheet-top'),sb=el('div','sheet-body'),list=el('div'),
     sub=el('div','rsub',o.sub||''),cnt=el('div','rcnt'),chk=el('div','rchk'),note=el('div','rsub'),inp=el('input','field'),
-    cur='',shown=0,total=0,found=0,g=0,closed=false,q='',qt=null;
+    cur='',shown=0,total=0,found=0,g=0,closed=false,q='',qt=null,sort='';
   sh.setAttribute('role','dialog');sh.setAttribute('aria-modal','true');sh.setAttribute('aria-label','Recipients');
   sh.appendChild(el('div','grab'));
   top.appendChild(el('div','ptitle','Recipients'));top.appendChild(sub);top.appendChild(cnt);
   var sr=el('div','search'),fw=el('div','field-wrap');
   inp.type='text';inp.placeholder='Check an author ID';inp.setAttribute('autocomplete','off');inp.setAttribute('autocapitalize','off');inp.setAttribute('spellcheck','false');inp.setAttribute('enterkeyhint','search');inp.setAttribute('aria-label','Search recipients by author ID');
-  fw.appendChild(ico('search'));fw.appendChild(inp);sr.appendChild(fw);top.appendChild(sr);top.appendChild(chk);
+  fw.appendChild(ico('search'));fw.appendChild(inp);sr.appendChild(fw);top.appendChild(sr);
+  var sk=el('div','filters');
+  [['','Newest']].concat(CSORT).forEach(function(m){var b=el('button','key');b.type='button';b.setAttribute('aria-pressed',m[0]===sort?'true':'false');b.appendChild(el('span',null,m[1]));b.onclick=function(){if(sort===m[0])return;sort=m[0];[].forEach.call(sk.children,function(x){x.setAttribute('aria-pressed',x===b?'true':'false')});load(true)};sk.appendChild(b)});
+  top.appendChild(sk);top.appendChild(chk);
   sh.appendChild(top);sh.appendChild(sb);
   sb.appendChild(list);
   var more=btn('Load more','block more',function(){return load(false)});more.hidden=true;sb.appendChild(more);sb.appendChild(note);
@@ -2846,7 +2917,7 @@ function recipSheet(o){
   function load(first){
     var gg=++g;
     if(first){cur='';shown=0;list.textContent='';chk.textContent='';chk.className='rchk';note.textContent='';more.hidden=true;sb.scrollTop=0;skel(list,4,'row')}
-    return api('/admin/alert',{method:'POST',body:Object.assign({},o.body,{q:q,cursor:cur})}).then(function(r){
+    return api('/admin/alert',{method:'POST',body:Object.assign({},o.body,{q:q,cursor:cur,sort:sort})}).then(function(r){
       if(gg!==g||closed)return;
       unskel(list);
       if(!r.ok){bad(r,'Could not load the recipients');return}
@@ -2994,7 +3065,7 @@ var OV=[
   ['Content',[['notes','Published notes'],['notesNew1d','New today'],['notesNew7d','New this week'],['publishers','Publishers'],['stories','In stories'],['likes','Likes']]],
   ['Ads and follows',[['adsActive','Active ads'],['adsPaused','Paused ads'],['adViewsUsed','Ad views used'],['adsExhausted','Used up'],['adsUnpublished','Taken down'],['subscriptions','Subscriptions']]]
 ];
-var ovS={view:'users',cur:'',total:0,shown:0,gen:0,loaded:false,fil:'',sort:'new',q:'',t:null};
+var ovS={view:'users',cur:'',total:0,shown:0,gen:0,loaded:false,fil:'',sort:'new',nsort:'new',q:'',t:null};
 function ovShell(){
   var C=$('ovstats');C.textContent='';
   OV.forEach(function(sec){
@@ -3020,7 +3091,7 @@ function loadOverview(){
 function ovSync(){
   var users=ovS.view==='users';
   [].forEach.call($('ovseg').children,function(b){b.setAttribute('aria-pressed',b.getAttribute('data-v')===ovS.view?'true':'false')});
-  $('ovfil').hidden=!users;
+  $('ovsort').parentNode.hidden=!users;$('ovfilter').parentNode.hidden=!users;$('ovnsort').parentNode.hidden=users;
   $('ovq').placeholder=users?'Search by author ID':'Search by slug or author ID'
 }
 function ovUser(u){$('ovlist').appendChild(ovUserRow(u))}
@@ -3028,8 +3099,10 @@ function ovUserRow(u){
   var r=el('button','pgrow'),l=el('div');r.type='button';
   r.onclick=function(){if(!u.authorId)return;try{navigator.clipboard.writeText(u.authorId).then(function(){msg('Author ID copied')},function(){msg(u.authorId)})}catch(e){msg(u.authorId)}};
   l.appendChild(el('div','slug',u.email||'Account missing'));
-  l.appendChild(el('small',null,(u.name?u.name+' - ':'')+'Joined '+ago(u.createdAt)+' - '+num(u.notes)+(u.notes===1?' note':' notes')+' - '+(u.lastSeen?'seen '+ago(u.lastSeen):'not seen yet')+(u.lastSignInAt?' - signed in '+ago(u.lastSignInAt):'')));
+  l.appendChild(el('small',null,(u.name?u.name+' - ':'')+'Joined '+ago(u.createdAt)+' - '+num(u.notes)+(u.notes===1?' note':' notes')+(u.subs!=null?' - '+num(u.subs)+(u.subs===1?' subscriber':' subscribers'):'')+(u.likes!=null?' - '+cntWord('likes',u.likes):'')+' - '+(u.lastSeen?'seen '+ago(u.lastSeen):'not seen yet')+(u.lastSignInAt?' - signed in '+ago(u.lastSignInAt):'')));
   if(u.authorId)l.appendChild(el('small','aid',u.authorId));
+  if(u.referredBy){l.appendChild(el('small',null,'Referred by '+(u.referredBy.email||'account missing')));if(u.referredBy.authorId)l.appendChild(el('small','aid',u.referredBy.authorId))}
+  if(u.referralCode)l.appendChild(el('small','aid','Referral code '+u.referralCode));
   r.appendChild(l);
   var m=el('div','pm');
   if(u.authorId){var cp=el('span','lk');cp.setAttribute('aria-label','Copy author ID');cp.appendChild(ico('copy'));m.appendChild(cp)}
@@ -3042,7 +3115,8 @@ function ovUserRow(u){
 function ovNote(n){
   var r=el('button','pgrow');r.type='button';r.onclick=function(){openLookup(n.slug)};
   var l=el('div');l.appendChild(slugEl(n.slug));
-  l.appendChild(el('small',null,(n.title||'Untitled')+' - published '+ago(n.createdAt)));
+  var nk=isCsort(ovS.nsort)?ovS.nsort.split('_')[1]:'';
+  l.appendChild(el('small',null,(n.title||'Untitled')+' - published '+ago(n.createdAt)+(n.likes==null?'':' - '+cntWord('likes',n.likes))+((nk==='subs'||nk==='posts')&&n.authorSubs!=null?' - author has '+cntWord(nk,nk==='subs'?n.authorSubs:n.authorNotes):'')));
   r.appendChild(l);
   var m=el('div','pm');if(n.story)m.appendChild(chip('story'));
   r.appendChild(m);$('ovlist').appendChild(r)
@@ -3051,7 +3125,7 @@ function ovList(reset){
   var L=$('ovlist'),m=$('ovmore'),users=ovS.view==='users',g=++ovS.gen;
   if(reset){ovS.cur='';ovS.total=0;ovS.shown=0;L.textContent='';moreBusy(m,false);m.hidden=true;$('ovcount').textContent='';skel(L,4,'row')}
   else moreBusy(m,true);
-  var qs='cursor='+encodeURIComponent(ovS.cur)+'&q='+encodeURIComponent(ovS.q)+(users?'&sort='+ovS.sort+'&f='+ovS.fil:'');
+  var qs='cursor='+encodeURIComponent(ovS.cur)+'&q='+encodeURIComponent(ovS.q)+'&sort='+(users?ovS.sort+'&f='+ovS.fil:ovS.nsort);
   return api('/admin/'+ovS.view+'?'+qs).then(function(o){
     if(g!==ovS.gen)return;
     unskel(L);moreBusy(m,false);
@@ -3382,7 +3456,7 @@ $('rf').onclick=function(){
 $('so').onclick=function(){
   sessionStorage.removeItem('adm');tok='';all=[];next=null;rIdx=false;rAgg=null;rGen++;navLog=[];lkSlug='';lkOwner=false;cur='reports';openSet={};auAll=[];auFilter='';recents=[];repSub='';
   ['list','lkowner','adlist','aulist','aukeys','qbar','qkeys','ovstats','ovlist','trchart','trleg','trrows','rpbox'].forEach(function(i){$(i).textContent=''});trS.data=null;trS.M=null;trS.end=null;trS.gen++;
-  ovS.loaded=false;ovS.view='users';ovS.q='';ovS.fil='';ovS.sort='new';ovS.gen++;$('ovq').value='';pickSet('ovsort','new');pickSet('ovfilter','');$('ovcount').textContent='';$('ovnote').textContent='';ovSync();
+  ovS.loaded=false;ovS.view='users';ovS.q='';ovS.fil='';ovS.sort='new';ovS.nsort='new';ovS.gen++;$('ovq').value='';pickSet('ovsort','new');pickSet('ovfilter','');pickSet('ovnsort','new');$('ovcount').textContent='';$('ovnote').textContent='';ovSync();
   $('queue').hidden=true;$('freason').value='';$('fq').value='';$('adq').value='';$('auq').value='';aidMap={};lkAid='';
   lookupHint();renderRecents();setBadge(0);document.body.dataset.alert='';$('tok').value='';
   navSync();loggedIn(false);msg('Signed out','ok')
@@ -3451,10 +3525,12 @@ function cocBuild(){
 $("coc").onclick=function(){ask({title:"Admin Code of Conduct",icon:"book",sev:"ad",node:cocBuild(),ok:"Got it",single:true})};
 $('ovsort').onclick=function(){pick('ovsort',function(){ovS.sort=$('ovsort').value;ovList(true)})};
 $('ovfilter').onclick=function(){pick('ovfilter',function(){ovS.fil=$('ovfilter').value;ovList(true)})};
+$('ovnsort').onclick=function(){pick('ovnsort',function(){ovS.nsort=$('ovnsort').value;ovList(true)})};
 $('ovq').oninput=function(){clearTimeout(ovS.t);ovS.t=setTimeout(function(){ovS.q=$('ovq').value.trim().toLowerCase();ovList(true)},300)};
 [].forEach.call($('ovseg').children,function(b){b.onclick=function(){var v=b.getAttribute('data-v');if(ovS.view===v)return;ovS.view=v;ovS.q='';$('ovq').value='';ovSync();ovList(true)}});
 $('adst').onclick=function(){pick('adst',function(){loadAds(true)})};
 $('adkind').onclick=function(){pick('adkind',function(){loadAds(true)})};
+$('adsort').onclick=function(){pick('adsort',function(){loadAds(true)})};
 $('auq').oninput=function(){clearTimeout(auT);auT=setTimeout(auSearch,300)};
 $('adq').oninput=function(){clearTimeout(adT);adT=setTimeout(function(){loadAds(true)},300)};
 $('fstatus').onclick=function(){pick('fstatus',renderAll)};
