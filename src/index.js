@@ -17,6 +17,8 @@
  * Secrets:
  *   REPORT_WEBHOOK_URL (optional)  - receives report JSON for alerting
  *   GOOGLE_CLIENT_IDS              - comma-separated client IDs accepted as idToken audience
+ *   PLAY_INTEGRITY_SA              - service account JSON for Play Integrity token decoding (see "Play Integrity attestation")
+ *   PLAY_INTEGRITY_ENFORCE         - "1" makes GET /ads/next require an attested ad key
  *   REVENUECAT_WEBHOOK_SECRET      - must match the webhook's Authorization header value;
  *                                    unset, the webhook refuses everything (fail closed)
  *
@@ -532,6 +534,7 @@ async function handleGoogleAuth(env, request) {
   }
   user.lastSignInAt = now;
   await putUser(env, identity.sub, user);
+  if (deletionCancelled) await syncReferralAccountState(env, identity.sub, !!user.suspended);
   const sessionToken = await createSession(env, identity.sub);
   await presenceSwitch(env, presenceDeviceId(body), identity.sub, true);
   return json({ sessionToken, sub: identity.sub, email: identity.email, authorId: await authorIdFor(env, identity.sub), deletionCancelled });
@@ -800,6 +803,286 @@ async function checkPublishRateLimit(env, request) {
   return true;
 }
 
+// Per-IP limiter for the unauthenticated ad-view counter, so a script can't burn through someone's paid views.
+const AD_VIEW_RATE_MAX = 20, AD_NEXT_RATE_MAX = 60, AD_RATE_WINDOW_S = 60;
+async function checkAdIpRateLimit(env, request, bucket, max) {
+  const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
+  const key = 'ratelimit:' + bucket + ':' + ip;
+  try {
+    const raw = await env.REPORTS.get(key);
+    const count = raw ? parseInt(raw, 10) || 0 : 0;
+    if (count >= max) return false;
+    await env.REPORTS.put(key, String(count + 1), { expirationTtl: Math.max(60, AD_RATE_WINDOW_S) });
+  } catch (e) { /* fail open, like the account limiter */ }
+  return true;
+}
+// Served-ad tokens: GET /ads/next hands out a single-use token with each ad, and POST /ads/:slug/view only counts a view that
+// presents a live token for that slug. A view can therefore only follow an ad that was actually served, one view per served ad,
+// so a script has to fetch a fresh ad for every view it wants to burn (and /ads/next is itself rate limited per IP).
+// Builds from before this existed send no token, so their views stop counting while this is true; set it false to count them again
+// (they then fall back to the per-IP limit only).
+const AD_VIEW_REQUIRE_TOKEN = true;
+const AD_VIEW_TOKEN_TTL_MS = 6 * 60 * 60 * 1000;
+let adViewTokensReady = null;
+function ensureAdViewTokens(env) {
+  if (!adViewTokensReady) {
+    adViewTokensReady = env.ADS_DB.prepare('CREATE TABLE IF NOT EXISTS ad_view_tokens (token TEXT PRIMARY KEY, slug TEXT NOT NULL, created_at INTEGER NOT NULL)').run()
+      .then(() => env.ADS_DB.prepare('CREATE INDEX IF NOT EXISTS ad_view_tokens_created ON ad_view_tokens (created_at)').run())
+      .catch((e) => { adViewTokensReady = null; throw e; });
+  }
+  return adViewTokensReady;
+}
+async function issueAdViewToken(env, slug) {
+  try {
+    await ensureAdViewTokens(env);
+    const token = crypto.randomUUID().replace(/-/g, '') + crypto.randomUUID().replace(/-/g, '').slice(0, 16);
+    const now = Date.now();
+    await env.ADS_DB.prepare('INSERT INTO ad_view_tokens (token, slug, created_at) VALUES (?, ?, ?)').bind(token, slug, now).run();
+    // Expired tokens are swept now and then, on issue, so the table stays small without a separate job.
+    if (Math.random() < 0.05) await env.ADS_DB.prepare('DELETE FROM ad_view_tokens WHERE created_at < ?').bind(now - AD_VIEW_TOKEN_TTL_MS).run();
+    return token;
+  } catch (e) { console.log('ad view token failed: ' + (e && e.message)); return null; }
+}
+// One atomic delete: true only for the first use of a live token that was issued for this slug.
+async function consumeAdViewToken(env, slug, token) {
+  if (typeof token !== 'string' || token.length < 16 || token.length > 64) return false;
+  try {
+    await ensureAdViewTokens(env);
+    const r = await env.ADS_DB.prepare('DELETE FROM ad_view_tokens WHERE token = ? AND slug = ? AND created_at > ? RETURNING token')
+      .bind(token, slug, Date.now() - AD_VIEW_TOKEN_TTL_MS).first();
+    return !!r;
+  } catch (e) { console.log('ad view token check failed: ' + (e && e.message)); return false; }
+}
+// Per-ad velocity cap. Tokens and per-IP limits still let a bot spread over many IPs spend one view per served ad, at a cost of
+// about one request pair per view. This caps how many views a single ad can have counted per hour no matter how many IPs or
+// tokens the traffic comes from. The cap is enforced where the ad is served (handleAdNext skips an ad whose hour is full and
+// moves on to the next one in rotation) as well as where the view is counted (handleAdView), so a capped ad is not shown at all
+// rather than shown for free.
+// Nothing here is tuned by hand. Each kind (write / share) gets an hourly budget learned from its own history, split across its
+// active ads (more ads, lower cap each; fewer ads, higher), so the pool keeps its room however many ads there are.
+// What the budget learns from is the part of the traffic a bot can't cheaply fake: views from ESTABLISHED devices, meaning a
+// viewer id whose first counted view on the platform (ad_viewers) is more than a day old. A script minting fresh ids gets its views
+// counted against the cap but never raises it, and to raise it must first get each id a counted view, then wait a day, and even
+// then each id is held to AD_VIEW_DEVICE_HOURLY_MAX views an hour. Budget = headroom times the typical (median) hour of
+// established-device views over the last day, or a bit more than the last hour's, whichever is higher, so real growth in returning
+// users loosens it within hours instead of days. Before there is enough established history (right after this ships) it uses all
+// counted views instead, and a small floor per ad keeps a brand-new platform serving.
+const AD_VIEW_HEADROOM = 2;
+const AD_VIEW_GROWTH = 1.25;
+const AD_VIEW_HISTORY_HOURS = 24;
+const AD_VIEW_MIN_HISTORY_HOURS = 3;
+const AD_VIEW_PER_AD_HOUR_MIN = 10;
+const AD_VIEW_ESTABLISHED_AGE_MS = 24 * 60 * 60 * 1000;
+const AD_VIEW_DEVICE_HOURLY_MAX = 10;
+const AD_VIEW_BUDGET_CACHE_MS = 5 * 60 * 1000;
+const AD_VIEW_RATE_BUCKET_MS = 60 * 60 * 1000;
+const adViewDemandCache = new Map(); // kind -> { at, median, prev }; per isolate, so it only ever costs one query per kind every few minutes
+function medianOf(sorted) {
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+}
+// Typical hourly demand for a kind over the finished hours of the window (hours with no views are left out, so a quiet night
+// doesn't drag it down): the median, and the last finished hour. Established-device views when there are enough hours of them,
+// otherwise all counted views with no growth term. { median: 0, prev: 0 } when there isn't enough history yet.
+async function adViewDemand(env, kind) {
+  const cached = adViewDemandCache.get(kind);
+  if (cached && Date.now() - cached.at < AD_VIEW_BUDGET_CACHE_MS) return cached;
+  const out = { at: Date.now(), median: 0, prev: 0 };
+  try {
+    await ensureAdViewRate(env);
+    const now = Math.floor(Date.now() / AD_VIEW_RATE_BUCKET_MS);
+    const { results } = await env.ADS_DB.prepare(
+      'SELECT r.bucket AS bucket, SUM(r.n) AS n, SUM(r.est) AS est FROM ad_view_rate r JOIN ads a ON a.slug = r.slug WHERE a.kind = ? AND r.bucket >= ? AND r.bucket < ? GROUP BY r.bucket'
+    ).bind(kind, now - AD_VIEW_HISTORY_HOURS, now).all();
+    const rows = results || [];
+    const est = rows.map((r) => r.est).filter((n) => n > 0).sort((x, y) => x - y);
+    if (est.length >= AD_VIEW_MIN_HISTORY_HOURS) {
+      out.median = medianOf(est);
+      const last = rows.find((r) => r.bucket === now - 1);
+      out.prev = last ? last.est : 0;
+    } else {
+      const all = rows.map((r) => r.n).filter((n) => n > 0).sort((x, y) => x - y);
+      if (all.length >= AD_VIEW_MIN_HISTORY_HOURS) out.median = medianOf(all);
+    }
+  } catch (e) { console.log('ad view history failed: ' + (e && e.message)); }
+  adViewDemandCache.set(kind, out);
+  return out;
+}
+// Per-ad hourly cap for a kind with `activeAds` ads running right now.
+async function adViewHourCap(env, kind, activeAds) {
+  const n = Math.max(1, Number(activeAds) || 1);
+  const d = await adViewDemand(env, kind);
+  const budget = Math.max(AD_VIEW_PER_AD_HOUR_MIN * n, Math.ceil(Math.max(AD_VIEW_HEADROOM * d.median, AD_VIEW_GROWTH * d.prev)));
+  return Math.max(AD_VIEW_PER_AD_HOUR_MIN, Math.ceil(budget / n));
+}
+// Established device: its first counted view on the platform is over a day old. Only a positive answer is cached, since a new
+// device becomes established by the clock alone. Needs the index below to be quick; false (new) if the lookup fails.
+const adViewEstablishedCache = new Set();
+async function adViewerEstablished(env, viewerId) {
+  if (!viewerId) return false;
+  if (adViewEstablishedCache.has(viewerId)) return true;
+  try {
+    await ensureAdViewRate(env);
+    const r = await env.ADS_DB.prepare('SELECT MIN(first_seen_at) AS t FROM ad_viewers WHERE viewer_id = ?').bind(viewerId).first();
+    if (r && r.t && r.t < Date.now() - AD_VIEW_ESTABLISHED_AGE_MS) {
+      if (adViewEstablishedCache.size > 5000) adViewEstablishedCache.clear();
+      adViewEstablishedCache.add(viewerId);
+      return true;
+    }
+  } catch (e) { /* treated as a new device */ }
+  return false;
+}
+// Per-device hourly limit, same best-effort KV window as checkAdIpRateLimit but keyed by the viewer id, so one device (aged or not)
+// can't stand in for many views.
+async function checkAdDeviceRateLimit(env, viewerId) {
+  const key = 'ratelimit:addev:' + viewerId;
+  try {
+    const raw = await env.REPORTS.get(key);
+    const count = raw ? parseInt(raw, 10) || 0 : 0;
+    if (count >= AD_VIEW_DEVICE_HOURLY_MAX) return false;
+    await env.REPORTS.put(key, String(count + 1), { expirationTtl: 3600 });
+  } catch (e) { /* fail open, like the other limiters */ }
+  return true;
+}
+let adViewRateReady = null;
+function ensureAdViewRate(env) {
+  if (!adViewRateReady) {
+    adViewRateReady = (async () => {
+      await env.ADS_DB.prepare('CREATE TABLE IF NOT EXISTS ad_view_rate (slug TEXT NOT NULL, bucket INTEGER NOT NULL, n INTEGER NOT NULL, est INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (slug, bucket))').run();
+      await addColumnOnce(env, 'ALTER TABLE ad_view_rate ADD COLUMN est INTEGER NOT NULL DEFAULT 0'); // tables made before est existed
+      try { await env.ADS_DB.prepare('CREATE INDEX IF NOT EXISTS ad_viewers_viewer ON ad_viewers (viewer_id, first_seen_at)').run(); }
+      catch (e) { console.log('ad_viewers viewer index failed: ' + (e && e.message)); } // only speeds the device-age lookup up
+    })().catch((e) => { adViewRateReady = null; throw e; });
+  }
+  return adViewRateReady;
+}
+// Read-only: true when this ad's current hour is already full. Used at serve time so a capped ad is not handed out. Fails open.
+async function adViewHourFull(env, slug, cap) {
+  try {
+    await ensureAdViewRate(env);
+    const r = await env.ADS_DB.prepare('SELECT n FROM ad_view_rate WHERE slug = ? AND bucket = ?')
+      .bind(slug, Math.floor(Date.now() / AD_VIEW_RATE_BUCKET_MS)).first();
+    return !!(r && r.n >= cap);
+  } catch (e) { return false; }
+}
+// One atomic upsert: takes a slot in this ad's current hour only while it is under the cap. Fails open if D1 errors.
+async function takeAdViewSlot(env, slug, cap, established) {
+  try {
+    await ensureAdViewRate(env);
+    const bucket = Math.floor(Date.now() / AD_VIEW_RATE_BUCKET_MS);
+    const r = await env.ADS_DB.prepare('INSERT INTO ad_view_rate (slug, bucket, n, est) VALUES (?, ?, 1, ?) ON CONFLICT (slug, bucket) DO UPDATE SET n = n + 1, est = est + excluded.est WHERE n < ? RETURNING n')
+      .bind(slug, bucket, established ? 1 : 0, cap).first();
+    if (Math.random() < 0.02) await env.ADS_DB.prepare('DELETE FROM ad_view_rate WHERE bucket < ?').bind(bucket - AD_VIEW_HISTORY_HOURS - 2).run();
+    return !!r;
+  } catch (e) { console.log('ad view rate failed: ' + (e && e.message)); return true; }
+}
+// ---------------- Play Integrity attestation for ad serving ----------------
+// The one thing a script farm can't cheaply fake is a genuine Android device running the genuine app from Google Play. The app
+// asks Google for an integrity token (nonce chosen by the app), sends it to POST /ads/attest, and the worker has Google decode it
+// (playintegrity.googleapis.com, with a service account) and checks: the package is one of ours, the nonce matches and was never used,
+// the token is fresh, the app is PLAY_RECOGNIZED and the device MEETS_DEVICE_INTEGRITY. A pass returns an "ad key" good for a day, which
+// GET /ads/next must then present (?ak=) and which is held to AD_ATTEST_NEXT_PER_KEY_HOUR ads an hour. One Google decode per device per
+// day, not per ad, so the API quota is never the limit.
+// Rollout: /ads/attest works as soon as the secrets exist; /ads/next only demands a key once PLAY_INTEGRITY_ENFORCE is "1".
+// Secrets / vars: PLAY_INTEGRITY_SA (service account JSON, secret), PLAY_INTEGRITY_ENFORCE ("1" to require keys),
+// PLAY_INTEGRITY_PACKAGES (optional, comma-separated, default both Note Builder apps).
+const AD_ATTEST_KEY_TTL_S = 24 * 60 * 60;
+const AD_ATTEST_NEXT_PER_KEY_HOUR = 30;
+const AD_ATTEST_MAX_AGE_MS = 5 * 60 * 1000;
+function adAttestApps(env) {
+  return String(env.PLAY_INTEGRITY_PACKAGES || 'com.essentialsoftware.notebuilder,com.essentialsoftware.notebuilderpro').split(',').map((x) => x.trim()).filter(Boolean);
+}
+// Best-effort KV counter (same style as the other limiters): true while under max. Fails open.
+async function kvBump(env, key, max, ttl) {
+  try {
+    const raw = await env.REPORTS.get(key);
+    const count = raw ? parseInt(raw, 10) || 0 : 0;
+    if (count >= max) return false;
+    await env.REPORTS.put(key, String(count + 1), { expirationTtl: Math.max(60, ttl) });
+  } catch (e) { /* fail open */ }
+  return true;
+}
+function b64url(buf) {
+  let bin = '';
+  const bytes = new Uint8Array(buf);
+  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+let googleTokenCache = null; // { token, exp }
+async function googleAccessToken(env, scope) {
+  if (googleTokenCache && googleTokenCache.exp > Date.now() + 60000) return googleTokenCache.token;
+  const sa = JSON.parse(env.PLAY_INTEGRITY_SA);
+  const enc = (o) => b64url(new TextEncoder().encode(JSON.stringify(o)));
+  const now = Math.floor(Date.now() / 1000);
+  const unsigned = enc({ alg: 'RS256', typ: 'JWT' }) + '.' + enc({ iss: sa.client_email, scope, aud: 'https://oauth2.googleapis.com/token', iat: now, exp: now + 3600 });
+  const der = Uint8Array.from(atob(sa.private_key.replace(/-----[^-]+-----/g, '').replace(/\s+/g, '')), (c) => c.charCodeAt(0));
+  const key = await crypto.subtle.importKey('pkcs8', der, { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' }, false, ['sign']);
+  const sig = await crypto.subtle.sign('RSASSA-PKCS1-v1_5', key, new TextEncoder().encode(unsigned));
+  const resp = await fetch('https://oauth2.googleapis.com/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: 'grant_type=' + encodeURIComponent('urn:ietf:params:oauth:grant-type:jwt-bearer') + '&assertion=' + unsigned + '.' + b64url(sig)
+  });
+  const data = await resp.json();
+  if (!resp.ok || !data.access_token) throw new Error('google token ' + resp.status);
+  googleTokenCache = { token: data.access_token, exp: Date.now() + (data.expires_in || 3600) * 1000 };
+  return googleTokenCache.token;
+}
+async function verifyPlayIntegrity(env, appId, nonce, integrityToken) {
+  try {
+    const at = await googleAccessToken(env, 'https://www.googleapis.com/auth/playintegrity');
+    const resp = await fetch('https://playintegrity.googleapis.com/v1/' + encodeURIComponent(appId) + ':decodeIntegrityToken', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer ' + at, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ integrity_token: integrityToken })
+    });
+    if (!resp.ok) { console.log('decodeIntegrityToken ' + resp.status); return false; }
+    const p = (await resp.json()).tokenPayloadExternal || {};
+    const rd = p.requestDetails || {};
+    if (rd.requestPackageName !== appId || rd.nonce !== nonce) return false;
+    if (Math.abs(Date.now() - Number(rd.timestampMillis || 0)) > AD_ATTEST_MAX_AGE_MS) return false;
+    if ((p.appIntegrity || {}).appRecognitionVerdict !== 'PLAY_RECOGNIZED') return false;
+    const dev = (p.deviceIntegrity || {}).deviceRecognitionVerdict || [];
+    return dev.includes('MEETS_DEVICE_INTEGRITY');
+  } catch (e) { console.log('play integrity failed: ' + (e && e.message)); return false; }
+}
+// POST /ads/attest { viewerId, appId, nonce, integrityToken } -> { adKey, expiresIn }
+async function handleAdAttest(env, request) {
+  if (!env.PLAY_INTEGRITY_SA) return textError(501, 'attestation not configured');
+  if (!(await checkAdIpRateLimit(env, request, 'adattest', 10))) return textError(429, 'slow down');
+  let body;
+  try { body = await request.json(); } catch (e) { body = {}; }
+  const viewerId = typeof body.viewerId === 'string' ? body.viewerId.slice(0, MAX_VIEWER_ID_LEN) : '';
+  const appId = typeof body.appId === 'string' ? body.appId : '';
+  const nonce = typeof body.nonce === 'string' ? body.nonce : '';
+  const token = typeof body.integrityToken === 'string' ? body.integrityToken : '';
+  if (!viewerId || !adAttestApps(env).includes(appId) || !/^[A-Za-z0-9_-]{16,200}$/.test(nonce) || !token || token.length > 20000) return textError(400, 'bad attestation request');
+  if (!(await kvBump(env, 'ratelimit:adattestdev:' + viewerId, 6, 86400))) return textError(429, 'too many attestations for this device');
+  try {
+    if (await env.REPORTS.get('adnonce:' + nonce)) return textError(400, 'nonce already used');
+    await env.REPORTS.put('adnonce:' + nonce, '1', { expirationTtl: 600 });
+  } catch (e) { /* the freshness check inside the token still bounds replay */ }
+  if (!(await verifyPlayIntegrity(env, appId, nonce, token))) return textError(403, 'attestation failed');
+  const adKey = newToken();
+  await env.REPORTS.put('adkey:' + adKey, viewerId, { expirationTtl: AD_ATTEST_KEY_TTL_S });
+  return json({ adKey, expiresIn: AD_ATTEST_KEY_TTL_S });
+}
+// /ads/next gate: when enforcing, the request must carry a live ad key (?ak=) and stay under that key's hourly allowance.
+async function adAttestKeyOk(env, request) {
+  let ak = '';
+  try { ak = new URL(request.url).searchParams.get('ak') || ''; } catch (e) {}
+  if (!/^[a-f0-9]{16,128}$/i.test(ak)) return false;
+  try {
+    if (!(await env.REPORTS.get('adkey:' + ak))) return false;
+  } catch (e) { return true; } // KV hiccup: don't turn ads off for everyone
+  return kvBump(env, 'ratelimit:adkeynext:' + ak, AD_ATTEST_NEXT_PER_KEY_HOUR, 3600);
+}
+// An account that is suspended or scheduled for deletion must not have ads running or editable.
+async function adOwnerBlocked(env, sub) {
+  if (!sub) return false;
+  try { const u = await getUser(env, sub); return !!(u && (u.suspended || u.pendingDeletionAt)); } catch (e) { return false; }
+}
+
 // Per-account backstop for the signed-in write routes (likes, subscribing,
 // marking stories seen, backup uploads). Same best-effort KV fixed-window
 // approach as the limiters above, but keyed by account and split into
@@ -815,7 +1098,8 @@ const ACCOUNT_RATE_LIMITS = {
   subscribe: { max: 30,  windowS: 60 },
   seen:      { max: 120, windowS: 60 },
   syncPush:  { max: 30,  windowS: 60 },
-  syncImage: { max: 300, windowS: 60 }
+  syncImage: { max: 300, windowS: 60 },
+  redeem:    { max: 8,   windowS: 60 }
 };
 async function checkAccountRateLimit(env, sub, action) {
   const cfg = ACCOUNT_RATE_LIMITS[action];
@@ -970,6 +1254,7 @@ async function handlePublish(env, request) {
       'INSERT OR REPLACE INTO stories (slug, author_sub, title, created_at, image_url, image_urls, description, tags, note_created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
     ).bind(slug, ownerSub, storyTitle, now, imageUrl, imageUrls, cleanStoryDesc(desc), cleanStoryTags(tags), cleanNoteCreatedAt(createdAt)).run();
   }
+  await afterPublishAdCheck(env, ownerSub);
   return json({ slug, token }, 201);
 }
 
@@ -989,6 +1274,17 @@ async function handleUpdate(env, request, slug) {
   const tokenHash = await sha256Hex(token);
   if (!timingSafeEqual(tokenHash, meta.tokenHash)) return textError(403, 'invalid token');
   if (await storyCycleEnded(env, slug, meta)) meta.showInStories = false;
+
+  // A page that is a running ad is the ad: an edit through this route must pass the same checks as the ad's own Save Changes.
+  try {
+    const adRow = await env.ADS_DB.prepare("SELECT status FROM ads WHERE slug = ? AND status IN ('active', 'paused')").bind(slug).first();
+    if (adRow) {
+      if (adRow.status === 'paused') return textError(403, 'this note is running as an ad that an admin paused, so it cannot be edited right now');
+      if (await adOwnerBlocked(env, meta.ownerSub)) return textError(403, 'this account is suspended');
+      const el = await validateAdEligibility(html);
+      if (!el.ok) return textError(422, 'this note is running as an ad, so edits must keep it ad-eligible: ' + el.reason);
+    }
+  } catch (e) { console.log('ad edit check failed: ' + (e && e.message)); }
 
   await env.NOTES_BUCKET.put(slug + '.html', html, {
     httpMetadata: { contentType: 'text/html; charset=utf-8' }
@@ -1761,7 +2057,10 @@ async function handleSubscribe(env, request, authorParam) {
   const authorSub = await resolveAuthorParam(env, authorParam);
   if (!authorSub) return textError(404, 'author not found');
   if (authorSub === sub) return textError(400, 'can\u2019t subscribe to yourself');
-  return applySubscription(env, request, sub, authorSub, true);
+  const res = await applySubscription(env, request, sub, authorSub, true);
+  await maybeNotifyAdUnlock(env, authorSub, AD_TIER_CHECK_GAP_MS);
+  await maybeNotifyAdUnlock(env, sub, AD_TIER_CHECK_GAP_MS);
+  return res;
 }
 
 async function handleUnsubscribe(env, request, authorParam) {
@@ -1885,6 +2184,10 @@ async function handleLike(env, request, slug) {
       .bind(sub, slug, meta.ownerSub || '', Date.now(), sub, 'like', slug, t)
   ]);
   const row = await env.ADS_DB.prepare('SELECT 1 AS x FROM likes WHERE liker_sub = ? AND slug = ?').bind(sub, slug).first();
+  if (row) {
+    await maybeNotifyAdUnlock(env, meta.ownerSub, AD_TIER_CHECK_GAP_MS);
+    await maybeNotifyAdUnlock(env, sub, AD_TIER_CHECK_GAP_MS);
+  }
   return json({ ok: true, liked: !!row });
 }
 
@@ -2602,6 +2905,7 @@ async function handleDeleteAccount(env, request) {
   // existed can't be listed; requireSessionInfo rejects those via
   // pendingDeletionAt instead.
   await revokeAllSessions(env, sub);
+  await syncReferralAccountState(env, sub, true);
 
   return json({ ok: true, pendingDeletionAt });
 }
@@ -2682,6 +2986,12 @@ async function purgeAccountData(env, sub) {
     env.ADS_DB.prepare('DELETE FROM ad_viewers WHERE slug IN (SELECT slug FROM ads WHERE owner_sub = ?)').bind(sub),
     env.ADS_DB.prepare('DELETE FROM ads WHERE owner_sub = ?').bind(sub),
     env.ADS_DB.prepare('DELETE FROM view_credits_ledger WHERE owner_sub = ?').bind(sub)
+  ]);
+  await ensureAdStanding(env);
+  await env.ADS_DB.batch([
+    env.ADS_DB.prepare('DELETE FROM ad_tier_state WHERE sub = ?').bind(sub),
+    env.ADS_DB.prepare('DELETE FROM referral_codes WHERE sub = ?').bind(sub),
+    env.ADS_DB.prepare('DELETE FROM referrals WHERE referred_sub = ? OR referrer_sub = ?').bind(sub, sub)
   ]);
   await ensureAlerts(env);
   await env.ADS_DB.prepare('DELETE FROM alerts WHERE sub = ?').bind(sub).run();
@@ -2955,6 +3265,299 @@ async function handleRevenueCatWebhook(env, request) {
   return json({ ok: true });
 }
 
+/* ---- Ad access: packages are earned, not just bought ----
+ * Buying is open to anyone who can pay, which would let a brand-new account flood the platform with ads on day one.
+ * So each package is unlocked by standing in the community: subscribers, published notes, likes received, and (from
+ * the second package up) giving back: likes given, accounts followed, days active, notes shared to stories, and
+ * friends invited. Every requirement is shown to the owner as progress, never as a bare "no".
+ *
+ * Why notes always outnumber ads, by construction:
+ *  - every advertiser needs 5+ subscribers, so there are always several times more users than advertisers;
+ *  - every running ad needs AD_MIN_NOTES_PER_AD published notes behind it, so ads are at most 1/5 of an account's notes,
+ *    and the requirements below keep real advertisers far under that;
+ *  - a tier also caps how many ads one account can run at once.
+ * Nothing here caps total ads platform-wide, so profitability is untouched: more good accounts means more eligible ads.
+ *
+ * A rule strike in the last 60 days holds an account back to the 5,000 package (two strikes: the 1,000 package).
+ * Unlocks are never revoked, only held; the hold lifts by itself when the strike ages out (or an admin excuses it), and the
+ * check that sees it end sends a "package is back" alert. Holds only block starting new ads; running ads are untouched. */
+const AD_TIERS = [
+  { tier: 1, views: 1000,   maxActive: 1, req: { subs: 5,   notes: 5 } },
+  { tier: 2, views: 5000,   maxActive: 2, req: { subs: 25,  notes: 10, likesReceived: 40,   likesGiven: 10,  follows: 5,  activeDays: 5 } },
+  { tier: 3, views: 20000,  maxActive: 3, req: { subs: 100, notes: 25, likesReceived: 200,  likesGiven: 40,  follows: 10, activeDays: 12, stories: 3 } },
+  { tier: 4, views: 100000, maxActive: 5, req: { subs: 400, notes: 60, likesReceived: 1000, likesGiven: 100, follows: 20, activeDays: 18, stories: 8 } }
+];
+const AD_MIN_NOTES_PER_AD = 5;
+const AD_STRIKE_WINDOW_MS = 60 * 24 * 60 * 60 * 1000;
+const AD_TIER_CHECK_GAP_MS = 60 * 1000;        // event hooks: re-check an account at most once a minute
+const AD_TIER_POLL_GAP_MS = 10 * 60 * 1000;    // the app's alert poll: at most every 10 minutes
+const REFERRAL_WINDOW_MS = 14 * 24 * 60 * 60 * 1000;
+const REFERRAL_BONUS_PER = 3;                   // each qualified invite counts as this many subscribers toward packages 2 and up
+const REFERRAL_BONUS_MAX_INVITES = 5;           // ...for up to this many invites
+const REFERRAL_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
+const REQ_WORDS = {
+  subs: ['subscriber', 'subscribers'], notes: ['published note', 'published notes'],
+  likesReceived: ['like received', 'likes received'], likesGiven: ['like given to other notes', 'likes given to other notes'],
+  follows: ['account you follow', 'accounts you follow'], activeDays: ['active day in the last 30', 'active days in the last 30'],
+  stories: ['note shared to stories', 'notes shared to stories']
+};
+function fmtN(n) { return Number(n).toLocaleString('en-US'); }
+function reqLabel(key, need) { const w = REQ_WORDS[key]; return w ? w[need === 1 ? 0 : 1] : key; }
+
+let adStandingReady = null;
+function ensureAdStanding(env) {
+  if (!adStandingReady) {
+    adStandingReady = (async () => {
+      await Promise.all([ensureActivity(env), ensureAlerts(env)]);
+      await env.ADS_DB.batch([
+        env.ADS_DB.prepare('CREATE TABLE IF NOT EXISTS ad_tier_state (sub TEXT PRIMARY KEY, notified_tier INTEGER NOT NULL DEFAULT 0, checked_at INTEGER NOT NULL DEFAULT 0)'),
+        env.ADS_DB.prepare('CREATE TABLE IF NOT EXISTS referral_codes (code TEXT PRIMARY KEY, sub TEXT NOT NULL UNIQUE)'),
+        env.ADS_DB.prepare('CREATE TABLE IF NOT EXISTS referrals (referred_sub TEXT PRIMARY KEY, referrer_sub TEXT NOT NULL, created_at INTEGER NOT NULL)'),
+        env.ADS_DB.prepare('CREATE INDEX IF NOT EXISTS referrals_referrer ON referrals (referrer_sub)'),
+        env.ADS_DB.prepare('CREATE INDEX IF NOT EXISTS activity_id_day ON activity_daily (id, day)')
+      ]);
+      // last_tier / was_held: what the previous check saw, so the check that finds a strike hold has ended can say so.
+      // Rows from before these columns existed have last_tier NULL, which never triggers a "package is back" alert.
+      await addColumnOnce(env, 'ALTER TABLE ad_tier_state ADD COLUMN last_tier INTEGER');
+      await addColumnOnce(env, 'ALTER TABLE ad_tier_state ADD COLUMN was_held INTEGER NOT NULL DEFAULT 0');
+      // voided_at / void_reason: a referral that no longer counts. 'account' = the referred account is suspended or being deleted
+      // (lifts by itself when that ends), 'admin' = an admin voided it (only an admin can restore it).
+      await addColumnOnce(env, 'ALTER TABLE referrals ADD COLUMN voided_at INTEGER');
+      await addColumnOnce(env, 'ALTER TABLE referrals ADD COLUMN void_reason TEXT');
+    })().catch((e) => { adStandingReady = null; throw e; });
+  }
+  return adStandingReady;
+}
+
+// Everything the tiers are judged on, in one D1 round trip.
+async function adMetrics(env, sub) {
+  await ensureAdStanding(env);
+  const today = Math.floor(Date.now() / 86400000);
+  const q = (sql, ...b) => env.ADS_DB.prepare(sql).bind(...b);
+  const rs = await env.ADS_DB.batch([
+    q('SELECT COUNT(*) AS c FROM subscriptions WHERE author_sub = ?', sub),
+    q('SELECT COUNT(*) AS c FROM published_notes WHERE author_sub = ?', sub),
+    q('SELECT COUNT(*) AS c FROM likes WHERE author_sub = ?', sub),
+    q('SELECT COUNT(*) AS c FROM likes WHERE liker_sub = ?', sub),
+    q('SELECT COUNT(*) AS c FROM subscriptions WHERE subscriber_sub = ?', sub),
+    q('SELECT COUNT(*) AS c FROM activity_daily WHERE id = ? AND day > ?', 'u:' + sub, today - 30),
+    q('SELECT COUNT(*) AS c FROM stories WHERE author_sub = ?', sub),
+    q("SELECT COUNT(*) AS c FROM ads WHERE owner_sub = ? AND status = 'active'", sub),
+    q('SELECT created_at FROM alerts WHERE sub = ? AND created_at > ? AND ' + ACTIVE_STRIKE_SQL + ' ORDER BY created_at ASC LIMIT 50', sub, Date.now() - AD_STRIKE_WINDOW_MS),
+    q("SELECT COUNT(*) AS c FROM referrals r WHERE r.referrer_sub = ? AND r.voided_at IS NULL AND EXISTS (SELECT 1 FROM published_notes p WHERE p.author_sub = r.referred_sub) AND (SELECT COUNT(*) FROM activity_daily a WHERE a.id = 'u:' || r.referred_sub) >= 2", sub),
+    q('SELECT COUNT(*) AS c FROM referrals WHERE referrer_sub = ?', sub)
+  ]);
+  const c = (i, f) => ((rs[i].results && rs[i].results[0] && rs[i].results[0][f || 'c']) || 0);
+  const strikeTimes = ((rs[8].results) || []).map((r) => r.created_at);
+  return {
+    subs: c(0), notes: c(1), likesReceived: c(2), likesGiven: c(3), follows: c(4), activeDays: c(5), stories: c(6),
+    activeAds: c(7), strikes: strikeTimes.length, strikeTimes, referralsQualified: c(9), referralsTotal: c(10)
+  };
+}
+
+// One strike in the window caps an account at package 2, two or more at package 1.
+function strikeCap(n) { return n >= 2 ? 1 : n === 1 ? 2 : AD_TIERS.length; }
+function fmtDay(ms) { return new Date(ms).toISOString().slice(0, 10); }
+
+function buildStanding(m) {
+  const bonus = Math.min(m.referralsQualified, REFERRAL_BONUS_MAX_INVITES) * REFERRAL_BONUS_PER;
+  const tiers = AD_TIERS.map((t) => {
+    const reqs = Object.entries(t.req).map(([key, need]) => {
+      // Invites only ever help from the second package up: the first needs real subscribers.
+      const have = key === 'subs' && t.tier >= 2 ? m.subs + bonus : m[key];
+      return { key, label: reqLabel(key, need), hint: key === 'subs' && t.tier >= 2 ? 'invites count too' : null, have, need, met: have >= need };
+    });
+    return { tier: t.tier, views: t.views, maxActive: t.maxActive, reqs, met: reqs.every((r) => r.met) };
+  });
+  let earned = 0;
+  for (const t of tiers) { if (t.met) earned = t.tier; else break; }
+  const tier = Math.min(earned, strikeCap(m.strikes));
+  const cur = tier ? AD_TIERS[tier - 1] : null;
+  // When does each held package come back? Strikes expire oldest first, and every expiry can step the cap up a level,
+  // so each held package gets its own date: returns[tier] = the first moment the cap lets that package through.
+  // until = the first step back up, fullUntil = everything earned is open again (equal when one strike is the whole hold).
+  let held = null;
+  if (earned > tier) {
+    const exp = (m.strikeTimes || []).map((t) => t + AD_STRIKE_WINDOW_MS);
+    const returns = {};
+    for (let T = tier + 1; T <= earned; T++) {
+      for (let j = 1; j <= exp.length; j++) {
+        if (Math.min(earned, strikeCap(exp.length - j)) >= T) { returns[T] = exp[j - 1]; break; }
+      }
+    }
+    const dates = Object.values(returns);
+    const last = exp.length ? exp[exp.length - 1] : Date.now();
+    held = { until: dates.length ? Math.min(...dates) : last, fullUntil: dates.length ? Math.max(...dates) : last, returns };
+  }
+  return {
+    tier, earnedTier: earned,
+    maxViews: cur ? cur.views : 0, maxActive: cur ? cur.maxActive : 0,
+    activeAds: m.activeAds, notes: m.notes, minNotesPerAd: AD_MIN_NOTES_PER_AD,
+    nextTier: tier < AD_TIERS.length ? tier + 1 : null,
+    held,
+    referralBonus: bonus, tiers
+  };
+}
+
+function firstUnmet(t) { return t.reqs.find((r) => !r.met) || null; }
+
+// null when the owner may put `views` into a new ad now, else {code, message} written to encourage, not scold.
+function adGate(s, views) {
+  if (!s.tier) {
+    const r = firstUnmet(s.tiers[0]);
+    return { code: 'locked', message: 'Ads unlock at ' + fmtN(r.need) + ' ' + r.label + ' (you have ' + fmtN(r.have) + '). Keep publishing and sharing and you will get there.' };
+  }
+  if (views > s.maxViews) {
+    const t = s.tiers.find((x) => x.views >= views) || s.tiers[s.tiers.length - 1];
+    if (s.held && t.met) return { code: 'held', message: 'The ' + fmtN(t.views) + '-view package is paused after a recent rule strike. It comes back on ' + fmtDay((s.held.returns && s.held.returns[t.tier]) || s.held.fullUntil) + '.' };
+    const r = firstUnmet(t);
+    return { code: 'locked', message: 'The ' + fmtN(t.views) + '-view package unlocks at ' + fmtN(r.need) + ' ' + r.label + ' (you have ' + fmtN(r.have) + ').' };
+  }
+  if (s.activeAds >= s.maxActive) {
+    return { code: 'ad-limit', message: 'At your level you can run ' + s.maxActive + (s.maxActive === 1 ? ' ad' : ' ads') + ' at once. Let one finish, or unlock the next package for more.' };
+  }
+  const needNotes = AD_MIN_NOTES_PER_AD * (s.activeAds + 1);
+  if (s.notes < needNotes) {
+    return { code: 'need-notes', message: 'Every running ad needs ' + AD_MIN_NOTES_PER_AD + ' published notes behind it. Publish ' + (needNotes - s.notes) + ' more to run another.' };
+  }
+  return null;
+}
+
+function unlockText(s) {
+  const t = s.tiers[s.tier - 1];
+  let msg = 'You unlocked the ' + fmtN(t.views) + '-view ad package. Open Publish as Ad on one of your published notes to use it.';
+  const n = s.tiers[s.tier];
+  if (n) { const r = firstUnmet(n); if (r) msg += ' Next up: ' + fmtN(n.views) + ' views, which needs ' + fmtN(r.need) + ' ' + r.label + '.'; }
+  return msg;
+}
+
+// Records the tier an account has been told about and sends the unlock alert the first time a new package opens.
+// One alert per crossing (the highest package reached), never repeated, never sent for a package already announced.
+async function recordAdTier(env, sub, s) {
+  await ensureAdStanding(env);
+  const st = await env.ADS_DB.prepare('SELECT notified_tier, last_tier, was_held FROM ad_tier_state WHERE sub = ?').bind(sub).first();
+  const prev = st ? st.notified_tier : 0;
+  if (s.tier > prev) await createAlert(env, sub, 'unlock', unlockText(s), { ref: 'adtier:' + s.tier, dedupeMs: 365 * 24 * 60 * 60 * 1000 });
+  // A strike hold ending (aged out, or excused by an admin) raises the package without being a new unlock, so say so here.
+  // Only when the last check saw the hold, so a package that dipped for any other reason never triggers this.
+  else if (st && st.was_held && st.last_tier != null && s.tier > st.last_tier) {
+    await createAlert(env, sub, 'unlock', holdLiftedText(s), { ref: 'adback:' + s.tier, dedupeMs: 24 * 60 * 60 * 1000 });
+  }
+  await env.ADS_DB.prepare(
+    'INSERT INTO ad_tier_state (sub, notified_tier, checked_at, last_tier, was_held) VALUES (?, ?, ?, ?, ?) ON CONFLICT(sub) DO UPDATE SET notified_tier = MAX(notified_tier, excluded.notified_tier), checked_at = excluded.checked_at, last_tier = excluded.last_tier, was_held = excluded.was_held'
+  ).bind(sub, s.tier, Date.now(), s.tier, s.held ? 1 : 0).run();
+}
+
+// Not a strike alert: kind 'unlock', and no "was paused" / "was taken down" wording.
+function holdLiftedText(s) {
+  const t = s.tiers[s.tier - 1];
+  if (s.held) return 'Your ' + fmtN(t.views) + '-view ad package is back. The bigger packages you have earned return on ' + fmtDay(s.held.fullUntil) + '.';
+  return 'Your ' + fmtN(t.views) + '-view ad package is back. The hold from a recent rule strike has ended, so every package you have earned is open again.';
+}
+
+// Best-effort and throttled: called after the things that move the numbers (a like, a follow, a publish, an invite)
+// and from the app's alert poll, so an unlock lands within moments of being earned. Never fails the caller.
+async function maybeNotifyAdUnlock(env, sub, minGapMs) {
+  try {
+    if (!sub) return;
+    await ensureAdStanding(env);
+    const st = await env.ADS_DB.prepare('SELECT notified_tier, checked_at, was_held FROM ad_tier_state WHERE sub = ?').bind(sub).first();
+    if (st && st.notified_tier >= AD_TIERS.length && !st.was_held) return; // everything announced and nothing held back: nothing left to say
+    if (st && Date.now() - st.checked_at < (minGapMs || 0)) return;
+    const user = await getUser(env, sub);
+    if (!user || user.suspended || user.pendingDeletionAt) return;
+    await recordAdTier(env, sub, buildStanding(await adMetrics(env, sub)));
+  } catch (e) { console.log('ad unlock check failed: ' + (e && e.message)); }
+}
+
+// A friend's first published note can be what qualifies their invite, so the inviter gets re-checked then.
+async function afterPublishAdCheck(env, ownerSub) {
+  try {
+    if (!ownerSub) return;
+    await maybeNotifyAdUnlock(env, ownerSub, AD_TIER_CHECK_GAP_MS);
+    await ensureAdStanding(env);
+    const r = await env.ADS_DB.prepare('SELECT referrer_sub FROM referrals WHERE referred_sub = ?').bind(ownerSub).first();
+    if (r) await maybeNotifyAdUnlock(env, r.referrer_sub, AD_TIER_CHECK_GAP_MS);
+  } catch (e) { console.log('post-publish ad check failed: ' + (e && e.message)); }
+}
+
+/* ---- Invites ---- */
+// A referred account that is suspended or being deleted stops counting toward its referrer; it counts again when that ends.
+// Never touches an admin-voided referral.
+async function syncReferralAccountState(env, sub, blocked) {
+  try {
+    await ensureAdStanding(env);
+    if (blocked) await env.ADS_DB.prepare("UPDATE referrals SET voided_at = ?, void_reason = 'account' WHERE referred_sub = ? AND voided_at IS NULL").bind(Date.now(), sub).run();
+    else await env.ADS_DB.prepare("UPDATE referrals SET voided_at = NULL, void_reason = NULL WHERE referred_sub = ? AND void_reason = 'account'").bind(sub).run();
+  } catch (e) { console.log('referral state sync failed: ' + (e && e.message)); }
+}
+async function referralCodeFor(env, sub) {
+  await ensureAdStanding(env);
+  const have = await env.ADS_DB.prepare('SELECT code FROM referral_codes WHERE sub = ?').bind(sub).first();
+  if (have) return have.code;
+  for (let i = 0; i < 5; i++) {
+    const bytes = crypto.getRandomValues(new Uint8Array(8));
+    const code = [...bytes].map((b) => REFERRAL_ALPHABET[b % REFERRAL_ALPHABET.length]).join('');
+    await env.ADS_DB.prepare('INSERT OR IGNORE INTO referral_codes (code, sub) VALUES (?, ?)').bind(code, sub).run();
+    const row = await env.ADS_DB.prepare('SELECT code FROM referral_codes WHERE sub = ?').bind(sub).first();
+    if (row) return row.code;
+  }
+  return null;
+}
+
+async function referralSummary(env, sub, user, m) {
+  const code = await referralCodeFor(env, sub);
+  const used = await env.ADS_DB.prepare('SELECT 1 AS x FROM referrals WHERE referred_sub = ?').bind(sub).first();
+  return {
+    code, invited: m.referralsTotal, qualified: m.referralsQualified,
+    bonusPer: REFERRAL_BONUS_PER, maxBonusInvites: REFERRAL_BONUS_MAX_INVITES,
+    canRedeem: !used && !!user && Date.now() - (user.createdAt || 0) <= REFERRAL_WINDOW_MS
+  };
+}
+
+// GET /referral/mine: the signed-in account's invite code and how its invites are doing.
+async function handleReferralMine(env, request) {
+  const sub = await requireSession(env, request);
+  if (!sub) return textError(401, 'sign-in required');
+  const [user, m] = await Promise.all([getUser(env, sub), adMetrics(env, sub)]);
+  return json(await referralSummary(env, sub, user, m));
+}
+
+// POST /referral/redeem {code, follow?}: a new account enters a friend's code once, in its first 14 days. The friend
+// is told, and counts it toward their ad access once the newcomer has published a note and been around for two days.
+// follow:true also subscribes the newcomer to the friend (the app asks first; it is never done silently).
+async function handleReferralRedeem(env, request) {
+  const sub = await requireSession(env, request);
+  if (!sub) return textError(401, 'sign-in required');
+  const limited = await accountRateLimitResponse(env, sub, 'redeem');
+  if (limited) return limited;
+  let body;
+  try { body = await request.json(); } catch (e) { return textError(400, 'invalid JSON body'); }
+  const code = String((body && body.code) || '').trim().toUpperCase().replace(/[\s-]/g, '');
+  if (!/^[A-Z2-9]{8}$/.test(code)) return textError(400, 'That invite code does not look right.');
+  const user = await getUser(env, sub);
+  if (!user) return textError(401, 'sign-in required');
+  if (Date.now() - (user.createdAt || 0) > REFERRAL_WINDOW_MS) return textError(409, 'Invite codes can only be added in an account\u2019s first 14 days.');
+  await ensureAdStanding(env);
+  const row = await env.ADS_DB.prepare('SELECT sub FROM referral_codes WHERE code = ?').bind(code).first();
+  if (!row) return textError(404, 'That invite code does not exist.');
+  if (row.sub === sub) return textError(400, 'You can\u2019t use your own invite code.');
+  // Two accounts inviting each other would each count for the other, so a code from someone who used yours is refused.
+  const mutual = await env.ADS_DB.prepare('SELECT 1 AS x FROM referrals WHERE referred_sub = ? AND referrer_sub = ?').bind(row.sub, sub).first();
+  if (mutual) return textError(409, 'That invite code can\u2019t be used on this account.');
+  const ins = await env.ADS_DB.prepare('INSERT OR IGNORE INTO referrals (referred_sub, referrer_sub, created_at) VALUES (?, ?, ?)').bind(sub, row.sub, Date.now()).run();
+  if (!(ins && ins.meta && ins.meta.changes)) return textError(409, 'You have already added an invite code.');
+  let followed = false;
+  if (body && body.follow === true) {
+    await applySubscription(env, request, sub, row.sub, true);
+    followed = true;
+  }
+  await createAlert(env, row.sub, 'referral', 'A friend joined with your invite code. Once they publish a note and have been active on two days, they count toward your ad access.', { ref: 'ref:' + sub, dedupeMs: 365 * 24 * 60 * 60 * 1000 });
+  await maybeNotifyAdUnlock(env, row.sub, AD_TIER_CHECK_GAP_MS);
+  if (followed) await maybeNotifyAdUnlock(env, row.sub, 0);
+  return json({ ok: true, followed });
+}
+
 /* ---- Ad handlers ---- */
 
 // Registers an already-published page (published the normal way, via
@@ -2986,6 +3589,12 @@ async function handleAdPublish(env, request) {
   const html = await obj.text();
   const eligibility = await validateAdEligibility(html);
   if (!eligibility.ok) return textError(422, 'not eligible: ' + eligibility.reason);
+
+  // Packages are earned (see AD_TIERS): the app locks them before purchase, and this is the check that can't be bypassed.
+  // Credits bought anyway stay on the ledger and become spendable once the package unlocks.
+  const standing = buildStanding(await adMetrics(env, sub));
+  const gate = adGate(standing, views);
+  if (gate) return json({ error: gate.message, code: gate.code }, 403);
 
   const balance = await getCreditBalance(env, sub);
   if (balance < views) return textError(402, 'insufficient view credits');
@@ -3040,8 +3649,10 @@ async function handleAdUpdate(env, request, slug) {
   if (!timingSafeEqual(await sha256Hex(token), meta.tokenHash)) return textError(403, 'invalid token');
 
   await ensureAdKind(env);
-  const ad = await env.ADS_DB.prepare('SELECT slug FROM ads WHERE slug = ?').bind(slug).first();
+  const ad = await env.ADS_DB.prepare('SELECT slug, status FROM ads WHERE slug = ?').bind(slug).first();
   if (!ad) return textError(404, 'not registered as an ad');
+  if (ad.status === 'paused') return textError(403, 'this ad was paused by an admin, so it cannot be edited right now');
+  if (await adOwnerBlocked(env, meta.ownerSub)) return textError(403, 'this account is suspended');
 
   const eligibility = await validateAdEligibility(html);
   if (!eligibility.ok) return textError(422, 'not eligible: ' + eligibility.reason);
@@ -3087,7 +3698,14 @@ async function handleMyAds(env, request) {
      FROM ads a WHERE a.owner_sub = ? ORDER BY a.created_at DESC`
   ).bind(sub).all();
   const balance = await getCreditBalance(env, sub);
-  return json({ ads: results || [], creditBalance: balance });
+  let standing = null;
+  try {
+    const m = await adMetrics(env, sub);
+    standing = buildStanding(m);
+    standing.referral = await referralSummary(env, sub, await getUser(env, sub), m);
+    await recordAdTier(env, sub, standing);
+  } catch (e) { console.log('standing failed: ' + (e && e.message)); } // the screen still works without it
+  return json({ ads: results || [], creditBalance: balance, standing });
 }
 
 // GET /ads/next[?kind=share] — called from the Write screen (no kind, which is also what
@@ -3101,45 +3719,58 @@ async function handleAdNext(env, request) {
   let kind = AD_KIND_WRITE;
   try { if (new URL(request.url).searchParams.get('kind') === AD_KIND_SHARE) kind = AD_KIND_SHARE; } catch (e) {}
   try { await ensureAdKind(env); } catch (e) { return json({ ad: null }); } // never fail a screen over this
+  if (!(await checkAdIpRateLimit(env, request, 'adnext', AD_NEXT_RATE_MAX))) return json({ ad: null }); // the app falls back to the pristine template
+  if (env.PLAY_INTEGRITY_ENFORCE === '1' && !(await adAttestKeyOk(env, request))) return json({ ad: null, needAttest: true }); // the app attests in the background and the next screen gets an ad
 
   const activeCount = await env.ADS_DB.prepare("SELECT COUNT(*) AS n FROM ads WHERE status = 'active' AND kind = ?").bind(kind).first();
   if (!activeCount || activeCount.n === 0) return json({ ad: null });
 
-  // One statement, one implicit D1 transaction: advance this kind's cursor to the
-  // next active ad of that kind past its current position, wrapping to the first
-  // one if the cursor's past the end — or leaving it unmoved (fallback to its own
-  // current value) in the never-expected case both subqueries miss.
-  // This is what makes concurrent taps each get a distinct ad
-  // instead of racing onto the same one.
-  const cursorRow = await env.ADS_DB.prepare(`
-    UPDATE ad_rotation_cursor_kind
-    SET position = COALESCE(
-      (SELECT rotation_order FROM ads WHERE status = 'active' AND kind = ad_rotation_cursor_kind.kind AND rotation_order > ad_rotation_cursor_kind.position ORDER BY rotation_order ASC LIMIT 1),
-      (SELECT rotation_order FROM ads WHERE status = 'active' AND kind = ad_rotation_cursor_kind.kind ORDER BY rotation_order ASC LIMIT 1),
-      ad_rotation_cursor_kind.position
-    )
-    WHERE kind = ?
-    RETURNING position
-  `).bind(kind).first();
-  if (!cursorRow) return json({ ad: null });
+  // An ad that can't be served right now (gone, owner blocked, hourly cap reached, page missing) is skipped and the next ad in
+  // rotation is tried, at most once around the pool, so a tap only falls back to the pristine template when nothing can be served.
+  const cap = await adViewHourCap(env, kind, activeCount.n);
+  const attempts = Math.min(activeCount.n, 10);
+  for (let i = 0; i < attempts; i++) {
+    // One statement, one implicit D1 transaction: advance this kind's cursor to the
+    // next active ad of that kind past its current position, wrapping to the first
+    // one if the cursor's past the end — or leaving it unmoved (fallback to its own
+    // current value) in the never-expected case both subqueries miss.
+    // This is what makes concurrent taps each get a distinct ad
+    // instead of racing onto the same one.
+    const cursorRow = await env.ADS_DB.prepare(`
+      UPDATE ad_rotation_cursor_kind
+      SET position = COALESCE(
+        (SELECT rotation_order FROM ads WHERE status = 'active' AND kind = ad_rotation_cursor_kind.kind AND rotation_order > ad_rotation_cursor_kind.position ORDER BY rotation_order ASC LIMIT 1),
+        (SELECT rotation_order FROM ads WHERE status = 'active' AND kind = ad_rotation_cursor_kind.kind ORDER BY rotation_order ASC LIMIT 1),
+        ad_rotation_cursor_kind.position
+      )
+      WHERE kind = ?
+      RETURNING position
+    `).bind(kind).first();
+    if (!cursorRow) return json({ ad: null });
 
-  const ad = await env.ADS_DB.prepare(
-    "SELECT slug FROM ads WHERE status = 'active' AND kind = ? AND rotation_order = ?"
-  ).bind(kind, cursorRow.position).first();
-  if (!ad) return json({ ad: null }); // lost a race against an unpublish between the two queries above — next tap retries
+    const ad = await env.ADS_DB.prepare(
+      "SELECT slug, owner_sub FROM ads WHERE status = 'active' AND kind = ? AND rotation_order = ?"
+    ).bind(kind, cursorRow.position).first();
+    if (!ad) continue; // lost a race against an unpublish between the two queries above — try the next one
 
-  // Never serve an ad whose page is gone (unpublished, taken down, or its
-  // owner's account was purged). Also heals rows from before handleUnpublish
-  // took ads down itself.
-  const meta = await getMeta(env, ad.slug);
-  if (!meta || meta.deletedAt) {
-    await env.ADS_DB.prepare("UPDATE ads SET status = 'unpublished', updated_at = ? WHERE slug = ? AND status = 'active'")
-      .bind(Date.now(), ad.slug).run();
-    return json({ ad: null }); // next tap moves on to the next ad
+    // Never serve an ad whose page is gone (unpublished, taken down, or its
+    // owner's account was purged). Also heals rows from before handleUnpublish
+    // took ads down itself.
+    const meta = await getMeta(env, ad.slug);
+    if (!meta || meta.deletedAt) {
+      await env.ADS_DB.prepare("UPDATE ads SET status = 'unpublished', updated_at = ? WHERE slug = ? AND status = 'active'")
+        .bind(Date.now(), ad.slug).run();
+      continue;
+    }
+    // A suspended (or deleting) owner's ads stay in the table but are never handed out; they run again if the account is restored.
+    if (await adOwnerBlocked(env, ad.owner_sub)) continue;
+    // A capped ad (see adViewHourCap) is not served until its hour rolls over.
+    if (await adViewHourFull(env, ad.slug, cap)) continue;
+    const obj = await env.NOTES_BUCKET.get(ad.slug + '.html');
+    if (!obj) continue;
+    return json({ ad: { slug: ad.slug, html: await obj.text(), viewToken: await issueAdViewToken(env, ad.slug) } });
   }
-  const obj = await env.NOTES_BUCKET.get(ad.slug + '.html');
-  if (!obj) return json({ ad: null });
-  return json({ ad: { slug: ad.slug, html: await obj.text() } });
+  return json({ ad: null });
 }
 
 // POST /ads/:slug/view — the edit-time decrement: called once the person
@@ -3162,10 +3793,28 @@ async function handleAdNext(env, request) {
 // counts the impression as before; it's just left out of the unique count.
 async function handleAdView(env, request, slug) {
   if (!validSlug(slug)) return textError(400, 'invalid slug');
+  if (!(await checkAdIpRateLimit(env, request, 'adview', AD_VIEW_RATE_MAX))) return json({ ok: true, counted: false, limited: true }, 429, { 'Retry-After': '60' });
   let body;
   try { body = await request.json(); } catch (e) { body = {}; }
   const viewerId = typeof body?.viewerId === 'string' ? body.viewerId.slice(0, MAX_VIEWER_ID_LEN) : null;
+  // Only a view that follows a served ad counts (see AD_VIEW_REQUIRE_TOKEN). Answered like any other uncounted view.
+  if (AD_VIEW_REQUIRE_TOKEN && !(await consumeAdViewToken(env, slug, body && body.viewToken))) return json({ ok: true, counted: false });
 
+  try { await ensureAdKind(env); } catch (e) { /* the kind column is only needed for the cap's pool size; no cap without it, see below */ }
+  const owner = await env.ADS_DB.prepare('SELECT owner_sub, kind FROM ads WHERE slug = ?').bind(slug).first().catch(() => null)
+    || await env.ADS_DB.prepare('SELECT owner_sub FROM ads WHERE slug = ?').bind(slug).first();
+  if (owner && await adOwnerBlocked(env, owner.owner_sub)) return json({ ok: true, counted: false });
+  // Same per-ad cap handleAdNext used, from how many ads of this kind are active now.
+  let cap = 1e9; // unknown ad or kind: nothing to cap against (the spend below fails on its own for an unknown slug)
+  if (owner && owner.kind) {
+    try {
+      const c = await env.ADS_DB.prepare("SELECT COUNT(*) AS n FROM ads WHERE status = 'active' AND kind = ?").bind(owner.kind).first();
+      cap = await adViewHourCap(env, owner.kind, c && c.n);
+    } catch (e) { /* no cap this time */ }
+  }
+  // One device can't stand in for many views, and a view from an established device is what the budget learns from.
+  if (viewerId && !(await checkAdDeviceRateLimit(env, viewerId))) return json({ ok: true, counted: false, limited: true });
+  if (!(await takeAdViewSlot(env, slug, cap, await adViewerEstablished(env, viewerId)))) return json({ ok: true, counted: false, capped: true });
   const row = await env.ADS_DB.prepare(`
     UPDATE ads
     SET views_used = views_used + 1,
@@ -3208,18 +3857,29 @@ const ALERT_REPEAT_NOTE = 'Repeated violations can lead to your account being su
 // name removal, suspension, and an ad being paused or taken down. Reports alone are not strikes, and
 // neither are lifts/resumes/refunds. Derived from the alerts table so it also covers past alerts.
 const STRIKE_SQL = "kind IN ('takedown','story','profile_picture','profile_name','suspended') OR (kind = 'ad' AND (message LIKE '%was paused%' OR message LIKE '%was taken down%'))";
+// What the ad hold counts: strikes an admin has not excused.
+const ACTIVE_STRIKE_SQL = 'excused_at IS NULL AND (' + STRIKE_SQL + ')';
 const STRIKE_KINDS = new Set(['takedown', 'story', 'profile_picture', 'profile_name', 'suspended']);
 function isStrikeAlert(kind, message) {
   if (STRIKE_KINDS.has(kind)) return true;
   return kind === 'ad' && /was paused|was taken down/.test(String(message || ''));
 }
+async function addColumnOnce(env, sql) {
+  try { await env.ADS_DB.prepare(sql).run(); }
+  catch (e) { if (!/duplicate column/i.test(String(e && e.message))) throw e; }
+}
 let alertsReady = null;
 function ensureAlerts(env) {
   if (!alertsReady) {
-    alertsReady = env.ADS_DB.batch([
-      env.ADS_DB.prepare('CREATE TABLE IF NOT EXISTS alerts (id TEXT PRIMARY KEY, sub TEXT NOT NULL, kind TEXT NOT NULL, message TEXT NOT NULL, ref TEXT, created_at INTEGER NOT NULL, dismissed_at INTEGER)'),
-      env.ADS_DB.prepare('CREATE INDEX IF NOT EXISTS alerts_sub_time ON alerts (sub, dismissed_at, created_at, id)')
-    ]).catch((e) => { alertsReady = null; throw e; });
+    alertsReady = (async () => {
+      await env.ADS_DB.batch([
+        env.ADS_DB.prepare('CREATE TABLE IF NOT EXISTS alerts (id TEXT PRIMARY KEY, sub TEXT NOT NULL, kind TEXT NOT NULL, message TEXT NOT NULL, ref TEXT, created_at INTEGER NOT NULL, dismissed_at INTEGER)'),
+        env.ADS_DB.prepare('CREATE INDEX IF NOT EXISTS alerts_sub_time ON alerts (sub, dismissed_at, created_at, id)')
+      ]);
+      // excused_at: set when an admin excuses a strike (e.g. a wrongful takedown). An excused strike stays on the record
+      // but no longer counts toward the ad hold. SQLite has no ADD COLUMN IF NOT EXISTS, so a duplicate-column error is expected after the first run.
+      await addColumnOnce(env, 'ALTER TABLE alerts ADD COLUMN excused_at INTEGER');
+    })().catch((e) => { alertsReady = null; throw e; });
   }
   return alertsReady;
 }
@@ -3291,6 +3951,7 @@ async function handleAlertsUnread(env, request) {
   const sub = await requireSession(env, request);
   if (!sub) return textError(401, 'sign-in required');
   await ensureAlerts(env);
+  await maybeNotifyAdUnlock(env, sub, AD_TIER_POLL_GAP_MS); // activity-based unlocks (active days) surface while the person is in the app
   const seen = parseInt((await env.ACCOUNTS.get(ALERTS_SEEN_PREFIX + sub)) || '0', 10) || 0;
   const row = await env.ADS_DB.prepare('SELECT COUNT(*) AS t, COALESCE(SUM(CASE WHEN created_at > ? THEN 1 ELSE 0 END), 0) AS n FROM alerts WHERE sub = ? AND dismissed_at IS NULL').bind(seen, sub).first();
   return json({ count: row ? row.n : 0, total: row ? row.t : 0 });
@@ -3414,7 +4075,7 @@ async function handleAdminReportsReindex(env, request) {
   return json({ ok: true, done, cursor: done ? null : phase + ':' + (kvCursor || ''), indexed: stmts.length });
 }
 
-// D1-backed report list. Filters (dismissed, reason, slug substring) and the sort run in SQL; the first
+// D1-backed report list. Filters (dismissed, reason, slug substring) and the sort (new | old | most reported | most_subs ... least_likes) run in SQL; the first
 // page also returns exact aggregates (agg) so the counts don't depend on how much is loaded. Status
 // (live / taken down / ...) lives in KV metadata, so that one filter stays client-side. Returns null on
 // any D1 failure so the caller can fall back to the KV walk.
@@ -3427,10 +4088,14 @@ async function handleAdminReportsIndexed(env, url) {
     const aid = adminAidQ(sp.get('q'));
     const q = aid ? '' : (sp.get('q') || '').toLowerCase().replace(/[^a-z0-9-]/g, '').slice(0, 48);
     const sp2 = sp.get('sort');
-    const sort = sp2 === 'old' || sp2 === 'most' ? sp2 : 'new';
+    // Count sorts: by the reported note's likes, or by its owner's subscribers / notes (a note with no owner or no likes counts 0).
+    // Pages whose reports include CSAM stay on top in every sort.
+    const cs = adminCountSort(sp2, '(SELECT pn.author_sub FROM published_notes pn WHERE pn.slug = report_index.slug)', 'report_index.slug');
+    const sort = cs ? 'count' : sp2 === 'old' || sp2 === 'most' ? sp2 : 'new';
+    const paged = sort === 'most' || sort === 'count'; // OFFSET paging: the order is not a plain column
     const cursorRaw = sp.get('cursor') || '';
-    const off = sort === 'most' ? Math.min(100000, Math.max(0, parseInt(cursorRaw, 10) || 0)) : 0;
-    const cur = sort === 'most' ? null : parseAdminCursor(cursorRaw);
+    const off = paged ? Math.min(100000, Math.max(0, parseInt(cursorRaw, 10) || 0)) : 0;
+    const cur = paged ? null : parseAdminCursor(cursorRaw);
     const dClause = dis ? 'dismissed_at IS NOT NULL' : 'dismissed_at IS NULL';
     const base = [dClause], bb = [];
     if (aid) {
@@ -3443,12 +4108,14 @@ async function handleAdminReportsIndexed(env, url) {
     const where = base.slice(), wb = bb.slice();
     if (reason) { where.push('reason = ?'); wb.push(reason); }
     if (cur) { where.push(sort === 'old' ? '(reported_at, key) > (?, ?)' : '(reported_at, key) < (?, ?)'); wb.push(cur.key, cur.id); }
-    const order = sort === 'most'
+    const order = sort === 'count'
+      ? '(SELECT MAX(r3.is_csam) FROM report_index r3 WHERE r3.slug = report_index.slug AND r3.' + dClause + ') DESC, ' + cs.expr + (cs.asc ? ' ASC' : ' DESC') + ', slug ASC, reported_at DESC, key DESC'
+      : sort === 'most'
       ? '(SELECT COUNT(*) FROM report_index r2 WHERE r2.slug = report_index.slug AND r2.' + dClause + ') DESC, slug ASC, reported_at DESC, key DESC'
       : sort === 'old' ? 'reported_at ASC, key ASC' : 'reported_at DESC, key DESC';
     const stmts = [
-      env.ADS_DB.prepare('SELECT key, slug, reason, is_csam, reported_at FROM report_index WHERE ' + where.join(' AND ') + ' ORDER BY ' + order + ' LIMIT ?' + (sort === 'most' ? ' OFFSET ?' : ''))
-        .bind(...wb, REPORT_INDEX_PAGE + 1, ...(sort === 'most' ? [off] : []))
+      env.ADS_DB.prepare('SELECT key, slug, reason, is_csam, reported_at' + (cs ? ', ' + cs.expr + ' AS sort_count' : '') + ' FROM report_index WHERE ' + where.join(' AND ') + ' ORDER BY ' + order + ' LIMIT ?' + (paged ? ' OFFSET ?' : ''))
+        .bind(...wb, REPORT_INDEX_PAGE + 1, ...(paged ? [off] : []))
     ];
     const first = !cursorRaw;
     if (first) {
@@ -3462,7 +4129,7 @@ async function handleAdminReportsIndexed(env, url) {
     const more = rows.length > REPORT_INDEX_PAGE;
     if (more) rows.pop();
     const last = rows[rows.length - 1];
-    const nextCursor = more && last ? (sort === 'most' ? String(off + REPORT_INDEX_PAGE) : last.reported_at + '|' + last.key) : null;
+    const nextCursor = more && last ? (paged ? String(off + REPORT_INDEX_PAGE) : last.reported_at + '|' + last.key) : null;
     const metas = new Map();
     const out = await Promise.all(rows.map(async (r) => {
       const raw = await env.REPORTS.get(r.key);
@@ -3473,7 +4140,7 @@ async function handleAdminReportsIndexed(env, url) {
       if (!metas.has(r.slug)) metas.set(r.slug, getMeta(env, r.slug));
       const meta = await metas.get(r.slug);
       return {
-        key: r.key, slug: r.slug, reportedAt: r.reported_at,
+        key: r.key, slug: r.slug, reportedAt: r.reported_at, sortCount: cs ? r.sort_count : undefined,
         reason: rec ? rec.reason : '?', details: rec ? rec.details : '',
         isCsam: !!(rec && rec.isCsam),
         dismissedAt: rec ? rec.dismissedAt || null : null,
@@ -4175,19 +4842,43 @@ async function handleAdminOwner(env, request, url) {
     await ensureAlerts(env);
     const ar = await env.ADS_DB.batch([
       env.ADS_DB.prepare('SELECT kind, message, created_at, dismissed_at FROM alerts WHERE sub = ? AND created_at >= ? ORDER BY created_at DESC, id DESC LIMIT 300').bind(sub, TREND_EPOCH),
-      env.ADS_DB.prepare('SELECT kind, message, created_at, dismissed_at FROM alerts WHERE sub = ? AND created_at >= ? AND (' + STRIKE_SQL + ') ORDER BY created_at ASC, id ASC LIMIT 300').bind(sub, TREND_EPOCH),
+      env.ADS_DB.prepare('SELECT id, kind, message, created_at, dismissed_at, excused_at FROM alerts WHERE sub = ? AND created_at >= ? AND (' + STRIKE_SQL + ') ORDER BY created_at ASC, id ASC LIMIT 300').bind(sub, TREND_EPOCH),
       env.ADS_DB.prepare('SELECT COUNT(*) AS n FROM alerts WHERE sub = ? AND created_at >= ?').bind(sub, TREND_EPOCH)
     ]);
     alertRows = ar[0].results || [];
     strikeRows = ar[1].results || [];
     alertTotal = ((ar[2].results || [])[0] || {}).n || 0;
   } catch (e) { console.log('admin alerts failed: ' + (e && e.message)); }
+  let adTier = null; // which ad package the account has earned (0 = none yet); see AD_TIERS
+  let referral = null;
+  try {
+    const adMet = await adMetrics(env, sub);
+    adTier = buildStanding(adMet).tier;
+    const [codeRow, byRow, kidRows] = await Promise.all([
+      env.ADS_DB.prepare('SELECT code FROM referral_codes WHERE sub = ?').bind(sub).first(),
+      env.ADS_DB.prepare('SELECT r.referrer_sub, r.created_at, r.voided_at, r.void_reason, a.author_id FROM referrals r LEFT JOIN authors a ON a.sub = r.referrer_sub WHERE r.referred_sub = ?').bind(sub).first(),
+      env.ADS_DB.prepare(
+        "SELECT r.referred_sub, r.created_at, r.voided_at, r.void_reason, a.author_id, EXISTS (SELECT 1 FROM published_notes p WHERE p.author_sub = r.referred_sub) AS pub, " +
+        "(SELECT COUNT(*) FROM activity_daily d WHERE d.id = 'u:' || r.referred_sub) AS days FROM referrals r LEFT JOIN authors a ON a.sub = r.referred_sub WHERE r.referrer_sub = ? ORDER BY r.created_at DESC LIMIT 20"
+      ).bind(sub).all()
+    ]);
+    const emailOf = async (x) => { try { const u = await getUser(env, x); return u ? u.email || null : null; } catch (e) { return null; } };
+    referral = {
+      code: codeRow ? codeRow.code : null,
+      invited: adMet.referralsTotal, qualified: adMet.referralsQualified,
+      referredBy: byRow ? { email: await emailOf(byRow.referrer_sub), authorId: byRow.author_id || null, at: byRow.created_at, voidedAt: byRow.voided_at || null, voidReason: byRow.void_reason || null } : null,
+      referred: await Promise.all(((kidRows && kidRows.results) || []).map(async (r) => ({
+        email: await emailOf(r.referred_sub), authorId: r.author_id || null, at: r.created_at,
+        voidedAt: r.voided_at || null, voidReason: r.void_reason || null, counts: !r.voided_at && !!r.pub && r.days >= 2
+      })))
+    };
+  } catch (e) { console.log('admin ad tier failed: ' + (e && e.message)); }
   return json({
     authorId,
     alerts: alertRows.map(r => ({ kind: r.kind, message: r.message, at: r.created_at, dismissedAt: r.dismissed_at || null, strike: isStrikeAlert(r.kind, r.message) })),
     alertTotal,
-    strikes: strikeRows.map(r => ({ kind: r.kind, message: r.message, at: r.created_at, dismissedAt: r.dismissed_at || null })),
-    strikeCount: strikeRows.length,
+    strikes: strikeRows.map(r => ({ id: r.id, kind: r.kind, message: r.message, at: r.created_at, dismissedAt: r.dismissed_at || null, excusedAt: r.excused_at || null, counting: !r.excused_at && r.created_at > Date.now() - AD_STRIKE_WINDOW_MS })),
+    strikeCount: strikeRows.filter(r => !r.excused_at).length,
     reportStats,
     email: user ? user.email : null, createdAt: user ? user.createdAt || null : null,
     displayName: user ? user.profileName || null : null, hasProfileImage: !!(user && user.hasProfileImage),
@@ -4196,7 +4887,7 @@ async function handleAdminOwner(env, request, url) {
     lastSignInAt: user ? user.lastSignInAt || null : null,
     suspended: !!(user && user.suspended), pendingDeletionAt: user ? user.pendingDeletionAt || null : null,
     pages, ads: adsRow ? adsRow.n : 0, creditBalance: balance,
-    subscribers: subRow ? subRow.n : 0, likes: likesTotal
+    subscribers: subRow ? subRow.n : 0, likes: likesTotal, adTier, referral
   });
 }
 
@@ -4229,6 +4920,8 @@ async function handleAdminOwnerAction(env, request) {
   } else return textError(400, 'invalid action');
   await putUser(env, sub, user);
   if (action === 'suspend' || action === 'delete') await revokeAllSessions(env, sub);
+  if (action === 'suspend' || action === 'delete') await syncReferralAccountState(env, sub, true);
+  else if (action === 'unsuspend' || action === 'cancel-delete') await syncReferralAccountState(env, sub, !!(user.suspended || user.pendingDeletionAt));
   await audit(env, 'owner_' + action, slug, reason || null);
   const ownerAlert = {
     'clear-picture': ['profile_picture', 'Your profile picture was removed. ' + alertReason(reason) + ' You can upload a new one. ' + ALERT_REPEAT_NOTE],
@@ -4239,6 +4932,72 @@ async function handleAdminOwnerAction(env, request) {
   if (ownerAlert) await createAlert(env, sub, ownerAlert[0], ownerAlert[1]);
   else if (action === 'cancel-delete' && !user.adminDeleted && wasAdminDeleted) await createAlert(env, sub, 'unsuspended', 'Your account deletion was cancelled and your account restored. ' + ALERT_REPEAT_NOTE);
   return json({ ok: true, suspended: !!user.suspended, pendingDeletionAt: user.pendingDeletionAt || null });
+}
+
+// POST /admin/strike {slug, id, action, reason}: "excuse" stops one strike alert counting toward the ad hold (a wrongful takedown, say);
+// "restore" makes it count again. The alert itself stays on the record, marked excused. The owner is told either way, and the
+// excuse re-checks their standing right away so a lifted hold is announced now instead of at the next poll.
+async function handleAdminStrike(env, request) {
+  const g = await adminGate(env, request); if (g) return g;
+  const body = await adminBody(request);
+  const slug = typeof body.slug === 'string' ? body.slug.toLowerCase() : '';
+  if (!SLUG_RE.test(slug)) return textError(400, 'invalid slug');
+  const id = typeof body.id === 'string' ? body.id : '';
+  if (!/^[0-9a-f-]{36}$/.test(id)) return textError(400, 'invalid alert id');
+  const action = body.action;
+  if (action !== 'excuse' && action !== 'restore') return textError(400, 'invalid action');
+  const reason = adminReasonOf(body);
+  if (action === 'excuse' && !reason) return textError(400, 'reason required');
+  const meta = await getMeta(env, slug);
+  if (!meta || !meta.ownerSub) return textError(404, 'no account for this slug');
+  const sub = meta.ownerSub;
+  await ensureAlerts(env);
+  const row = await env.ADS_DB.prepare('SELECT kind, message, excused_at FROM alerts WHERE id = ? AND sub = ?').bind(id, sub).first();
+  if (!row || !isStrikeAlert(row.kind, row.message)) return textError(404, 'strike not found for this account');
+  if (action === 'excuse' && row.excused_at) return textError(409, 'already excused');
+  if (action === 'restore' && !row.excused_at) return textError(409, 'not excused');
+  await env.ADS_DB.prepare('UPDATE alerts SET excused_at = ? WHERE id = ? AND sub = ?').bind(action === 'excuse' ? Date.now() : null, id, sub).run();
+  await audit(env, 'strike_' + action, slug, (reason || '') + ' [' + id.slice(0, 8) + ']');
+  if (action === 'excuse') await createAlert(env, sub, 'excused', 'A strike on your account was excused and no longer counts against your ad access. ' + alertReason(reason));
+  else await createAlert(env, sub, 'excused', 'A strike that had been excused was reinstated, so it counts toward your ad access again until it is 60 days old.');
+  await maybeNotifyAdUnlock(env, sub, 0);
+  return json({ ok: true });
+}
+
+// POST /admin/referral {slug, action: 'void'|'restore', reason, aid?}: a referral that should not count toward ad access (fraud, a fake account).
+// slug is any page of the account: with no aid it is the REFERRED account's own referral; with aid (a referred account's author ID)
+// it is that account's referral to the slug's owner. A referral voided because its account is suspended returns by itself and can't be restored here.
+async function handleAdminReferral(env, request) {
+  const g = await adminGate(env, request); if (g) return g;
+  const body = await adminBody(request);
+  const slug = typeof body.slug === 'string' ? body.slug.toLowerCase() : '';
+  if (!SLUG_RE.test(slug)) return textError(400, 'invalid slug');
+  const action = body.action;
+  if (action !== 'void' && action !== 'restore') return textError(400, 'invalid action');
+  const reason = adminReasonOf(body);
+  if (action === 'void' && !reason) return textError(400, 'reason required');
+  const meta = await getMeta(env, slug);
+  if (!meta || !meta.ownerSub) return textError(404, 'no account for this slug');
+  await ensureAdStanding(env);
+  let referred = meta.ownerSub;
+  const aid = adminAidQ(body.aid);
+  if (aid) { referred = await adminSubFromAid(env, aid); if (!referred) return textError(404, 'no account for that author ID'); }
+  const row = await env.ADS_DB.prepare('SELECT referrer_sub, voided_at, void_reason FROM referrals WHERE referred_sub = ?').bind(referred).first();
+  if (!row || (aid && row.referrer_sub !== meta.ownerSub)) return textError(404, 'referral not found');
+  if (action === 'void') {
+    if (row.voided_at && row.void_reason === 'admin') return textError(409, 'already voided');
+    await env.ADS_DB.prepare("UPDATE referrals SET voided_at = ?, void_reason = 'admin' WHERE referred_sub = ?").bind(Date.now(), referred).run();
+  } else {
+    if (!row.voided_at) return textError(409, 'not voided');
+    if (row.void_reason !== 'admin') return textError(409, 'this referral is paused because the account is suspended or being deleted; it returns when that ends');
+    await env.ADS_DB.prepare('UPDATE referrals SET voided_at = NULL, void_reason = NULL WHERE referred_sub = ?').bind(referred).run();
+  }
+  await audit(env, 'referral_' + action, slug, (reason || '') + (aid ? ' [' + aid.slice(0, 10) + ']' : ''));
+  await createAlert(env, row.referrer_sub, 'referral', action === 'void'
+    ? 'A friend\u2019s invite no longer counts toward your ad access. ' + alertReason(reason)
+    : 'A friend\u2019s invite counts toward your ad access again.');
+  await maybeNotifyAdUnlock(env, row.referrer_sub, 0);
+  return json({ ok: true });
 }
 
 // POST /admin/story {slug, action}: "remove" pulls a page out of stories (page stays online)
@@ -4276,14 +5035,16 @@ async function handleAdminStory(env, request) {
   return json({ ok: true });
 }
 
-// GET /admin/ads?status=&kind=write|share&q=&cursor= (q: slug part or author ID): ads across all accounts, newest first, keyset-paginated.
+// GET /admin/ads?status=&kind=write|share&sort=new|most_subs|least_subs|most_posts|least_posts|most_likes|least_likes&q=&cursor= (q: slug part or author ID): ads across all
+// accounts, newest first unless sorted by the ad note's likes or the owner's subscriber or note count (newest first inside each count), keyset-paginated.
 const ADMIN_ADS_PAGE = 30;
 async function handleAdminAds(env, request, url) {
   const g = await adminGate(env, request); if (g) return g;
   await ensureAdminIndexes(env);
   await ensureAdKind(env);
   const status = url.searchParams.get('status') || '';
-  const cur = parseAdminCursor(url.searchParams.get('cursor'));
+  const cs = adminCountSort(url.searchParams.get('sort'), 'a.owner_sub', 'a.slug');
+  const cur = cs ? parseCountCursor(url.searchParams.get('cursor')) : parseAdminCursor(url.searchParams.get('cursor'));
   const filter = ['active', 'paused', 'exhausted', 'unpublished'].includes(status);
   const kindQ = url.searchParams.get('kind');
   const kindFilter = kindQ === 'write' || kindQ === 'share';
@@ -4295,15 +5056,20 @@ async function handleAdminAds(env, request, url) {
   if (aid) { where.push('a.owner_sub = ?'); b.push((await adminSubFromAid(env, aid)) || ''); }
   else if (q) { where.push('a.slug LIKE ?'); b.push('%' + q + '%'); }
   const w = where.length ? ' WHERE ' + where.join(' AND ') : '';
-  const curSql = cur ? (where.length ? ' AND ' : ' WHERE ') + '(a.created_at, a.slug) < (?, ?)' : '';
+  const sep = where.length ? ' AND ' : ' WHERE ';
+  const curSql = !cur ? '' : cs
+    ? sep + '(' + cs.expr + (cs.asc ? ' > ' : ' < ') + '? OR (' + cs.expr + ' = ? AND (a.created_at, a.slug) < (?, ?)))'
+    : sep + '(a.created_at, a.slug) < (?, ?)';
+  const curBind = !cur ? [] : cs ? [cur.key, cur.key, cur.at, cur.slug] : [cur.key, cur.id];
+  const order = (cs ? cs.expr + (cs.asc ? ' ASC' : ' DESC') + ', ' : '') + 'a.created_at DESC, a.slug DESC';
   // LIMIT+1 tells us whether another page exists without a second query; the total (first page only)
   // feeds the "of N" count.
   const stmts = [
     env.ADS_DB.prepare(
       'SELECT a.slug, a.owner_sub, a.views_total, a.views_used, a.status, a.created_at, a.kind, ' +
-      '(SELECT COUNT(*) FROM ad_viewers v WHERE v.slug = a.slug) AS unique_viewers ' +
-      'FROM ads a' + w + curSql + ' ORDER BY a.created_at DESC, a.slug DESC LIMIT ?'
-    ).bind(...b, ...(cur ? [cur.key, cur.id] : []), ADMIN_ADS_PAGE + 1)
+      '(SELECT COUNT(*) FROM ad_viewers v WHERE v.slug = a.slug) AS unique_viewers, ' + adminAuthorCols('a.owner_sub') + ', (SELECT COUNT(*) FROM likes xl WHERE xl.slug = a.slug) AS likes' + (cs ? ', ' + cs.expr + ' AS sort_key' : '') + ' ' +
+      'FROM ads a' + w + curSql + ' ORDER BY ' + order + ' LIMIT ?'
+    ).bind(...b, ...curBind, ADMIN_ADS_PAGE + 1)
   ];
   if (!cur) stmts.unshift(env.ADS_DB.prepare('SELECT COUNT(*) AS t FROM ads a' + w).bind(...b));
   const res = await env.ADS_DB.batch(stmts);
@@ -4320,10 +5086,11 @@ async function handleAdminAds(env, request, url) {
   return json({
     ads: rows.map(r => ({
       slug: r.slug, ownerEmail: emails[r.owner_sub], viewsTotal: r.views_total, viewsUsed: r.views_used,
-      status: r.status, createdAt: r.created_at, uniqueViewers: r.unique_viewers, kind: r.kind === 'share' ? 'share' : 'write'
+      status: r.status, createdAt: r.created_at, uniqueViewers: r.unique_viewers, kind: r.kind === 'share' ? 'share' : 'write',
+      ownerSubs: r.author_subs, ownerNotes: r.author_notes, likes: r.likes
     })),
     total: cur ? null : res[0].results[0].t,
-    next: more && last ? last.created_at + '|' + last.slug : null
+    next: more && last ? (cs ? last.sort_key + '|' + last.created_at + ':' + last.slug : last.created_at + '|' + last.slug) : null
   });
 }
 
@@ -4361,6 +5128,7 @@ async function handleAdminAd(env, request) {
       await set('active', 'paused');
     } else if (body.action === 'resume') {
       if (ad.status !== 'paused') return textError(409, 'ad is not paused');
+      if (await adOwnerBlocked(env, ad.owner_sub)) return textError(409, 'the owner account is suspended or being deleted');
       await set('paused', 'active');
     } else if (body.action === 'takedown') {
       if (ad.status !== 'active' && ad.status !== 'paused') return textError(409, 'ad is not running');
@@ -4561,23 +5329,27 @@ const ALERT_ID_SQL = "lower(hex(randomblob(4)) || '-' || hex(randomblob(2)) || '
 function caSearch(raw) {
   return String(raw || '').trim().toLowerCase().replace(/^@/, '').replace(/[^a-z0-9_]/g, '').slice(0, 34);
 }
-// One page of recipients (sql yields column s), newest accounts first, shaped like GET /admin/users rows. With a search q it
+// One page of recipients (sql yields column s), newest accounts first (or by body.sort: most_subs|least_subs|most_posts|least_posts|most_likes|least_likes), shaped like GET /admin/users rows. With a search q it
 // also reports how many recipients match (found) and, for a whole author ID, whether that account is one of them (check:
 // 'in' | 'out' | 'unknown' for an ID that belongs to no account).
 async function caRecipientPage(env, sql, bind, count, body) {
   const cur = parseAdminCursor(body.cursor);
   const q = caSearch(body.q);
+  const cs = adminCountSort(body.sort, 'a.sub');
+  const keyExpr = cs ? cs.expr : 'a.created_at', asc = !!(cs && cs.asc);
   const res = await env.ADS_DB.prepare(
-    'SELECT a.sub, a.author_id, a.created_at, p.last_seen, (SELECT COUNT(*) FROM published_notes n WHERE n.author_sub = a.sub) AS notes' +
+    'SELECT a.sub, a.author_id, a.created_at, p.last_seen, (SELECT COUNT(*) FROM published_notes n WHERE n.author_sub = a.sub) AS notes, ' +
+    '(SELECT COUNT(*) FROM subscriptions sb WHERE sb.author_sub = a.sub) AS subs, ' +
+      '(SELECT COUNT(*) FROM likes lk WHERE lk.author_sub = a.sub) AS likes' +
     " FROM authors a LEFT JOIN presence p ON p.id = 'u:' || a.sub WHERE a.sub IN (" + sql + ')' +
     (q ? ' AND instr(a.author_id, ?) > 0' : '') +
-    (cur ? ' AND (a.created_at, a.sub) < (?, ?)' : '') + ' ORDER BY a.created_at DESC, a.sub DESC LIMIT ?'
+    (cur ? ' AND (' + keyExpr + ', a.sub) ' + (asc ? '>' : '<') + ' (?, ?)' : '') + ' ORDER BY ' + keyExpr + (asc ? ' ASC' : ' DESC') + ', a.sub' + (asc ? ' ASC' : ' DESC') + ' LIMIT ?'
   ).bind(...bind, ...(q ? [q] : []), ...(cur ? [cur.key, cur.id] : []), ADMIN_DIR_PAGE + 1).all();
   const rows = res.results || [];
   const more = rows.length > ADMIN_DIR_PAGE;
   if (more) rows.pop();
   const last = rows[rows.length - 1];
-  const out = { users: await adminUserRows(env, rows, Date.now()), count, next: more && last ? last.created_at + '|' + last.sub : null };
+  const out = { users: await adminUserRows(env, rows, Date.now()), count, next: more && last ? (cs ? last[cs.col] : last.created_at) + '|' + last.sub : null };
   if (q && !cur) {
     const f = await env.ADS_DB.prepare('SELECT COUNT(*) AS n FROM authors a WHERE a.sub IN (' + sql + ') AND instr(a.author_id, ?) > 0').bind(...bind, q).first();
     out.found = f ? f.n : 0;
@@ -4855,7 +5627,7 @@ async function ownerReportStats(env, sub, slugs0) {
   } catch (e) { console.log('owner report stats failed: ' + (e && e.message)); return null; }
 }
 
-// GET /admin/users?cursor=&q=&sort=new|old|active&f=online|active24: accounts, keyset-paginated (no
+// GET /admin/users?cursor=&q=&sort=new|old|active|most_subs|least_subs|most_posts|least_posts|most_likes|least_likes&f=online|active24: accounts, keyset-paginated (no
 // OFFSET, so deep pages cost the same as the first). The total is only computed on the first page
 // (no cursor); the client keeps it. q matches the start of the account id or author id (emails live
 // in KV, so they can't be searched, only shown).
@@ -4877,7 +5649,10 @@ function ensureAdminIndexes(env) {
       'CREATE INDEX IF NOT EXISTS admin_ads_status_created ON ads (status, created_at, slug)',
       'CREATE INDEX IF NOT EXISTS admin_ads_owner ON ads (owner_sub)',
       'CREATE INDEX IF NOT EXISTS admin_ads_rotation ON ads (status, rotation_order)',
-      'CREATE INDEX IF NOT EXISTS admin_viewers_slug ON ad_viewers (slug)'
+      'CREATE INDEX IF NOT EXISTS admin_viewers_slug ON ad_viewers (slug)',
+      'CREATE INDEX IF NOT EXISTS admin_subs_author ON subscriptions (author_sub)',
+      'CREATE INDEX IF NOT EXISTS admin_likes_slug ON likes (slug)',
+      'CREATE INDEX IF NOT EXISTS admin_likes_author ON likes (author_sub)'
     ];
     adminIndexesReady = Promise.all(ix.map((sql) => env.ADS_DB.prepare(sql).run().catch(() => null)));
   }
@@ -4903,6 +5678,36 @@ function parseAdminCursor(raw) {
   const id = raw.slice(i + 1).slice(0, 200);
   return Number.isFinite(key) && id ? { key, id } : null;
 }
+// Count sorts shared by the admin lists (sort=most_subs|least_subs|most_posts|least_posts|most_likes|least_likes): by how many subscribers or
+// published notes an account has. col = the account column of the row being sorted; the expression is repeated in the
+// cursor test so keyset paging stays exact. Own-property check, so a sort of "constructor" can't match.
+const ADMIN_COUNT_SORTS = {
+  most_subs: { t: 'subscriptions', col: 'subs', asc: false }, least_subs: { t: 'subscriptions', col: 'subs', asc: true },
+  most_posts: { t: 'published_notes', col: 'notes', asc: false }, least_posts: { t: 'published_notes', col: 'notes', asc: true },
+  most_likes: { t: 'likes', col: 'likes', asc: false }, least_likes: { t: 'likes', col: 'likes', asc: true }
+};
+// slugCol (optional) is the note's slug column for lists whose rows are notes (notes, ads, reports): a likes sort then counts that
+// note's own likes. Without it, likes are everything the account's notes have received. Subscriber / note sorts always count the account.
+function adminCountSort(sort, col, slugCol) {
+  if (typeof sort !== 'string' || !Object.prototype.hasOwnProperty.call(ADMIN_COUNT_SORTS, sort)) return null;
+  const s = ADMIN_COUNT_SORTS[sort];
+  if (s.t === 'likes') return { col: s.col, asc: s.asc, expr: '(SELECT COUNT(*) FROM likes ct WHERE ct.' + (slugCol ? 'slug = ' + slugCol : 'author_sub = ' + col) + ')' };
+  return { col: s.col, asc: s.asc, expr: '(SELECT COUNT(*) FROM ' + s.t + ' ct WHERE ct.author_sub = ' + col + ')' };
+}
+// An account's follower and note counts, as extra columns for lists whose rows belong to an account (col).
+function adminAuthorCols(col) {
+  return '(SELECT COUNT(*) FROM subscriptions xs WHERE xs.author_sub = ' + col + ') AS author_subs, ' +
+    '(SELECT COUNT(*) FROM published_notes xn WHERE xn.author_sub = ' + col + ') AS author_notes';
+}
+// Lists keyed by (created_at, slug) that sort by a count keep newest first inside each count, so their cursor is
+// "<count>|<created_at>:<slug>"; null when malformed (the list just restarts).
+function parseCountCursor(raw) {
+  const c = parseAdminCursor(raw);
+  const i = c ? c.id.indexOf(':') : -1;
+  if (i < 1) return null;
+  const at = Number(c.id.slice(0, i)), slug = c.id.slice(i + 1);
+  return Number.isFinite(at) && slug ? { key: c.key, at, slug } : null;
+}
 async function handleAdminUsers(env, request, url) {
   const g = await adminGate(env, request); if (g) return g;
   await ensurePresence(env);
@@ -4919,13 +5724,16 @@ async function handleAdminUsers(env, request, url) {
   else if (f === 'active24') { where.push('p.last_seen >= ?'); bind.push(now - 24 * 60 * 60 * 1000); }
   const from = " FROM authors a LEFT JOIN presence p ON p.id = 'u:' || a.sub";
   const whereSql = where.length ? ' WHERE ' + where.join(' AND ') : '';
-  const asc = sort === 'old';
-  const keyExpr = sort === 'active' ? 'COALESCE(p.last_seen, 0)' : 'a.created_at';
+  const cs = adminCountSort(sort, 'a.sub');
+  const asc = cs ? cs.asc : sort === 'old';
+  const keyExpr = cs ? cs.expr : sort === 'active' ? 'COALESCE(p.last_seen, 0)' : 'a.created_at';
   const order = keyExpr + (asc ? ' ASC' : ' DESC') + ', a.sub' + (asc ? ' ASC' : ' DESC');
   const curSql = cur ? (where.length ? ' AND ' : ' WHERE ') + '(' + keyExpr + ', a.sub) ' + (asc ? '>' : '<') + ' (?, ?)' : '';
   const stmts = [
     env.ADS_DB.prepare(
-      'SELECT a.sub, a.author_id, a.created_at, p.last_seen, (SELECT COUNT(*) FROM published_notes n WHERE n.author_sub = a.sub) AS notes' +
+      'SELECT a.sub, a.author_id, a.created_at, p.last_seen, (SELECT COUNT(*) FROM published_notes n WHERE n.author_sub = a.sub) AS notes, ' +
+      '(SELECT COUNT(*) FROM subscriptions sb WHERE sb.author_sub = a.sub) AS subs, ' +
+      '(SELECT COUNT(*) FROM likes lk WHERE lk.author_sub = a.sub) AS likes' +
       from + whereSql + curSql + ' ORDER BY ' + order + ' LIMIT ?'
     ).bind(...bind, ...(cur ? [cur.key, cur.id] : []), ADMIN_DIR_PAGE + 1)
   ];
@@ -4936,40 +5744,69 @@ async function handleAdminUsers(env, request, url) {
   const more = rows.length > ADMIN_DIR_PAGE;
   if (more) rows.pop();
   const last = rows[rows.length - 1];
-  const next = more && last ? (sort === 'active' ? (last.last_seen || 0) : last.created_at) + '|' + last.sub : null;
+  const next = more && last ? (cs ? last[cs.col] : sort === 'active' ? (last.last_seen || 0) : last.created_at) + '|' + last.sub : null;
   return json({ users: await adminUserRows(env, rows, now), total, next });
 }
 // Directory rows (admin Users list and the custom-alert recipient list): the D1 row plus what lives in the KV user record.
 async function adminUserRows(env, rows, now) {
+  // Who referred each account (referrals) and each account's own invite code (referral_codes). Both tables are created lazily,
+  // so a failure here just means no referral data yet.
+  const refBy = new Map(), codes = new Map();
+  if (rows.length) {
+    const subs = rows.map((r) => r.sub), ph = subs.map(() => '?').join(',');
+    try {
+      const [rf, cd] = await env.ADS_DB.batch([
+        env.ADS_DB.prepare('SELECT r.referred_sub, r.referrer_sub, a.author_id FROM referrals r LEFT JOIN authors a ON a.sub = r.referrer_sub WHERE r.referred_sub IN (' + ph + ')').bind(...subs),
+        env.ADS_DB.prepare('SELECT sub, code FROM referral_codes WHERE sub IN (' + ph + ')').bind(...subs)
+      ]);
+      for (const x of rf.results || []) refBy.set(x.referred_sub, x);
+      for (const x of cd.results || []) codes.set(x.sub, x.code);
+    } catch (e) {}
+  }
   return Promise.all(rows.map(async (r) => {
     let u = null;
     try { u = await getUserCached(env, r.sub); } catch (e) {}
+    let referredBy = null;
+    const rb = refBy.get(r.sub);
+    if (rb) {
+      let ru = null;
+      try { ru = await getUserCached(env, rb.referrer_sub); } catch (e) {}
+      referredBy = { email: (ru && ru.email) || null, authorId: rb.author_id || null };
+    }
     return {
+      referredBy, referralCode: codes.get(r.sub) || null,
       authorId: r.author_id || null,
       email: u ? u.email || null : null, name: u ? u.profileName || null : null, lastSignInAt: u ? u.lastSignInAt || null : null,
-      createdAt: r.created_at, lastSeen: r.last_seen || null, notes: r.notes,
+      createdAt: r.created_at, lastSeen: r.last_seen || null, notes: r.notes, subs: r.subs, likes: r.likes,
       online: !!(r.last_seen && now - r.last_seen < ONLINE_WINDOW_MS),
       suspended: !!(u && u.suspended && !u.pendingDeletionAt), deleting: !!(u && u.pendingDeletionAt)
     };
   }));
 }
 
-// GET /admin/notes?cursor=&q=: published notes (signed-in publishers), newest first, keyset-paginated;
+// GET /admin/notes?cursor=&q=&sort=new|most_subs|least_subs|most_posts|least_posts|most_likes|least_likes: published notes (signed-in publishers), newest
+// first unless sorted by the note's likes or its author's subscriber or note count (newest first inside each count), keyset-paginated;
 // total on the first page only. q matches the start of the slug.
 async function handleAdminNotes(env, request, url) {
   const g = await adminGate(env, request); if (g) return g;
   await ensureAdminIndexes(env);
   const sp = url.searchParams;
-  const cur = parseAdminCursor(sp.get('cursor'));
+  const cs = adminCountSort(sp.get('sort'), 'n.author_sub', 'n.slug');
+  const cur = cs ? parseCountCursor(sp.get('cursor')) : parseAdminCursor(sp.get('cursor'));
   const aid = adminAidQ(sp.get('q'));
   const q = aid ? '' : (sp.get('q') || '').toLowerCase().replace(/[^a-z0-9-]/g, '').slice(0, 48);
   const from = ' FROM published_notes n LEFT JOIN stories s ON s.slug = n.slug';
   const whereSql = aid ? ' WHERE n.author_sub = ?' : q ? ' WHERE n.slug LIKE ?' : '';
   const bind = aid ? [(await adminSubFromAid(env, aid)) || ''] : q ? [q + '%'] : [];
-  const curSql = cur ? ((aid || q) ? ' AND ' : ' WHERE ') + '(n.created_at, n.slug) < (?, ?)' : '';
+  const sep = (aid || q) ? ' AND ' : ' WHERE ';
+  const curSql = !cur ? '' : cs
+    ? sep + '(' + cs.expr + (cs.asc ? ' > ' : ' < ') + '? OR (' + cs.expr + ' = ? AND (n.created_at, n.slug) < (?, ?)))'
+    : sep + '(n.created_at, n.slug) < (?, ?)';
+  const curBind = !cur ? [] : cs ? [cur.key, cur.key, cur.at, cur.slug] : [cur.key, cur.id];
+  const order = (cs ? cs.expr + (cs.asc ? ' ASC' : ' DESC') + ', ' : '') + 'n.created_at DESC, n.slug DESC';
   const stmts = [
-    env.ADS_DB.prepare('SELECT n.slug, n.created_at, s.title, (s.slug IS NOT NULL) AS story' + from + whereSql + curSql + ' ORDER BY n.created_at DESC, n.slug DESC LIMIT ?')
-      .bind(...bind, ...(cur ? [cur.key, cur.id] : []), ADMIN_DIR_PAGE + 1)
+    env.ADS_DB.prepare('SELECT n.slug, n.created_at, s.title, (s.slug IS NOT NULL) AS story, (SELECT COUNT(*) FROM likes xl WHERE xl.slug = n.slug) AS likes, ' + adminAuthorCols('n.author_sub') + (cs ? ', ' + cs.expr + ' AS sort_key' : '') + from + whereSql + curSql + ' ORDER BY ' + order + ' LIMIT ?')
+      .bind(...bind, ...curBind, ADMIN_DIR_PAGE + 1)
   ];
   if (!cur) stmts.unshift(env.ADS_DB.prepare('SELECT COUNT(*) AS t' + from + whereSql).bind(...bind));
   const res = await env.ADS_DB.batch(stmts);
@@ -4978,9 +5815,9 @@ async function handleAdminNotes(env, request, url) {
   if (more) rows.pop();
   const last = rows[rows.length - 1];
   return json({
-    notes: rows.map(r => ({ slug: r.slug, title: r.title || null, createdAt: r.created_at, story: !!r.story })),
+    notes: rows.map(r => ({ slug: r.slug, title: r.title || null, createdAt: r.created_at, story: !!r.story, authorSubs: r.author_subs, authorNotes: r.author_notes, likes: r.likes })),
     total: cur ? null : res[0].results[0].t,
-    next: more && last ? last.created_at + '|' + last.slug : null
+    next: more && last ? (cs ? last.sort_key + '|' + last.created_at + ':' + last.slug : last.created_at + '|' + last.slug) : null
   });
 }
 
@@ -5421,6 +6258,7 @@ select.field::-ms-expand{display:none}
 .sheet-top{flex:none;margin:0 0 6px;padding:0 0 12px;border-bottom:1px solid var(--line)}
 .sheet-top .ptitle{margin:0 0 4px}
 .sheet-top .search{margin:10px 0 0}
+.sheet-top .filters{margin:8px 0 0;padding:0 0 2px}
 .rsub,.rcnt{font-size:13px;color:var(--muted)}
 .rsub:empty,.rcnt:empty,.rchk:empty{display:none}
 .rsub{margin:0 0 2px}
@@ -5571,6 +6409,7 @@ body[data-auth=out] #msg{bottom:calc(24px + env(safe-area-inset-bottom,0px))}
       <div class="filters" id="ovfil">
         <span class="sel"><button type="button" class="pick" id="ovsort" aria-label="Sort" aria-haspopup="listbox" value="new">Newest first</button><span class="ico" data-i="chev"></span></span>
         <span class="sel"><button type="button" class="pick" id="ovfilter" aria-label="Show" aria-haspopup="listbox" value="">All users</button><span class="ico" data-i="chev"></span></span>
+        <span class="sel" hidden><button type="button" class="pick" id="ovnsort" aria-label="Sort" aria-haspopup="listbox" value="new">Newest first</button><span class="ico" data-i="chev"></span></span>
       </div>
       <div class="sec-t" id="ovcount"></div>
       <div id="ovlist"></div>
@@ -5587,7 +6426,7 @@ body[data-auth=out] #msg{bottom:calc(24px + env(safe-area-inset-bottom,0px))}
       <div class="search"><div class="field-wrap"><span class="ico" data-i="search"></span><input class="field" id="fq" placeholder="Filter by slug or author ID" autocomplete="off" autocapitalize="off" spellcheck="false"></div></div>
       <div class="filters">
         <span class="sel"><button type="button" class="pick" id="fstatus" aria-label="Status" aria-haspopup="listbox" value="">Any status</button><span class="ico" data-i="chev"></span></span>
-        <span class="sel"><button type="button" class="pick" id="fsort" aria-label="Sort" aria-haspopup="listbox" value="new">Newest first</button><span class="ico" data-i="chev"></span></span>
+        <span class="sel"><button type="button" class="pick" id="fsort" aria-label="Sort" aria-haspopup="listbox" value="new">Default order</button><span class="ico" data-i="chev"></span></span>
         <label class="pillck"><input type="checkbox" id="fgroup" checked><span>Group by slug</span></label>
         <label class="pillck"><input type="checkbox" id="fdis"><span>Dismissed</span></label>
       </div>
@@ -5610,6 +6449,7 @@ body[data-auth=out] #msg{bottom:calc(24px + env(safe-area-inset-bottom,0px))}
       <div class="filters">
         <span class="sel"><button type="button" class="pick" id="adst" aria-label="Ad status" aria-haspopup="listbox" value="">All ads</button><span class="ico" data-i="chev"></span></span>
         <span class="sel"><button type="button" class="pick" id="adkind" aria-label="Ad type" aria-haspopup="listbox" value="">Write &amp; Share</button><span class="ico" data-i="chev"></span></span>
+        <span class="sel"><button type="button" class="pick" id="adsort" aria-label="Sort" aria-haspopup="listbox" value="new">Newest first</button><span class="ico" data-i="chev"></span></span>
       </div>
       <div id="adlist"></div>
       <button class="btn block more" id="admore" hidden>Load more</button>
@@ -5959,7 +6799,13 @@ function ask(o){
   })
 }
 
-var PICKS={ovsort:[['new', 'Newest first'], ['old', 'Oldest first'], ['active', 'Last active']],ovfilter:[['', 'All users'], ['online', 'Online now'], ['active24', 'Active 24h']],fstatus:[['', 'Any status'], ['live', 'live'], ['taken down', 'taken down'], ['unpublished', 'unpublished'], ['missing', 'missing']],fsort:[['new', 'Newest first'], ['most', 'Most reported'], ['old', 'Oldest first']],adst:[['', 'All ads'], ['active', 'Active'], ['paused', 'Paused'], ['exhausted', 'Used up'], ['unpublished', 'Down']],adkind:[['', 'Write & Share'], ['write', 'Write'], ['share', 'Share']]};
+var CSORT=[['most_subs','Most subscribers'],['least_subs','Least subscribers'],['most_posts','Most notes'],['least_posts','Least notes'],['most_likes','Most likes'],['least_likes','Least likes']];
+// "12 subscribers" / "1 note" / "84 likes" for a count k (subs | posts | likes).
+function cntWord(k,n){return num(n)+(k==='subs'?(n===1?' subscriber':' subscribers'):k==='posts'?(n===1?' note':' notes'):(n===1?' like':' likes'))}
+function isCsort(so){return /^(most|least)_(subs|posts|likes)$/.test(so||'')}
+// What a count sort on the Reports list ordered a card by: the reported note's likes, or its owner's subscribers / notes.
+function repCnt(r){var so=$('fsort').value;if(!isCsort(so)||r.sortCount==null)return '';var k=so.split('_')[1];return ' - '+(k==='likes'?'':'owner has ')+cntWord(k,r.sortCount)}
+var PICKS={ovnsort:[['new','Newest first']].concat(CSORT),adsort:[['new','Newest first']].concat(CSORT),ovsort:[['new', 'Newest first'], ['old', 'Oldest first'], ['active', 'Last active']].concat(CSORT),ovfilter:[['', 'All users'], ['online', 'Online now'], ['active24', 'Active 24h']],fstatus:[['', 'Any status'], ['live', 'live'], ['taken down', 'taken down'], ['unpublished', 'unpublished'], ['missing', 'missing']],fsort:[['new', 'Default order'], ['most', 'Most reported'], ['old', 'Oldest first']].concat(CSORT),adst:[['', 'All ads'], ['active', 'Active'], ['paused', 'Paused'], ['exhausted', 'Used up'], ['unpublished', 'Down']],adkind:[['', 'Write & Share'], ['write', 'Write'], ['share', 'Share']]};
 function pickSet(id,v){
   var b=$(id),o=PICKS[id].filter(function(x){return x[0]===v})[0]||PICKS[id][0];
   b.value=o[0];b.textContent=o[1]
@@ -6209,7 +7055,7 @@ function repQuery(first){
   if(next&&!first)p.push('cursor='+encodeURIComponent(next));
   return p.join('&')
 }
-function repFilter(){if(rIdx)loadReports(true);else renderAll()}
+function repFilter(){if(rIdx)loadReports(true);else{if(isCsort($('fsort').value))msg('Sorting by counts works once the search index has finished building');renderAll()}}
 function startReindex(){
   if(reindexing)return;reindexing=true;msg('Indexing reports for search\u2026');
   (function step(c){
@@ -6270,9 +7116,10 @@ function repGroups(base){
   var fr=$('freason').value,grp=$('fgroup').checked,so=$('fsort').value;
   var items=base.filter(function(r){return!fr||r.reason===fr});
   var groups=[],idx={};
-  items.forEach(function(r){var k=grp?r.slug:r.key;if(idx[k]==null){idx[k]=groups.length;groups.push({slug:r.slug,key:k,items:[]})}groups[idx[k]].items.push(r)});
+  items.forEach(function(r){var k=grp?r.slug:r.key;if(idx[k]==null){idx[k]=groups.length;groups.push({slug:r.slug,key:k,ord:groups.length,items:[]})}groups[idx[k]].items.push(r)});
   groups.sort(function(a,b){
     var x=hasCsam(a),y=hasCsam(b);if(x!==y)return x?-1:1;
+    if(isCsort(so))return a.ord-b.ord; // the server already ordered these by the count; CSAM groups still come first
     var an=a.items[0].reportedAt,bn=b.items[0].reportedAt;
     if(so==='most'&&a.items.length!==b.items.length)return b.items.length-a.items.length;
     if(so==='old')return an-bn;
@@ -6339,7 +7186,7 @@ function renderGroup(g){
   chips.push(stChip(first.status));
   if(g.items.length>1)chips.push(chip(g.items.length+' reports'));
   if(csam)chips.push(chip(nc?'NCMEC '+fmtD(nc.at):'NCMEC not recorded',nc?'good':'bad'));
-  var card=mkCard({sev:sev,urgent:csam,icon:RICON[sev],slug:g.slug,chips:chips,sub:'Latest report '+ago(first.reportedAt),trail:agoS(first.reportedAt),key:'rep:'+g.key});
+  var card=mkCard({sev:sev,urgent:csam,icon:RICON[sev],slug:g.slug,chips:chips,sub:'Latest report '+ago(first.reportedAt)+repCnt(first),trail:agoS(first.reportedAt),key:'rep:'+g.key});
   var pad=card.pad;
   g.items.forEach(function(x){
     var r=el('div','rep'),top=el('div','rep-top');
@@ -6569,10 +7416,36 @@ function storyAct(slug,action,done){
     return api('/admin/story',{method:'POST',body:{slug:slug,action:action,reason:reason}}).then(function(o){if(o.ok){msg(rm?'Removed /'+slug+' from stories':'Stories allowed again for /'+slug);done()}else showErr(o,rm?'Could not remove /'+slug+' from stories':'Could not allow stories for /'+slug)})
   })
 }
+function strikeAct(slug,x,done){
+  var ex=!x.excusedAt;
+  return ask({title:ex?'Excuse this strike?':'Count this strike again?',text:ex?'It stops counting toward the ad hold right away and stays on the record, marked excused. The owner gets an alert with your reason.':'It counts toward the ad hold again until it is 60 days old. The owner is told.',ok:ex?'Excuse':'Count again',danger:!ex,fields:ex?[REASON_F]:undefined}).then(function(v){
+    if(!v)return;var reason='';if(ex){reason=reasonOf(v);if(!reason)return}
+    return api('/admin/strike',{method:'POST',body:{slug:slug,id:x.id,action:ex?'excuse':'restore',reason:reason}}).then(function(o){if(o.ok){msg(ex?'Strike excused':'Strike counts again');done()}else showErr(o,ex?'Could not excuse the strike':'Could not restore the strike')})
+  })
+}
+function refAct(slug,aid,restore,done){
+  return ask({title:restore?'Count this referral again?':'Void this referral?',text:restore?'It counts toward the referrer ad access again. The referrer is told.':'It stops counting toward the referrer ad access. The referrer gets an alert with your reason.',ok:restore?'Restore':'Void',danger:!restore,fields:restore?undefined:[REASON_F]}).then(function(v){
+    if(!v)return;var reason='';if(!restore){reason=reasonOf(v);if(!reason)return}
+    var b={slug:slug,action:restore?'restore':'void',reason:reason};if(aid)b.aid=aid;
+    return api('/admin/referral',{method:'POST',body:b}).then(function(o){if(o.ok){msg(restore?'Referral counts again':'Referral voided');done()}else showErr(o,restore?'Could not restore the referral':'Could not void the referral')})
+  })
+}
+function refRow(slug,x,lead,aid,again){
+  var r=el('div','pgrow stack'),l=el('div');
+  l.appendChild(el('div','slug',lead+(x.email||'account missing')));
+  if(x.authorId)l.appendChild(el('small','aid',x.authorId));
+  l.appendChild(el('small',null,'Joined with the code '+ago(x.at)+(x.voidedAt?(x.voidReason==='admin'?' - voided '+ago(x.voidedAt):' - paused while the account is suspended or being deleted'):'')));
+  var m=el('div','pm');
+  if(x.voidedAt)m.appendChild(chip(x.voidReason==='admin'?'voided':'paused','bad'));else if(x.counts===true)m.appendChild(chip('counting','good'));else if(x.counts===false)m.appendChild(chip('not yet'));
+  r.appendChild(m);r.appendChild(l);
+  if((!x.voidedAt||x.voidReason==='admin')&&(aid!==null)){r.appendChild(btn(x.voidedAt?'Restore':'Void referral',null,function(){return refAct(slug,aid,!!x.voidedAt,again)}))}
+  return r
+}
 function loadOwner(slug){
   api('/admin/owner?slug='+encodeURIComponent(slug)).then(function(o){
     if(!o.ok){showErr(o,'Could not load the account');return}
     var d=o.j,out=$('lkowner');out.textContent='';
+    var again0=function(){loadOwner(slug)};
     var c=el('div','card static sev-other');
     if(d.anonymous){c.appendChild(el('div',null,'Anonymous page: no account to act on.'));out.appendChild(c);return}
     var hd=el('div','lk-head compact');hd.appendChild(tile(d.suspended?'csam':'other','user'));
@@ -6582,13 +7455,24 @@ function loadOwner(slug){
     if(d.pendingDeletionAt)cr.appendChild(chip('deletion '+fmtD(d.pendingDeletionAt+2592000000),'bad'));
     hm.appendChild(cr);hd.appendChild(hm);c.appendChild(hd);
     var st=el('div','stats');
-    [['Subscribers',d.subscribers],['Likes',d.likes],['Live pages',d.pages.length],['Strikes',d.strikeCount],['Reports',d.reportStats?d.reportStats.total:null],['Alerts',d.alertTotal]].forEach(function(x){var s=el('div','stat');s.appendChild(el('b',null,x[1]==null?'-':num(x[1])));s.appendChild(el('span',null,x[0]));st.appendChild(s)});
+    [['Subscribers',d.subscribers],['Likes',d.likes],['Live pages',d.pages.length],['Ad tier',d.adTier],['Strikes',d.strikeCount],['Reports',d.reportStats?d.reportStats.total:null],['Alerts',d.alertTotal]].forEach(function(x){var s=el('div','stat');s.appendChild(el('b',null,x[1]==null?'-':num(x[1])));s.appendChild(el('span',null,x[0]));st.appendChild(s)});
     c.appendChild(st);
     var k=el('div','kvs');c.appendChild(k);
     aidRow(k,d.authorId);
     kv(k,'Signed up',fmt(d.createdAt));kv(k,'Last sign-in',fmt(d.lastSignInAt));kv(k,'Ads',String(d.ads));kv(k,'Credit balance',num(d.creditBalance));
     kv(k,'Display name',d.displayName||'-');
     kv(k,'Backup',d.backup?num(d.backup.images)+(d.backup.imagesMore?'+':'')+' images - '+Math.round(d.backup.sizeBytes/1024)+' KB - '+ago(d.backup.updatedAt):'none');
+    var rf=d.referral;
+    if(rf){
+      c.appendChild(el('div','sec-t','Referrals'));
+      var rk=el('div','kvs');c.appendChild(rk);
+      kv(rk,'Invite code',rf.code||'-');kv(rk,'Invited',num(rf.invited)+' ('+num(rf.qualified)+' counting)');
+      if(rf.referredBy)c.appendChild(refRow(slug,rf.referredBy,'Referred by ',undefined,again0));
+      if(rf.referred&&rf.referred.length){
+        c.appendChild(el('div','fine','Accounts that joined with this code'+(rf.invited>rf.referred.length?' (latest '+num(rf.referred.length)+')':'')+'. A friend counts once they publish a note and have been active on two days.'));
+        rf.referred.forEach(function(x){c.appendChild(refRow(slug,x,'',x.authorId||null,again0))})
+      }
+    }
     c.appendChild(el('div','sec-t','Reports against this account'));
     var rs=d.reportStats;
     if(!rs)c.appendChild(el('div','fine','Report totals are unavailable until the report index is built (open the Reports tab once).'));
@@ -6600,12 +7484,17 @@ function loadOwner(slug){
     }
     c.appendChild(el('div','sec-t','Strikes ('+num(d.strikeCount||0)+')'));
     if(!d.strikes||!d.strikes.length)c.appendChild(el('div','fine','No strikes. Reports alone are not strikes; takedowns, story or ad removals, profile removals and suspensions are.'));
-    else d.strikes.forEach(function(x,i){
-      var r=el('div','pgrow stack'),l=el('div');
-      l.appendChild(el('div','amsg',x.message));
-      l.appendChild(el('small',null,fmt(x.at)+' - '+ago(x.at)+(x.dismissedAt?' - deleted by user '+ago(x.dismissedAt):'')));
-      var m=el('div','pm');m.appendChild(chip('strike #'+(i+1),'bad'));m.appendChild(chip(x.kind.replace(/_/g,' ')));r.appendChild(m);r.appendChild(l);c.appendChild(r)
-    });
+    else{
+      c.appendChild(el('div','fine','A strike holds ad packages back for 60 days, then stops counting by itself. Excusing one removes it from the hold now (for a wrongful takedown, say) and tells the owner.'));
+      d.strikes.forEach(function(x,i){
+        var r=el('div','pgrow stack'),l=el('div');
+        l.appendChild(el('div','amsg',x.message));
+        l.appendChild(el('small',null,fmt(x.at)+' - '+ago(x.at)+(x.excusedAt?' - excused '+ago(x.excusedAt):!x.counting?' - past 60 days, no longer counts':'')+(x.dismissedAt?' - deleted by user '+ago(x.dismissedAt):'')));
+        var m=el('div','pm');m.appendChild(chip('strike #'+(i+1),x.excusedAt||!x.counting?null:'bad'));m.appendChild(chip(x.kind.replace(/_/g,' ')));if(x.excusedAt)m.appendChild(chip('excused','good'));r.appendChild(m);r.appendChild(l);
+        if(x.excusedAt||x.counting){var sb=btn(x.excusedAt?'Count again':'Excuse strike',null,function(){return strikeAct(slug,x,function(){loadOwner(slug)})});r.appendChild(sb)}
+        c.appendChild(r)
+      })
+    }
     if(d.hasProfileImage){c.appendChild(el('div','sec-t','Profile picture'));var pw=el('div','media');pw.appendChild(mediaTile('Profile picture',function(){return loadMedia(slug,'profile')},true));c.appendChild(pw)}
     if(d.ledger&&d.ledger.length){
       c.appendChild(el('div','sec-t','Credit ledger'));
@@ -6698,7 +7587,7 @@ function openAd(slug){
 function loadAds(reset){
   var L=$('adlist');
   if(reset){adCur='';adTotal=0;L.textContent='';skel(L,3)}else moreBusy($('admore'),true);
-  return api('/admin/ads?status='+encodeURIComponent($('adst').value)+'&kind='+encodeURIComponent($('adkind').value)+'&q='+encodeURIComponent(adqv())+'&cursor='+encodeURIComponent(adCur)).then(function(o){
+  return api('/admin/ads?status='+encodeURIComponent($('adst').value)+'&kind='+encodeURIComponent($('adkind').value)+'&sort='+encodeURIComponent($('adsort').value)+'&q='+encodeURIComponent(adqv())+'&cursor='+encodeURIComponent(adCur)).then(function(o){
     unskel(L);moreBusy($('admore'),false);
     if(!o.ok){bad(o,'Could not load ads');return}
     if(o.j.total!=null)adTotal=o.j.total;SUBS.ads=num(adTotal)+(adTotal===1?' campaign':' campaigns')+adFiltLbl();if(cur==='ads')setSub();
@@ -6737,9 +7626,9 @@ function renderAd(a){
   var pct=a.viewsTotal?Math.min(100,Math.round(a.viewsUsed/a.viewsTotal*100)):0;
   var m=el('div'),bar=el('div','meter'),i=document.createElement('i');i.style.width=pct+'%';bar.appendChild(i);m.appendChild(bar);
   var ml=el('div','meter-l');ml.appendChild(el('span',null,num(a.viewsUsed)+' of '+num(a.viewsTotal)+' views'));ml.appendChild(el('span',null,pct+'%'));m.appendChild(ml);
-  var card=mkCard({sev:'ad',icon:'ads',slug:a.slug,chips:[stChip(a.status)],sub:a.ownerEmail||'account missing',extra:m,key:'ad:'+a.slug});
+  var card=mkCard({sev:'ad',icon:'ads',slug:a.slug,chips:[stChip(a.status)],sub:(a.ownerEmail||'account missing')+(a.ownerSubs==null?'':' - '+num(a.ownerSubs)+(a.ownerSubs===1?' subscriber':' subscribers')+' - '+num(a.ownerNotes)+(a.ownerNotes===1?' note':' notes')),extra:m,key:'ad:'+a.slug});
   var k=el('div','kvs');
-  kv(k,'Type',a.kind==='share'?'Share':'Write');kv(k,'Unique viewers',num(a.uniqueViewers));kv(k,'Views left',num(left));kv(k,'Created',fmt(a.createdAt));
+  kv(k,'Type',a.kind==='share'?'Share':'Write');if(a.likes!=null)kv(k,'Likes',num(a.likes));kv(k,'Unique viewers',num(a.uniqueViewers));kv(k,'Views left',num(left));kv(k,'Created',fmt(a.createdAt));
   card.pad.appendChild(k);
   var tools=el('div','tools');tools.appendChild(btn('Lookup',null,function(){openLookup(a.slug)}));card.pad.appendChild(tools);
   var foot=card.foot;
@@ -6754,7 +7643,7 @@ function renderAd(a){
 }
 
 /* ---------- Audit ---------- */
-var ACT_LBL={takedown:'Takedown',release:'Release',restore:'Restore',dismiss:'Dismiss',undismiss:'Undismiss',purge:'Purge',ncmec_recorded:'NCMEC recorded',owner_suspend:'Suspend account',owner_unsuspend:'Unsuspend account',owner_delete:'Delete account','owner_cancel-delete':'Cancel deletion','owner_clear-name':'Clear name','owner_clear-picture':'Clear picture',story_remove:'Story removed',story_allow:'Story allowed',ad_pause:'Ad paused',ad_resume:'Ad resumed',ad_takedown:'Ad taken down',ad_refund:'Ad refunded',custom_alert:'Custom alert'};
+var ACT_LBL={takedown:'Takedown',release:'Release',restore:'Restore',dismiss:'Dismiss',undismiss:'Undismiss',purge:'Purge',ncmec_recorded:'NCMEC recorded',owner_suspend:'Suspend account',owner_unsuspend:'Unsuspend account',owner_delete:'Delete account','owner_cancel-delete':'Cancel deletion','owner_clear-name':'Clear name','owner_clear-picture':'Clear picture',story_remove:'Story removed',story_allow:'Story allowed',strike_excuse:'Strike excused',strike_restore:'Strike reinstated',referral_void:'Referral voided',referral_restore:'Referral restored',ad_pause:'Ad paused',ad_resume:'Ad resumed',ad_takedown:'Ad taken down',ad_refund:'Ad refunded',custom_alert:'Custom alert'};
 function actLbl(a){a=String(a||'');if(ACT_LBL[a])return ACT_LBL[a];a=a.replace(/[_-]+/g,' ').trim();return a.charAt(0).toUpperCase()+a.slice(1)}
 function actTone(a){a=String(a||'');if(/take|purge|suspend|delete|ban/.test(a)&&!/unsuspend|cancel/.test(a))return'bad';if(/restore|release|unsuspend|cancel|allow|refund|resume/.test(a))return'good';return''}
 var auT=null,auBusy=false;
@@ -7538,13 +8427,16 @@ function recipSheet(o){
   if(curSheet)curSheet.done(false,true);
   var trig=document.activeElement,back=el('div','sheet-back'),sh=el('div','sheet'),top=el('div','sheet-top'),sb=el('div','sheet-body'),list=el('div'),
     sub=el('div','rsub',o.sub||''),cnt=el('div','rcnt'),chk=el('div','rchk'),note=el('div','rsub'),inp=el('input','field'),
-    cur='',shown=0,total=0,found=0,g=0,closed=false,q='',qt=null;
+    cur='',shown=0,total=0,found=0,g=0,closed=false,q='',qt=null,sort='';
   sh.setAttribute('role','dialog');sh.setAttribute('aria-modal','true');sh.setAttribute('aria-label','Recipients');
   sh.appendChild(el('div','grab'));
   top.appendChild(el('div','ptitle','Recipients'));top.appendChild(sub);top.appendChild(cnt);
   var sr=el('div','search'),fw=el('div','field-wrap');
   inp.type='text';inp.placeholder='Check an author ID';inp.setAttribute('autocomplete','off');inp.setAttribute('autocapitalize','off');inp.setAttribute('spellcheck','false');inp.setAttribute('enterkeyhint','search');inp.setAttribute('aria-label','Search recipients by author ID');
-  fw.appendChild(ico('search'));fw.appendChild(inp);sr.appendChild(fw);top.appendChild(sr);top.appendChild(chk);
+  fw.appendChild(ico('search'));fw.appendChild(inp);sr.appendChild(fw);top.appendChild(sr);
+  var sk=el('div','filters');
+  [['','Newest']].concat(CSORT).forEach(function(m){var b=el('button','key');b.type='button';b.setAttribute('aria-pressed',m[0]===sort?'true':'false');b.appendChild(el('span',null,m[1]));b.onclick=function(){if(sort===m[0])return;sort=m[0];[].forEach.call(sk.children,function(x){x.setAttribute('aria-pressed',x===b?'true':'false')});load(true)};sk.appendChild(b)});
+  top.appendChild(sk);top.appendChild(chk);
   sh.appendChild(top);sh.appendChild(sb);
   sb.appendChild(list);
   var more=btn('Load more','block more',function(){return load(false)});more.hidden=true;sb.appendChild(more);sb.appendChild(note);
@@ -7554,7 +8446,7 @@ function recipSheet(o){
   function load(first){
     var gg=++g;
     if(first){cur='';shown=0;list.textContent='';chk.textContent='';chk.className='rchk';note.textContent='';more.hidden=true;sb.scrollTop=0;skel(list,4,'row')}
-    return api('/admin/alert',{method:'POST',body:Object.assign({},o.body,{q:q,cursor:cur})}).then(function(r){
+    return api('/admin/alert',{method:'POST',body:Object.assign({},o.body,{q:q,cursor:cur,sort:sort})}).then(function(r){
       if(gg!==g||closed)return;
       unskel(list);
       if(!r.ok){bad(r,'Could not load the recipients');return}
@@ -7702,7 +8594,7 @@ var OV=[
   ['Content',[['notes','Published notes'],['notesNew1d','New today'],['notesNew7d','New this week'],['publishers','Publishers'],['stories','In stories'],['likes','Likes']]],
   ['Ads and follows',[['adsActive','Active ads'],['adsPaused','Paused ads'],['adViewsUsed','Ad views used'],['adsExhausted','Used up'],['adsUnpublished','Taken down'],['subscriptions','Subscriptions']]]
 ];
-var ovS={view:'users',cur:'',total:0,shown:0,gen:0,loaded:false,fil:'',sort:'new',q:'',t:null};
+var ovS={view:'users',cur:'',total:0,shown:0,gen:0,loaded:false,fil:'',sort:'new',nsort:'new',q:'',t:null};
 function ovShell(){
   var C=$('ovstats');C.textContent='';
   OV.forEach(function(sec){
@@ -7728,7 +8620,7 @@ function loadOverview(){
 function ovSync(){
   var users=ovS.view==='users';
   [].forEach.call($('ovseg').children,function(b){b.setAttribute('aria-pressed',b.getAttribute('data-v')===ovS.view?'true':'false')});
-  $('ovfil').hidden=!users;
+  $('ovsort').parentNode.hidden=!users;$('ovfilter').parentNode.hidden=!users;$('ovnsort').parentNode.hidden=users;
   $('ovq').placeholder=users?'Search by author ID':'Search by slug or author ID'
 }
 function ovUser(u){$('ovlist').appendChild(ovUserRow(u))}
@@ -7736,8 +8628,10 @@ function ovUserRow(u){
   var r=el('button','pgrow'),l=el('div');r.type='button';
   r.onclick=function(){if(!u.authorId)return;try{navigator.clipboard.writeText(u.authorId).then(function(){msg('Author ID copied')},function(){msg(u.authorId)})}catch(e){msg(u.authorId)}};
   l.appendChild(el('div','slug',u.email||'Account missing'));
-  l.appendChild(el('small',null,(u.name?u.name+' - ':'')+'Joined '+ago(u.createdAt)+' - '+num(u.notes)+(u.notes===1?' note':' notes')+' - '+(u.lastSeen?'seen '+ago(u.lastSeen):'not seen yet')+(u.lastSignInAt?' - signed in '+ago(u.lastSignInAt):'')));
+  l.appendChild(el('small',null,(u.name?u.name+' - ':'')+'Joined '+ago(u.createdAt)+' - '+num(u.notes)+(u.notes===1?' note':' notes')+(u.subs!=null?' - '+num(u.subs)+(u.subs===1?' subscriber':' subscribers'):'')+(u.likes!=null?' - '+cntWord('likes',u.likes):'')+' - '+(u.lastSeen?'seen '+ago(u.lastSeen):'not seen yet')+(u.lastSignInAt?' - signed in '+ago(u.lastSignInAt):'')));
   if(u.authorId)l.appendChild(el('small','aid',u.authorId));
+  if(u.referredBy){l.appendChild(el('small',null,'Referred by '+(u.referredBy.email||'account missing')));if(u.referredBy.authorId)l.appendChild(el('small','aid',u.referredBy.authorId))}
+  if(u.referralCode)l.appendChild(el('small','aid','Referral code '+u.referralCode));
   r.appendChild(l);
   var m=el('div','pm');
   if(u.authorId){var cp=el('span','lk');cp.setAttribute('aria-label','Copy author ID');cp.appendChild(ico('copy'));m.appendChild(cp)}
@@ -7750,7 +8644,8 @@ function ovUserRow(u){
 function ovNote(n){
   var r=el('button','pgrow');r.type='button';r.onclick=function(){openLookup(n.slug)};
   var l=el('div');l.appendChild(slugEl(n.slug));
-  l.appendChild(el('small',null,(n.title||'Untitled')+' - published '+ago(n.createdAt)));
+  var nk=isCsort(ovS.nsort)?ovS.nsort.split('_')[1]:'';
+  l.appendChild(el('small',null,(n.title||'Untitled')+' - published '+ago(n.createdAt)+(n.likes==null?'':' - '+cntWord('likes',n.likes))+((nk==='subs'||nk==='posts')&&n.authorSubs!=null?' - author has '+cntWord(nk,nk==='subs'?n.authorSubs:n.authorNotes):'')));
   r.appendChild(l);
   var m=el('div','pm');if(n.story)m.appendChild(chip('story'));
   r.appendChild(m);$('ovlist').appendChild(r)
@@ -7759,7 +8654,7 @@ function ovList(reset){
   var L=$('ovlist'),m=$('ovmore'),users=ovS.view==='users',g=++ovS.gen;
   if(reset){ovS.cur='';ovS.total=0;ovS.shown=0;L.textContent='';moreBusy(m,false);m.hidden=true;$('ovcount').textContent='';skel(L,4,'row')}
   else moreBusy(m,true);
-  var qs='cursor='+encodeURIComponent(ovS.cur)+'&q='+encodeURIComponent(ovS.q)+(users?'&sort='+ovS.sort+'&f='+ovS.fil:'');
+  var qs='cursor='+encodeURIComponent(ovS.cur)+'&q='+encodeURIComponent(ovS.q)+'&sort='+(users?ovS.sort+'&f='+ovS.fil:ovS.nsort);
   return api('/admin/'+ovS.view+'?'+qs).then(function(o){
     if(g!==ovS.gen)return;
     unskel(L);moreBusy(m,false);
@@ -8090,7 +8985,7 @@ $('rf').onclick=function(){
 $('so').onclick=function(){
   sessionStorage.removeItem('adm');tok='';all=[];next=null;rIdx=false;rAgg=null;rGen++;navLog=[];lkSlug='';lkOwner=false;cur='reports';openSet={};auAll=[];auFilter='';recents=[];repSub='';
   ['list','lkowner','adlist','aulist','aukeys','qbar','qkeys','ovstats','ovlist','trchart','trleg','trrows','rpbox'].forEach(function(i){$(i).textContent=''});trS.data=null;trS.M=null;trS.end=null;trS.gen++;
-  ovS.loaded=false;ovS.view='users';ovS.q='';ovS.fil='';ovS.sort='new';ovS.gen++;$('ovq').value='';pickSet('ovsort','new');pickSet('ovfilter','');$('ovcount').textContent='';$('ovnote').textContent='';ovSync();
+  ovS.loaded=false;ovS.view='users';ovS.q='';ovS.fil='';ovS.sort='new';ovS.nsort='new';ovS.gen++;$('ovq').value='';pickSet('ovsort','new');pickSet('ovfilter','');pickSet('ovnsort','new');$('ovcount').textContent='';$('ovnote').textContent='';ovSync();
   $('queue').hidden=true;$('freason').value='';$('fq').value='';$('adq').value='';$('auq').value='';aidMap={};lkAid='';
   lookupHint();renderRecents();setBadge(0);document.body.dataset.alert='';$('tok').value='';
   navSync();loggedIn(false);msg('Signed out','ok')
@@ -8159,10 +9054,12 @@ function cocBuild(){
 $("coc").onclick=function(){ask({title:"Admin Code of Conduct",icon:"book",sev:"ad",node:cocBuild(),ok:"Got it",single:true})};
 $('ovsort').onclick=function(){pick('ovsort',function(){ovS.sort=$('ovsort').value;ovList(true)})};
 $('ovfilter').onclick=function(){pick('ovfilter',function(){ovS.fil=$('ovfilter').value;ovList(true)})};
+$('ovnsort').onclick=function(){pick('ovnsort',function(){ovS.nsort=$('ovnsort').value;ovList(true)})};
 $('ovq').oninput=function(){clearTimeout(ovS.t);ovS.t=setTimeout(function(){ovS.q=$('ovq').value.trim().toLowerCase();ovList(true)},300)};
 [].forEach.call($('ovseg').children,function(b){b.onclick=function(){var v=b.getAttribute('data-v');if(ovS.view===v)return;ovS.view=v;ovS.q='';$('ovq').value='';ovSync();ovList(true)}});
 $('adst').onclick=function(){pick('adst',function(){loadAds(true)})};
 $('adkind').onclick=function(){pick('adkind',function(){loadAds(true)})};
+$('adsort').onclick=function(){pick('adsort',function(){loadAds(true)})};
 $('auq').oninput=function(){clearTimeout(auT);auT=setTimeout(auSearch,300)};
 $('adq').oninput=function(){clearTimeout(adT);adT=setTimeout(function(){loadAds(true)},300)};
 $('fstatus').onclick=function(){pick('fstatus',renderAll)};
@@ -8329,11 +9226,20 @@ export default {
       if (method === 'DELETE' && pathname.startsWith('/subscriptions/')) {
         return handleUnsubscribe(env, request, decodeURIComponent(pathname.slice('/subscriptions/'.length)));
       }
+      if (method === 'GET' && pathname === '/referral/mine') {
+        return handleReferralMine(env, request);
+      }
+      if (method === 'POST' && pathname === '/referral/redeem') {
+        return handleReferralRedeem(env, request);
+      }
       if (method === 'POST' && pathname === '/ads/publish') {
         return handleAdPublish(env, request);
       }
       if (method === 'GET' && pathname === '/ads/next') {
         return handleAdNext(env, request);
+      }
+      if (method === 'POST' && pathname === '/ads/attest') {
+        return handleAdAttest(env, request);
       }
       if (method === 'GET' && pathname === '/ads/mine') {
         return handleMyAds(env, request);
@@ -8395,6 +9301,8 @@ export default {
       if (method === 'GET' && pathname === '/admin/notes') return handleAdminNotes(env, request, url);
       if (method === 'POST' && pathname === '/admin/owner/action') return handleAdminOwnerAction(env, request);
       if (method === 'POST' && pathname === '/admin/story') return handleAdminStory(env, request);
+      if (method === 'POST' && pathname === '/admin/strike') return handleAdminStrike(env, request);
+      if (method === 'POST' && pathname === '/admin/referral') return handleAdminReferral(env, request);
       if (method === 'POST' && pathname === '/admin/ad') return handleAdminAd(env, request);
       if (method === 'POST' && pathname === '/admin/ncmec') return handleAdminNcmec(env, request);
       if (method === 'POST' && pathname === '/admin/undismiss') return handleAdminUndismiss(env, request);
