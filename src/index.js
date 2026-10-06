@@ -5962,6 +5962,8 @@ button{cursor:pointer}
 .login-card p{margin:0 0 26px;color:var(--muted);font-size:16px}
 .login-card .field{margin-bottom:12px}
 .fine{margin-top:16px;font-size:13px;color:var(--faint)}
+.fine+.pgrow,.fine+.media,.fine+.btn{margin-top:12px}
+.kvs+.pgrow{margin-top:8px}
 @keyframes rise{from{opacity:0;transform:translateY(14px)}}
 
 /* app bar */
@@ -6299,7 +6301,7 @@ ul.alert-md-list ul.alert-md-list ul.alert-md-list { list-style: square }
 .mdex-out::before{content:"Shows as";display:block;margin:0 0 4px;font-size:12px;font-weight:650;color:var(--faint)}
 .alrow{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 12px}
 .alrow.top{margin-top:14px}
-.catgrid:not([hidden]){display:flex;flex-wrap:wrap;gap:8px;margin:0 0 4px}
+.catgrid:not([hidden]){display:flex;flex-wrap:wrap;gap:8px;margin:0 0 12px}
 .recip{margin:12px 2px 0;font-size:14px;color:var(--muted)}
 .recip b{color:var(--text)}
 .recip.err{color:var(--danger)}
@@ -9082,40 +9084,39 @@ $('aumore').onclick=function(){loadAudit(false)};
 $('ovmore').onclick=function(){ovList(false)};
 var COC=[
   {h:"Keep it private",key:1,items:[
-    ["In public, never mention email, slug or link.","This covers any public place: replies, posts, comments, reviews and community chats."],
-    ["Use the Author ID.","It is how we point to a person."],
-    ["Describe a note by its action and time.","For example: the note taken down yesterday around 3 pm, or the note published on Monday evening."],
-    ["Guard what is private.","Never share the admin token or what is inside a note. Tap the lock to sign out when you are done."]
+    ["In public, please never mention email, slug or link.","This covers replies, posts, comments, reviews and chats."],
+    ["Use the Author ID.","Describe a note by what happened and when, like the note taken down Monday around 3 pm."],
+    ["Guard what is private.","Never share the admin token or what is inside a note, and tap the lock to sign out when you are done."]
   ],ex:[["ok","Do say","Author ID 7K2F9: the note published on Monday evening was taken down."],["no","Never say","/my-cool-page by jo@mail.com was removed."]]},
   {h:"Be kind",items:[
-    ["Reasons are shown to the owner exactly as you type them.","Keep them short, calm and specific, like Spam or Impersonation. No blame, no sarcasm."],
-    ["Be fair.","Same rules for everyone. Look at the page, not the person."],
-    ["Protect reporters.","Owners only see the report category. Never say who reported."]
+    ["Reasons reach the owner exactly as you type them.","Please keep them short, calm and specific, like Spam. No blame or sarcasm."],
+    ["Be fair.","The same rules apply to everyone. Look at the page, not the person."],
+    ["Protect reporters.","Owners only see the report category, so never say who reported."]
   ]},
   {h:"Use the lightest fix",items:[
-    ["Look first.","Open the snapshot and read the whole page before you act."],
-    ["Match the fix to the problem.","Wrong report? Dismiss it. Only one part is a problem? Fix just that part: remove the story, clear the profile name or pause the ad."],
-    ["Release helps an owner who is stuck.","If an owner cannot edit or unpublish their own page anymore, Release takes it offline and frees its address so they can publish again. It is not a penalty: no reason is needed, the owner gets a short alert, and unused ad views are refunded. Its likes, story and ad are removed. For rule-breaking, use Take down."],
-    ["Take down is for real violations.","It locks the slug for good. Suspend an account only as a last resort, usually after repeated violations."]
+    ["Look first.","Please read the whole snapshot before you act."],
+    ["Match the fix to the problem.","If a report is wrong, dismiss it. If only one part is a problem, fix just that part: remove the story, clear the profile name or pause the ad."],
+    ["Release helps an owner who is stuck.","If an owner cannot edit or unpublish, Release takes the page offline and frees the slug so they can publish again. It is not a penalty and needs no reason. The owner gets a short alert, unused ad views are refunded, and likes, story and ad are removed."],
+    ["Take down is for real violations.","It locks the slug for good. Suspend an account only as a last resort."]
   ]},
   {h:"Child safety comes first",items:[
     ["Open child safety reports first.","They are marked in red."],
-    ["Do not dismiss until the page is handled and NCMEC is notified.","Then save the report with Record NCMEC report."],
-    ["Never delete, copy, screenshot or share.","These pages are preserved for 18 months. Keep the image switches in Tools off unless you truly need them."],
+    ["Please do not dismiss until the page is handled and NCMEC is notified.","Then save the report with Record NCMEC report."],
+    ["Never delete, copy, screenshot or share.","These pages are kept for 18 months. Keep the image switches in Tools off unless you truly need them."],
     ["Restore only when you are sure the report was a mistake.",""]
   ]},
   {h:"Take care",items:[
     ["Everything you do is saved in Audit.","That keeps all of us trustworthy."],
-    ["Custom alerts carry approved messages only.","Send the wording exactly as it was approved, and nothing else. If you are not sure a message is approved, please check with another admin first."],
-    ["Send to the intended audience, and only them.","Before you tap Send alert, look at the groups or author IDs and the recipient count, so the message reaches just the people it was meant for."],
-    ["Slow down for permanent actions.","Take down all and Run purge cannot be undone. The purge already runs every night."],
-    ["Ads:","pause first, take down if it keeps breaking the rules. You can refund unused views when you take an ad down."],
+    ["Custom alerts carry approved messages only.","Send the wording exactly as approved. If you are not sure, please check with another admin first."],
+    ["Send to the intended audience.","Before you tap Send alert, check the audience and recipient count so it reaches just the people it was meant for."],
+    ["Slow down for permanent actions.","Take down all and Run purge cannot be undone, and purge already runs every night."],
+    ["Ads:","pause first, and take down only if it keeps breaking the rules. Unused views can be refunded."],
     ["Not sure? Wait and ask another admin.","Slipped up? Restore it and tell the team. Honest mistakes are fine."]
   ]}
 ];
 function cocBuild(){
   var w=el("div");
-  w.appendChild(el("div","coc-intro","Welcome to the team! Five easy habits keep our community safe and everyone treated with respect. Remember them as:"));
+  w.appendChild(el("div","coc-intro","Welcome to the team! Five easy habits keep our community safe and everyone treated with respect:"));
   var t=el("div","coc-tags"),secs=[];["Private","Kind","Light","Safe","Careful"].forEach(function(x,i){var b=el("button",null,x);b.type="button";b.setAttribute("aria-label","Go to section "+(i+1)+": "+x);b.onclick=function(){var s=secs[i],sb=b.closest(".sheet-body");if(!s||!sb)return;sb.scrollTo({top:sb.scrollTop+s.getBoundingClientRect().top-sb.getBoundingClientRect().top-t.offsetHeight+6,behavior:"smooth"});s.classList.add("coc-hit");setTimeout(function(){s.classList.remove("coc-hit")},1200)};t.appendChild(b)});w.appendChild(t);
   COC.forEach(function(s,i){
     var c=el("section","coc-sec"+(s.key?" coc-key":"")),h=el("div","coc-h");
