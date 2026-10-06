@@ -270,9 +270,18 @@ async function recordActivityDay(env, id, now) {
   const day = Math.floor(now / 86400000);
   if (activityLastDay.get(id) === day) return;
   await ensureActivity(env);
-  await env.ADS_DB.prepare('INSERT OR IGNORE INTO activity_daily (day, id) VALUES (?, ?)').bind(day, id).run();
+  const ins = await env.ADS_DB.prepare('INSERT OR IGNORE INTO activity_daily (day, id) VALUES (?, ?)').bind(day, id).run();
   if (activityLastDay.size > 5000) activityLastDay.clear();
   activityLastDay.set(id, day);
+  // A friend's new active day can be what qualifies their invite, so the inviter's gift/unlock check runs now rather than
+  // waiting for the inviter to open the app. Once per account per day, best-effort.
+  if (ins && ins.meta && ins.meta.changes && String(id).startsWith('u:')) {
+    try {
+      await ensureAdStanding(env);
+      const r = await env.ADS_DB.prepare('SELECT referrer_sub FROM referrals WHERE referred_sub = ?').bind(String(id).slice(2)).first();
+      if (r) await maybeNotifyAdUnlock(env, r.referrer_sub, AD_TIER_CHECK_GAP_MS);
+    } catch (e) { console.log('referral activity check failed: ' + (e && e.message)); }
+  }
 }
 // Dismissed CSAM report records expire from KV 18 months after dismissal, but their report_index copy
 // (slug, reason, times; no details) is otherwise only removed when the admin list happens to load it.
@@ -3267,12 +3276,12 @@ async function handleRevenueCatWebhook(env, request) {
 
 /* ---- Ad access: packages are earned, not just bought ----
  * Buying is open to anyone who can pay, which would let a brand-new account flood the platform with ads on day one.
- * So each package is unlocked by standing in the community: subscribers, published notes, likes received, and (from
- * the second package up) giving back: likes given, accounts followed, days active, notes shared to stories, and
- * friends invited. Every requirement is shown to the owner as progress, never as a bare "no".
+ * So the 1,000 package is open to everyone and every bigger one is unlocked by standing in the community: subscribers,
+ * published notes, likes received, and giving back: likes given, accounts followed, days active, notes shared to
+ * stories, and friends invited. Every requirement is shown to the owner as progress, never as a bare "no".
  *
  * Why notes always outnumber ads, by construction:
- *  - every advertiser needs 5+ subscribers, so there are always several times more users than advertisers;
+ *  - the 1,000 package is open to everyone; from the 5,000 package up an advertiser needs 25+ subscribers;
  *  - every running ad needs AD_MIN_NOTES_PER_AD published notes behind it, so ads are at most 1/5 of an account's notes,
  *    and the requirements below keep real advertisers far under that;
  *  - a tier also caps how many ads one account can run at once.
@@ -3282,7 +3291,7 @@ async function handleRevenueCatWebhook(env, request) {
  * Unlocks are never revoked, only held; the hold lifts by itself when the strike ages out (or an admin excuses it), and the
  * check that sees it end sends a "package is back" alert. Holds only block starting new ads; running ads are untouched. */
 const AD_TIERS = [
-  { tier: 1, views: 1000,   maxActive: 1, req: { subs: 5,   notes: 5 } },
+  { tier: 1, views: 1000,   maxActive: 1, req: {} }, // open to everyone: gating starts at the 5,000 package
   { tier: 2, views: 5000,   maxActive: 2, req: { subs: 25,  notes: 10, likesReceived: 40,   likesGiven: 10,  follows: 5,  activeDays: 5 } },
   { tier: 3, views: 20000,  maxActive: 3, req: { subs: 100, notes: 25, likesReceived: 200,  likesGiven: 40,  follows: 10, activeDays: 12, stories: 3 } },
   { tier: 4, views: 100000, maxActive: 5, req: { subs: 400, notes: 60, likesReceived: 1000, likesGiven: 100, follows: 20, activeDays: 18, stories: 8 } }
@@ -3294,6 +3303,8 @@ const AD_TIER_POLL_GAP_MS = 10 * 60 * 1000;    // the app's alert poll: at most 
 const REFERRAL_WINDOW_MS = 14 * 24 * 60 * 60 * 1000;
 const REFERRAL_BONUS_PER = 3;                   // each qualified invite counts as this many subscribers toward packages 2 and up
 const REFERRAL_BONUS_MAX_INVITES = 5;           // ...for up to this many invites
+const REFERRAL_GIFT_VIEWS = 100;                // free views added to the inviter's balance for each qualified invite
+const REFERRAL_GIFT_MAX_INVITES = 5;            // ...for up to this many invites (the same five that count toward packages)
 const REFERRAL_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
 const REQ_WORDS = {
   subs: ['subscriber', 'subscribers'], notes: ['published note', 'published notes'],
@@ -3363,16 +3374,15 @@ function buildStanding(m) {
   const bonus = Math.min(m.referralsQualified, REFERRAL_BONUS_MAX_INVITES) * REFERRAL_BONUS_PER;
   const tiers = AD_TIERS.map((t) => {
     const reqs = Object.entries(t.req).map(([key, need]) => {
-      // Invites only ever help from the second package up: the first needs real subscribers.
-      const have = key === 'subs' && t.tier >= 2 ? m.subs + bonus : m[key];
-      return { key, label: reqLabel(key, need), hint: key === 'subs' && t.tier >= 2 ? 'invites count too' : null, have, need, met: have >= need };
+      const have = key === 'subs' ? m.subs + bonus : m[key];
+      return { key, label: reqLabel(key, need), hint: key === 'subs' ? 'invites count too' : null, have, need, met: have >= need };
     });
     return { tier: t.tier, views: t.views, maxActive: t.maxActive, reqs, met: reqs.every((r) => r.met) };
   });
   let earned = 0;
   for (const t of tiers) { if (t.met) earned = t.tier; else break; }
   const tier = Math.min(earned, strikeCap(m.strikes));
-  const cur = tier ? AD_TIERS[tier - 1] : null;
+  const cur = AD_TIERS[tier - 1];
   // When does each held package come back? Strikes expire oldest first, and every expiry can step the cap up a level,
   // so each held package gets its own date: returns[tier] = the first moment the cap lets that package through.
   // until = the first step back up, fullUntil = everything earned is open again (equal when one strike is the whole hold).
@@ -3391,7 +3401,7 @@ function buildStanding(m) {
   }
   return {
     tier, earnedTier: earned,
-    maxViews: cur ? cur.views : 0, maxActive: cur ? cur.maxActive : 0,
+    maxViews: cur.views, maxActive: cur.maxActive,
     activeAds: m.activeAds, notes: m.notes, minNotesPerAd: AD_MIN_NOTES_PER_AD,
     nextTier: tier < AD_TIERS.length ? tier + 1 : null,
     held,
@@ -3403,11 +3413,9 @@ function firstUnmet(t) { return t.reqs.find((r) => !r.met) || null; }
 
 // null when the owner may put `views` into a new ad now, else {code, message} written to encourage, not scold.
 function adGate(s, views) {
-  if (!s.tier) {
-    const r = firstUnmet(s.tiers[0]);
-    return { code: 'locked', message: 'Ads unlock at ' + fmtN(r.need) + ' ' + r.label + ' (you have ' + fmtN(r.have) + '). Keep publishing and sharing and you will get there.' };
-  }
   if (views > s.maxViews) {
+    // A typed amount (spending a balance) that is not a package size is simply over the level's per-ad cap.
+    if (!s.tiers.some((x) => x.views === views)) return { code: 'over-cap', message: 'At your level an ad can have up to ' + fmtN(s.maxViews) + ' views.' };
     const t = s.tiers.find((x) => x.views >= views) || s.tiers[s.tiers.length - 1];
     if (s.held && t.met) return { code: 'held', message: 'The ' + fmtN(t.views) + '-view package is paused after a recent rule strike. It comes back on ' + fmtDay((s.held.returns && s.held.returns[t.tier]) || s.held.fullUntil) + '.' };
     const r = firstUnmet(t);
@@ -3462,6 +3470,7 @@ async function maybeNotifyAdUnlock(env, sub, minGapMs) {
     if (!sub) return;
     await ensureAdStanding(env);
     const st = await env.ADS_DB.prepare('SELECT notified_tier, checked_at, was_held FROM ad_tier_state WHERE sub = ?').bind(sub).first();
+    await grantReferralGifts(env, sub); // free views for invites that have just qualified (cheap: nothing to do for most accounts)
     if (st && st.notified_tier >= AD_TIERS.length && !st.was_held) return; // everything announced and nothing held back: nothing left to say
     if (st && Date.now() - st.checked_at < (minGapMs || 0)) return;
     const user = await getUser(env, sub);
@@ -3491,6 +3500,66 @@ async function syncReferralAccountState(env, sub, blocked) {
     else await env.ADS_DB.prepare("UPDATE referrals SET voided_at = NULL, void_reason = NULL WHERE referred_sub = ? AND void_reason = 'account'").bind(sub).run();
   } catch (e) { console.log('referral state sync failed: ' + (e && e.message)); }
 }
+// A qualified invite (the friend published a note and has been active on two days, and the invite isn't voided) puts
+// REFERRAL_GIFT_VIEWS free views on the inviter's ledger, once per invited account, for up to REFERRAL_GIFT_MAX_INVITES
+// invites. The ledger row's rc_event_id is 'gift:' + the invited sub, which is what makes it once-only. The views land
+// in the balance like any refund (spendable on an ad without a purchase) and the inviter gets an alert. Best-effort: never
+// fails the caller, and anything missed is picked up by the next check.
+async function grantReferralGifts(env, sub) {
+  try {
+    await ensureAdStanding(env);
+    const cand = await env.ADS_DB.prepare(
+      "SELECT r.referred_sub AS rs FROM referrals r WHERE r.referrer_sub = ? AND r.voided_at IS NULL " +
+      "AND EXISTS (SELECT 1 FROM published_notes p WHERE p.author_sub = r.referred_sub) " +
+      "AND (SELECT COUNT(*) FROM activity_daily a WHERE a.id = 'u:' || r.referred_sub) >= 2 " +
+      "AND NOT EXISTS (SELECT 1 FROM view_credits_ledger l WHERE l.rc_event_id = 'gift:' || r.referred_sub) " +
+      "ORDER BY r.created_at ASC LIMIT ?"
+    ).bind(sub, REFERRAL_GIFT_MAX_INVITES).all();
+    const rows = (cand && cand.results) || [];
+    if (!rows.length) return;
+    const user = await getUser(env, sub);
+    if (!user || user.suspended || user.pendingDeletionAt) return;
+    const done = await env.ADS_DB.prepare(
+      "SELECT COUNT(*) AS c FROM view_credits_ledger WHERE owner_sub = ? AND reason = 'gift' AND rc_event_id NOT LIKE '%:back:%'"
+    ).bind(sub).first();
+    let room = REFERRAL_GIFT_MAX_INVITES - ((done && done.c) || 0);
+    for (const r of rows) {
+      if (room <= 0) break;
+      const id = 'gift:' + r.rs;
+      const ins = await env.ADS_DB.prepare(
+        "INSERT INTO view_credits_ledger (owner_sub, delta, reason, rc_event_id, created_at) " +
+        "SELECT ?, ?, 'gift', ?, ? WHERE NOT EXISTS (SELECT 1 FROM view_credits_ledger WHERE rc_event_id = ?)"
+      ).bind(sub, REFERRAL_GIFT_VIEWS, id, Date.now(), id).run();
+      if (!(ins && ins.meta && ins.meta.changes)) continue;
+      room--;
+      await createAlert(env, sub, 'referral',
+        'A friend you invited is up and running, so ' + fmtN(REFERRAL_GIFT_VIEWS) + ' free ad views were added to your balance. Put them on any of your published notes from Publish as Ad, no purchase needed.' +
+        (room <= 0 ? ' That was the last gift for invites. Later invites still count toward your ad access.' : ''),
+        { ref: id, dedupeMs: 365 * 24 * 60 * 60 * 1000 });
+    }
+  } catch (e) { console.log('referral gift failed: ' + (e && e.message)); }
+}
+
+// Admin void takes a gift back, restore returns it. Net of every ledger row for this invite, so repeats can't double up.
+// Returns the views moved (0 when there was nothing to move). A balance the gift already spent can go negative: that only
+// blocks starting new ads until it is back above zero; running ads are untouched.
+async function adjustReferralGift(env, referrerSub, referredSub, action) {
+  // Exactly this invite's rows ('gift:<sub>' and 'gift:<sub>:...'), never another account whose ID starts with the same digits.
+  const id = 'gift:' + referredSub;
+  const row = await env.ADS_DB.prepare('SELECT COALESCE(SUM(delta), 0) AS net, COUNT(*) AS n FROM view_credits_ledger WHERE owner_sub = ? AND (rc_event_id = ? OR rc_event_id LIKE ?)').bind(referrerSub, id, id + ':%').first();
+  const net = (row && row.net) || 0, n = (row && row.n) || 0;
+  if (action === 'void') {
+    if (net <= 0) return 0;
+    await env.ADS_DB.prepare("INSERT INTO view_credits_ledger (owner_sub, delta, reason, rc_event_id, created_at) VALUES (?, ?, 'gift_reversal', ?, ?)")
+      .bind(referrerSub, -net, 'gift:' + referredSub + ':rev:' + Date.now(), Date.now()).run();
+    return net;
+  }
+  if (n === 0 || net !== 0) return 0;
+  await env.ADS_DB.prepare("INSERT INTO view_credits_ledger (owner_sub, delta, reason, rc_event_id, created_at) VALUES (?, ?, 'gift', ?, ?)")
+    .bind(referrerSub, REFERRAL_GIFT_VIEWS, 'gift:' + referredSub + ':back:' + Date.now(), Date.now()).run();
+  return REFERRAL_GIFT_VIEWS;
+}
+
 async function referralCodeFor(env, sub) {
   await ensureAdStanding(env);
   const have = await env.ADS_DB.prepare('SELECT code FROM referral_codes WHERE sub = ?').bind(sub).first();
@@ -3508,9 +3577,11 @@ async function referralCodeFor(env, sub) {
 async function referralSummary(env, sub, user, m) {
   const code = await referralCodeFor(env, sub);
   const used = await env.ADS_DB.prepare('SELECT 1 AS x FROM referrals WHERE referred_sub = ?').bind(sub).first();
+  const gifted = await env.ADS_DB.prepare("SELECT COUNT(*) AS c FROM view_credits_ledger WHERE owner_sub = ? AND reason = 'gift' AND rc_event_id NOT LIKE '%:back:%'").bind(sub).first();
   return {
     code, invited: m.referralsTotal, qualified: m.referralsQualified,
     bonusPer: REFERRAL_BONUS_PER, maxBonusInvites: REFERRAL_BONUS_MAX_INVITES,
+    giftViews: REFERRAL_GIFT_VIEWS, giftMaxInvites: REFERRAL_GIFT_MAX_INVITES, giftedInvites: (gifted && gifted.c) || 0,
     canRedeem: !used && !!user && Date.now() - (user.createdAt || 0) <= REFERRAL_WINDOW_MS
   };
 }
@@ -3552,7 +3623,7 @@ async function handleReferralRedeem(env, request) {
     await applySubscription(env, request, sub, row.sub, true);
     followed = true;
   }
-  await createAlert(env, row.sub, 'referral', 'A friend joined with your invite code. Once they publish a note and have been active on two days, they count toward your ad access.', { ref: 'ref:' + sub, dedupeMs: 365 * 24 * 60 * 60 * 1000 });
+  await createAlert(env, row.sub, 'referral', 'A friend joined with your invite code. Once they publish a note and have been active on two days, they count toward your ad access and ' + fmtN(REFERRAL_GIFT_VIEWS) + ' free ad views are added to your balance.', { ref: 'ref:' + sub, dedupeMs: 365 * 24 * 60 * 60 * 1000 });
   await maybeNotifyAdUnlock(env, row.sub, AD_TIER_CHECK_GAP_MS);
   if (followed) await maybeNotifyAdUnlock(env, row.sub, 0);
   return json({ ok: true, followed });
@@ -3569,7 +3640,11 @@ async function handleAdPublish(env, request) {
   if (!sub) return textError(401, 'sign-in required');
   let body;
   try { body = await request.json(); } catch (e) { return textError(400, 'invalid JSON body'); }
-  const { slug, token, views } = body || {};
+  // Buying a package for a note allocates it: the app buys, then registers the note with the package size. Views can also be
+  // bought ahead from Settings (the webhook credits the balance with no note attached), and useBalance:true spends views
+  // already on the ledger (refunds, invite gifts, funding) in any amount up to the level's cap, with no store purchase.
+  // Both paths debit the same ledger below, so the amount is the only thing that differs.
+  const { slug, token, views, useBalance } = body || {};
   if (!validSlug(slug)) return textError(400, 'invalid slug');
   if (!Number.isInteger(views) || views <= 0) return textError(400, 'invalid views');
 
@@ -3596,8 +3671,9 @@ async function handleAdPublish(env, request) {
   const gate = adGate(standing, views);
   if (gate) return json({ error: gate.message, code: gate.code }, 403);
 
+  const insufficient = useBalance === true ? 'your balance does not cover that many views' : 'insufficient view credits';
   const balance = await getCreditBalance(env, sub);
-  if (balance < views) return textError(402, 'insufficient view credits');
+  if (balance < views) return textError(402, insufficient);
 
   const now = Date.now();
   // The balance check above is only a fast path — it and the debit below
@@ -3624,9 +3700,9 @@ async function handleAdPublish(env, request) {
        WHERE EXISTS (SELECT 1 FROM ads WHERE slug = ? AND owner_sub = ? AND created_at = ?)`
     ).bind(sub, -views, slug, now, slug, sub, now),
   ]);
-  if (!results[0].meta.changes) return textError(402, 'insufficient view credits');
+  if (!results[0].meta.changes) return textError(402, insufficient);
 
-  return json({ ok: true, slug, viewsTotal: views, kind: eligibility.kind }, 201);
+  return json({ ok: true, slug, viewsTotal: views, kind: eligibility.kind, creditBalance: await getCreditBalance(env, sub) }, 201);
 }
 
 // Re-validates and swaps the page content for an already-running ad — the
@@ -4849,7 +4925,7 @@ async function handleAdminOwner(env, request, url) {
     strikeRows = ar[1].results || [];
     alertTotal = ((ar[2].results || [])[0] || {}).n || 0;
   } catch (e) { console.log('admin alerts failed: ' + (e && e.message)); }
-  let adTier = null; // which ad package the account has earned (0 = none yet); see AD_TIERS
+  let adTier = null; // which ad package the account has earned; see AD_TIERS
   let referral = null;
   try {
     const adMet = await adMetrics(env, sub);
@@ -4992,10 +5068,11 @@ async function handleAdminReferral(env, request) {
     if (row.void_reason !== 'admin') return textError(409, 'this referral is paused because the account is suspended or being deleted; it returns when that ends');
     await env.ADS_DB.prepare('UPDATE referrals SET voided_at = NULL, void_reason = NULL WHERE referred_sub = ?').bind(referred).run();
   }
-  await audit(env, 'referral_' + action, slug, (reason || '') + (aid ? ' [' + aid.slice(0, 10) + ']' : ''));
+  const moved = await adjustReferralGift(env, row.referrer_sub, referred, action);
+  await audit(env, 'referral_' + action, slug, (reason || '') + (aid ? ' [' + aid.slice(0, 10) + ']' : '') + (moved ? ' (' + (action === 'void' ? '-' : '+') + moved + ' gift views)' : ''));
   await createAlert(env, row.referrer_sub, 'referral', action === 'void'
-    ? 'A friend\u2019s invite no longer counts toward your ad access. ' + alertReason(reason)
-    : 'A friend\u2019s invite counts toward your ad access again.');
+    ? 'A friend\u2019s invite no longer counts toward your ad access. ' + (moved ? 'The ' + fmtN(moved) + ' free views it gave you were taken back. ' : '') + alertReason(reason)
+    : 'A friend\u2019s invite counts toward your ad access again.' + (moved ? ' Its ' + fmtN(moved) + ' free views are back in your balance.' : ''));
   await maybeNotifyAdUnlock(env, row.referrer_sub, 0);
   return json({ ok: true });
 }
@@ -7424,7 +7501,7 @@ function strikeAct(slug,x,done){
   })
 }
 function refAct(slug,aid,restore,done){
-  return ask({title:restore?'Count this referral again?':'Void this referral?',text:restore?'It counts toward the referrer ad access again. The referrer is told.':'It stops counting toward the referrer ad access. The referrer gets an alert with your reason.',ok:restore?'Restore':'Void',danger:!restore,fields:restore?undefined:[REASON_F]}).then(function(v){
+  return ask({title:restore?'Count this referral again?':'Void this referral?',text:restore?'It counts toward the referrer ad access again, and any free views taken back are returned. The referrer is told.':'It stops counting toward the referrer ad access, and any free views it gave are taken back. The referrer gets an alert with your reason.',ok:restore?'Restore':'Void',danger:!restore,fields:restore?undefined:[REASON_F]}).then(function(v){
     if(!v)return;var reason='';if(!restore){reason=reasonOf(v);if(!reason)return}
     var b={slug:slug,action:restore?'restore':'void',reason:reason};if(aid)b.aid=aid;
     return api('/admin/referral',{method:'POST',body:b}).then(function(o){if(o.ok){msg(restore?'Referral counts again':'Referral voided');done()}else showErr(o,restore?'Could not restore the referral':'Could not void the referral')})
@@ -7459,7 +7536,7 @@ function loadOwner(slug){
     c.appendChild(st);
     var k=el('div','kvs');c.appendChild(k);
     aidRow(k,d.authorId);
-    kv(k,'Signed up',fmt(d.createdAt));kv(k,'Last sign-in',fmt(d.lastSignInAt));kv(k,'Ads',String(d.ads));kv(k,'Credit balance',num(d.creditBalance));
+    kv(k,'Signed up',fmt(d.createdAt));kv(k,'Last sign-in',fmt(d.lastSignInAt));kv(k,'Ads',String(d.ads));kv(k,'Unspent balance',num(d.creditBalance)+' views');
     kv(k,'Display name',d.displayName||'-');
     kv(k,'Backup',d.backup?num(d.backup.images)+(d.backup.imagesMore?'+':'')+' images - '+Math.round(d.backup.sizeBytes/1024)+' KB - '+ago(d.backup.updatedAt):'none');
     var rf=d.referral;
@@ -7469,7 +7546,7 @@ function loadOwner(slug){
       kv(rk,'Invite code',rf.code||'-');kv(rk,'Invited',num(rf.invited)+' ('+num(rf.qualified)+' counting)');
       if(rf.referredBy)c.appendChild(refRow(slug,rf.referredBy,'Referred by ',undefined,again0));
       if(rf.referred&&rf.referred.length){
-        c.appendChild(el('div','fine','Accounts that joined with this code'+(rf.invited>rf.referred.length?' (latest '+num(rf.referred.length)+')':'')+'. A friend counts once they publish a note and have been active on two days.'));
+        c.appendChild(el('div','fine','Accounts that joined with this code'+(rf.invited>rf.referred.length?' (latest '+num(rf.referred.length)+')':'')+'. A friend counts once they publish a note and have been active on two days, and each one that counts also adds 100 free ad views to the referrer balance (up to 5 friends).'));
         rf.referred.forEach(function(x){c.appendChild(refRow(slug,x,'',x.authorId||null,again0))})
       }
     }
@@ -7497,8 +7574,9 @@ function loadOwner(slug){
     }
     if(d.hasProfileImage){c.appendChild(el('div','sec-t','Profile picture'));var pw=el('div','media');pw.appendChild(mediaTile('Profile picture',function(){return loadMedia(slug,'profile')},true));c.appendChild(pw)}
     if(d.ledger&&d.ledger.length){
-      c.appendChild(el('div','sec-t','Credit ledger'));
-      d.ledger.forEach(function(x){var r=el('div','pgrow'),l=el('div');l.appendChild(el('div','slug',(x.delta>0?'+':'')+num(x.delta)+' views'));l.appendChild(el('small',null,x.reason+(x.slug?' - /'+x.slug:'')+' - '+ago(x.at)));r.appendChild(l);c.appendChild(r)})
+      c.appendChild(el('div','sec-t','View ledger'));
+      c.appendChild(el('div','fine','Views are bought for a note (straight onto its ad) or added to the balance from Settings ahead of time. Refunds and invite gifts also leave a balance. The owner can put a balance on any of their ads without paying again.'));
+      d.ledger.forEach(function(x){var r=el('div','pgrow'),l=el('div');l.appendChild(el('div','slug',(x.delta>0?'+':'')+num(x.delta)+' views'));l.appendChild(el('small',null,({purchase:'Bought',allocate:'Put on ad',refund:'Returned to balance',gift:'Gift for an invite',gift_reversal:'Gift taken back'}[x.reason]||x.reason)+(x.slug?' - /'+x.slug:'')+' - '+ago(x.at)));r.appendChild(l);c.appendChild(r)})
     }
     if(d.alerts&&d.alerts.length){
       c.appendChild(el('div','sec-t','Alerts sent ('+num(d.alertTotal||d.alerts.length)+')'));
