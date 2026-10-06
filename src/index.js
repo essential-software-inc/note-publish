@@ -3291,10 +3291,10 @@ async function handleRevenueCatWebhook(env, request) {
  * Unlocks are never revoked, only held; the hold lifts by itself when the strike ages out (or an admin excuses it), and the
  * check that sees it end sends a "package is back" alert. Holds only block starting new ads; running ads are untouched. */
 const AD_TIERS = [
-  { tier: 1, views: 1000,   maxActive: 1, req: {} }, // open to everyone: gating starts at the 5,000 package
-  { tier: 2, views: 5000,   maxActive: 2, req: { subs: 25,  notes: 10, likesReceived: 40,   likesGiven: 10,  follows: 5,  activeDays: 5 } },
-  { tier: 3, views: 20000,  maxActive: 3, req: { subs: 100, notes: 25, likesReceived: 200,  likesGiven: 40,  follows: 10, activeDays: 12, stories: 3 } },
-  { tier: 4, views: 100000, maxActive: 5, req: { subs: 400, notes: 60, likesReceived: 1000, likesGiven: 100, follows: 20, activeDays: 18, stories: 8 } }
+  { tier: 1, views: 1000,   maxActive: 2, req: {} }, // open to everyone: gating starts at the 5,000 package
+  { tier: 2, views: 5000,   maxActive: 4, req: { subs: 25,  notes: 10, likesReceived: 40,   likesGiven: 10,  follows: 5,  activeDays: 5 } },
+  { tier: 3, views: 20000,  maxActive: 6, req: { subs: 100, notes: 25, likesReceived: 200,  likesGiven: 40,  follows: 10, activeDays: 12, stories: 3 } },
+  { tier: 4, views: 100000, maxActive: 10, req: { subs: 400, notes: 60, likesReceived: 1000, likesGiven: 100, follows: 20, activeDays: 18, stories: 8 } }
 ];
 const AD_MIN_NOTES_PER_AD = 5;
 const AD_STRIKE_WINDOW_MS = 60 * 24 * 60 * 60 * 1000;
@@ -3422,7 +3422,7 @@ function adGate(s, views) {
     return { code: 'locked', message: 'The ' + fmtN(t.views) + '-view package unlocks at ' + fmtN(r.need) + ' ' + r.label + ' (you have ' + fmtN(r.have) + ').' };
   }
   if (s.activeAds >= s.maxActive) {
-    return { code: 'ad-limit', message: 'At your level you can run ' + s.maxActive + (s.maxActive === 1 ? ' ad' : ' ads') + ' at once. Let one finish, or unlock the next package for more.' };
+    return { code: 'ad-limit', message: 'At your level you can run ' + s.maxActive + (s.maxActive === 1 ? ' ad' : ' ads') + ' at once. ' + (s.nextTier ? 'Let one finish, or unlock the next package for more.' : 'Let one finish to start another.') };
   }
   const needNotes = AD_MIN_NOTES_PER_AD * (s.activeAds + 1);
   if (s.notes < needNotes) {
