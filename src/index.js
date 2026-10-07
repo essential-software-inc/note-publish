@@ -2103,14 +2103,18 @@ async function applySubscription(env, request, sub, authorSub, want) {
 async function handleSubscriberCount(env, request) {
   const sub = await requireSession(env, request);
   if (!sub) return textError(401, 'sign-in required');
-  const [subs, likes] = await env.ADS_DB.batch([
+  const [subs, likes, following] = await env.ADS_DB.batch([
     env.ADS_DB.prepare('SELECT COUNT(*) AS c FROM subscriptions WHERE author_sub = ?').bind(sub),
-    env.ADS_DB.prepare('SELECT COUNT(*) AS c FROM likes WHERE author_sub = ?').bind(sub)
+    env.ADS_DB.prepare('SELECT COUNT(*) AS c FROM likes WHERE author_sub = ?').bind(sub),
+    env.ADS_DB.prepare('SELECT COUNT(*) AS c FROM subscriptions WHERE subscriber_sub = ?').bind(sub)
   ]);
+  const user = await getUser(env, sub);
   const one = (r) => (r && r.results && r.results[0] && r.results[0].c) || 0;
   // `likes` = total likes across every note this account has published, shown
   // next to the subscriber count on the Account sheet.
-  return json({ count: one(subs), likes: one(likes) });
+  // `following` = accounts this one subscribes to; `createdAt` = when the account was made (null if unknown).
+  // Both feed the Settings > Account rows.
+  return json({ count: one(subs), likes: one(likes), following: one(following), createdAt: (user && user.createdAt) || null });
 }
 
 // GET /subscriptions — every author the signed-in account follows, as a list
@@ -4876,7 +4880,7 @@ async function handleAdminOwner(env, request, url) {
   if (!meta) return textError(404, 'not found');
   if (!meta.ownerSub) return json({ anonymous: true });
   const sub = meta.ownerSub;
-  const [user, counts, adsRow, balance, subRow, likeRows, ledgerRows, syncRaw, syncImgs] = await Promise.all([
+  const [user, counts, adsRow, balance, subRow, likeRows, ledgerRows, syncRaw, syncImgs, followingRow] = await Promise.all([
     getUser(env, sub), reportCounts(env),
     env.ADS_DB.prepare('SELECT COUNT(*) AS n FROM ads WHERE owner_sub = ?').bind(sub).first(),
     getCreditBalance(env, sub),
@@ -4885,7 +4889,9 @@ async function handleAdminOwner(env, request, url) {
     env.ADS_DB.prepare('SELECT slug, COUNT(*) AS n FROM likes WHERE author_sub = ? GROUP BY slug').bind(sub).all(),
     env.ADS_DB.prepare('SELECT delta, reason, slug, created_at FROM view_credits_ledger WHERE owner_sub = ? ORDER BY created_at DESC LIMIT 20').bind(sub).all(),
     env.ACCOUNTS.get('syncmeta:' + sub),
-    adminCountSyncImages(env, sub)
+    adminCountSyncImages(env, sub),
+    // Accounts this one follows; the Settings > Account "Following" row counts the same table.
+    env.ADS_DB.prepare('SELECT COUNT(*) AS n FROM subscriptions WHERE subscriber_sub = ?').bind(sub).first()
   ]);
   let syncMeta = null;
   try { syncMeta = syncRaw ? JSON.parse(syncRaw) : null; } catch (e) {}
@@ -4926,10 +4932,12 @@ async function handleAdminOwner(env, request, url) {
     alertTotal = ((ar[2].results || [])[0] || {}).n || 0;
   } catch (e) { console.log('admin alerts failed: ' + (e && e.message)); }
   let adTier = null; // which ad package the account has earned; see AD_TIERS
+  let adsRunning = null, adLimit = null; // ads running now vs. how many its level allows at once
   let referral = null;
   try {
     const adMet = await adMetrics(env, sub);
-    adTier = buildStanding(adMet).tier;
+    const standing = buildStanding(adMet);
+    adTier = standing.tier; adsRunning = standing.activeAds; adLimit = standing.maxActive;
     const [codeRow, byRow, kidRows] = await Promise.all([
       env.ADS_DB.prepare('SELECT code FROM referral_codes WHERE sub = ?').bind(sub).first(),
       env.ADS_DB.prepare('SELECT r.referrer_sub, r.created_at, r.voided_at, r.void_reason, a.author_id FROM referrals r LEFT JOIN authors a ON a.sub = r.referrer_sub WHERE r.referred_sub = ?').bind(sub).first(),
@@ -4963,7 +4971,7 @@ async function handleAdminOwner(env, request, url) {
     lastSignInAt: user ? user.lastSignInAt || null : null,
     suspended: !!(user && user.suspended), pendingDeletionAt: user ? user.pendingDeletionAt || null : null,
     pages, ads: adsRow ? adsRow.n : 0, creditBalance: balance,
-    subscribers: subRow ? subRow.n : 0, likes: likesTotal, adTier, referral
+    subscribers: subRow ? subRow.n : 0, following: followingRow ? followingRow.n : 0, likes: likesTotal, adTier, adsRunning, adLimit, referral
   });
 }
 
@@ -5112,7 +5120,7 @@ async function handleAdminStory(env, request) {
   return json({ ok: true });
 }
 
-// GET /admin/ads?status=&kind=write|share&sort=new|most_subs|least_subs|most_posts|least_posts|most_likes|least_likes&q=&cursor= (q: slug part or author ID): ads across all
+// GET /admin/ads?status=&kind=write|share&sort=new|most_subs|least_subs|most_posts|least_posts|most_likes|least_likes|most_following|least_following&q=&cursor= (q: slug part or author ID): ads across all
 // accounts, newest first unless sorted by the ad note's likes or the owner's subscriber or note count (newest first inside each count), keyset-paginated.
 const ADMIN_ADS_PAGE = 30;
 async function handleAdminAds(env, request, url) {
@@ -5164,7 +5172,7 @@ async function handleAdminAds(env, request, url) {
     ads: rows.map(r => ({
       slug: r.slug, ownerEmail: emails[r.owner_sub], viewsTotal: r.views_total, viewsUsed: r.views_used,
       status: r.status, createdAt: r.created_at, uniqueViewers: r.unique_viewers, kind: r.kind === 'share' ? 'share' : 'write',
-      ownerSubs: r.author_subs, ownerNotes: r.author_notes, likes: r.likes
+      ownerSubs: r.author_subs, ownerFollowing: r.author_following, ownerNotes: r.author_notes, likes: r.likes
     })),
     total: cur ? null : res[0].results[0].t,
     next: more && last ? (cs ? last.sort_key + '|' + last.created_at + ':' + last.slug : last.created_at + '|' + last.slug) : null
@@ -5406,7 +5414,7 @@ const ALERT_ID_SQL = "lower(hex(randomblob(4)) || '-' || hex(randomblob(2)) || '
 function caSearch(raw) {
   return String(raw || '').trim().toLowerCase().replace(/^@/, '').replace(/[^a-z0-9_]/g, '').slice(0, 34);
 }
-// One page of recipients (sql yields column s), newest accounts first (or by body.sort: most_subs|least_subs|most_posts|least_posts|most_likes|least_likes), shaped like GET /admin/users rows. With a search q it
+// One page of recipients (sql yields column s), newest accounts first (or by body.sort: most_subs|least_subs|most_posts|least_posts|most_likes|least_likes|most_following|least_following), shaped like GET /admin/users rows. With a search q it
 // also reports how many recipients match (found) and, for a whole author ID, whether that account is one of them (check:
 // 'in' | 'out' | 'unknown' for an ID that belongs to no account).
 async function caRecipientPage(env, sql, bind, count, body) {
@@ -5417,6 +5425,7 @@ async function caRecipientPage(env, sql, bind, count, body) {
   const res = await env.ADS_DB.prepare(
     'SELECT a.sub, a.author_id, a.created_at, p.last_seen, (SELECT COUNT(*) FROM published_notes n WHERE n.author_sub = a.sub) AS notes, ' +
     '(SELECT COUNT(*) FROM subscriptions sb WHERE sb.author_sub = a.sub) AS subs, ' +
+      '(SELECT COUNT(*) FROM subscriptions fg WHERE fg.subscriber_sub = a.sub) AS following, ' +
       '(SELECT COUNT(*) FROM likes lk WHERE lk.author_sub = a.sub) AS likes' +
     " FROM authors a LEFT JOIN presence p ON p.id = 'u:' || a.sub WHERE a.sub IN (" + sql + ')' +
     (q ? ' AND instr(a.author_id, ?) > 0' : '') +
@@ -5704,7 +5713,7 @@ async function ownerReportStats(env, sub, slugs0) {
   } catch (e) { console.log('owner report stats failed: ' + (e && e.message)); return null; }
 }
 
-// GET /admin/users?cursor=&q=&sort=new|old|active|most_subs|least_subs|most_posts|least_posts|most_likes|least_likes&f=online|active24: accounts, keyset-paginated (no
+// GET /admin/users?cursor=&q=&sort=new|old|active|most_subs|least_subs|most_posts|least_posts|most_likes|least_likes|most_following|least_following&f=online|active24: accounts, keyset-paginated (no
 // OFFSET, so deep pages cost the same as the first). The total is only computed on the first page
 // (no cursor); the client keeps it. q matches the start of the account id or author id (emails live
 // in KV, so they can't be searched, only shown).
@@ -5755,13 +5764,15 @@ function parseAdminCursor(raw) {
   const id = raw.slice(i + 1).slice(0, 200);
   return Number.isFinite(key) && id ? { key, id } : null;
 }
-// Count sorts shared by the admin lists (sort=most_subs|least_subs|most_posts|least_posts|most_likes|least_likes): by how many subscribers or
+// Count sorts shared by the admin lists (sort=most_subs|least_subs|most_posts|least_posts|most_likes|least_likes|most_following|least_following): by how many subscribers or
 // published notes an account has. col = the account column of the row being sorted; the expression is repeated in the
 // cursor test so keyset paging stays exact. Own-property check, so a sort of "constructor" can't match.
 const ADMIN_COUNT_SORTS = {
   most_subs: { t: 'subscriptions', col: 'subs', asc: false }, least_subs: { t: 'subscriptions', col: 'subs', asc: true },
   most_posts: { t: 'published_notes', col: 'notes', asc: false }, least_posts: { t: 'published_notes', col: 'notes', asc: true },
-  most_likes: { t: 'likes', col: 'likes', asc: false }, least_likes: { t: 'likes', col: 'likes', asc: true }
+  most_likes: { t: 'likes', col: 'likes', asc: false }, least_likes: { t: 'likes', col: 'likes', asc: true },
+  // Following = accounts this one subscribes to, so it counts the other side of the subscriptions table (`by`).
+  most_following: { t: 'subscriptions', by: 'subscriber_sub', col: 'following', asc: false }, least_following: { t: 'subscriptions', by: 'subscriber_sub', col: 'following', asc: true }
 };
 // slugCol (optional) is the note's slug column for lists whose rows are notes (notes, ads, reports): a likes sort then counts that
 // note's own likes. Without it, likes are everything the account's notes have received. Subscriber / note sorts always count the account.
@@ -5769,11 +5780,12 @@ function adminCountSort(sort, col, slugCol) {
   if (typeof sort !== 'string' || !Object.prototype.hasOwnProperty.call(ADMIN_COUNT_SORTS, sort)) return null;
   const s = ADMIN_COUNT_SORTS[sort];
   if (s.t === 'likes') return { col: s.col, asc: s.asc, expr: '(SELECT COUNT(*) FROM likes ct WHERE ct.' + (slugCol ? 'slug = ' + slugCol : 'author_sub = ' + col) + ')' };
-  return { col: s.col, asc: s.asc, expr: '(SELECT COUNT(*) FROM ' + s.t + ' ct WHERE ct.author_sub = ' + col + ')' };
+  return { col: s.col, asc: s.asc, expr: '(SELECT COUNT(*) FROM ' + s.t + ' ct WHERE ct.' + (s.by || 'author_sub') + ' = ' + col + ')' };
 }
 // An account's follower and note counts, as extra columns for lists whose rows belong to an account (col).
 function adminAuthorCols(col) {
   return '(SELECT COUNT(*) FROM subscriptions xs WHERE xs.author_sub = ' + col + ') AS author_subs, ' +
+    '(SELECT COUNT(*) FROM subscriptions xf WHERE xf.subscriber_sub = ' + col + ') AS author_following, ' +
     '(SELECT COUNT(*) FROM published_notes xn WHERE xn.author_sub = ' + col + ') AS author_notes';
 }
 // Lists keyed by (created_at, slug) that sort by a count keep newest first inside each count, so their cursor is
@@ -5810,6 +5822,7 @@ async function handleAdminUsers(env, request, url) {
     env.ADS_DB.prepare(
       'SELECT a.sub, a.author_id, a.created_at, p.last_seen, (SELECT COUNT(*) FROM published_notes n WHERE n.author_sub = a.sub) AS notes, ' +
       '(SELECT COUNT(*) FROM subscriptions sb WHERE sb.author_sub = a.sub) AS subs, ' +
+      '(SELECT COUNT(*) FROM subscriptions fg WHERE fg.subscriber_sub = a.sub) AS following, ' +
       '(SELECT COUNT(*) FROM likes lk WHERE lk.author_sub = a.sub) AS likes' +
       from + whereSql + curSql + ' ORDER BY ' + order + ' LIMIT ?'
     ).bind(...bind, ...(cur ? [cur.key, cur.id] : []), ADMIN_DIR_PAGE + 1)
@@ -5854,14 +5867,14 @@ async function adminUserRows(env, rows, now) {
       referredBy, referralCode: codes.get(r.sub) || null,
       authorId: r.author_id || null,
       email: u ? u.email || null : null, name: u ? u.profileName || null : null, lastSignInAt: u ? u.lastSignInAt || null : null,
-      createdAt: r.created_at, lastSeen: r.last_seen || null, notes: r.notes, subs: r.subs, likes: r.likes,
+      createdAt: r.created_at, lastSeen: r.last_seen || null, notes: r.notes, subs: r.subs, following: r.following, likes: r.likes,
       online: !!(r.last_seen && now - r.last_seen < ONLINE_WINDOW_MS),
       suspended: !!(u && u.suspended && !u.pendingDeletionAt), deleting: !!(u && u.pendingDeletionAt)
     };
   }));
 }
 
-// GET /admin/notes?cursor=&q=&sort=new|most_subs|least_subs|most_posts|least_posts|most_likes|least_likes: published notes (signed-in publishers), newest
+// GET /admin/notes?cursor=&q=&sort=new|most_subs|least_subs|most_posts|least_posts|most_likes|least_likes|most_following|least_following: published notes (signed-in publishers), newest
 // first unless sorted by the note's likes or its author's subscriber or note count (newest first inside each count), keyset-paginated;
 // total on the first page only. q matches the start of the slug.
 async function handleAdminNotes(env, request, url) {
@@ -5892,7 +5905,7 @@ async function handleAdminNotes(env, request, url) {
   if (more) rows.pop();
   const last = rows[rows.length - 1];
   return json({
-    notes: rows.map(r => ({ slug: r.slug, title: r.title || null, createdAt: r.created_at, story: !!r.story, authorSubs: r.author_subs, authorNotes: r.author_notes, likes: r.likes })),
+    notes: rows.map(r => ({ slug: r.slug, title: r.title || null, createdAt: r.created_at, story: !!r.story, authorSubs: r.author_subs, authorFollowing: r.author_following, authorNotes: r.author_notes, likes: r.likes })),
     total: cur ? null : res[0].results[0].t,
     next: more && last ? (cs ? last.sort_key + '|' + last.created_at + ':' + last.slug : last.created_at + '|' + last.slug) : null
   });
@@ -6878,10 +6891,10 @@ function ask(o){
   })
 }
 
-var CSORT=[['most_subs','Most subscribers'],['least_subs','Least subscribers'],['most_posts','Most notes'],['least_posts','Least notes'],['most_likes','Most likes'],['least_likes','Least likes']];
+var CSORT=[['most_subs','Most subscribers'],['least_subs','Least subscribers'],['most_posts','Most notes'],['least_posts','Least notes'],['most_likes','Most likes'],['least_likes','Least likes'],['most_following','Most following'],['least_following','Least following']];
 // "12 subscribers" / "1 note" / "84 likes" for a count k (subs | posts | likes).
-function cntWord(k,n){return num(n)+(k==='subs'?(n===1?' subscriber':' subscribers'):k==='posts'?(n===1?' note':' notes'):(n===1?' like':' likes'))}
-function isCsort(so){return /^(most|least)_(subs|posts|likes)$/.test(so||'')}
+function cntWord(k,n){return num(n)+(k==='subs'?(n===1?' subscriber':' subscribers'):k==='posts'?(n===1?' note':' notes'):k==='following'?' following':(n===1?' like':' likes'))}
+function isCsort(so){return /^(most|least)_(subs|posts|likes|following)$/.test(so||'')}
 // What a count sort on the Reports list ordered a card by: the reported note's likes, or its owner's subscribers / notes.
 function repCnt(r){var so=$('fsort').value;if(!isCsort(so)||r.sortCount==null)return '';var k=so.split('_')[1];return ' - '+(k==='likes'?'':'owner has ')+cntWord(k,r.sortCount)}
 var PICKS={ovnsort:[['new','Newest first']].concat(CSORT),adsort:[['new','Newest first']].concat(CSORT),ovsort:[['new', 'Newest first'], ['old', 'Oldest first'], ['active', 'Last active']].concat(CSORT),ovfilter:[['', 'All users'], ['online', 'Online now'], ['active24', 'Active 24h']],fstatus:[['', 'Any status'], ['live', 'live'], ['taken down', 'taken down'], ['unpublished', 'unpublished'], ['missing', 'missing']],fsort:[['new', 'Default order'], ['most', 'Most reported'], ['old', 'Oldest first']].concat(CSORT),adst:[['', 'All ads'], ['active', 'Active'], ['paused', 'Paused'], ['exhausted', 'Used up'], ['unpublished', 'Down']],adkind:[['', 'Write & Share'], ['write', 'Write'], ['share', 'Share']]};
@@ -7534,11 +7547,11 @@ function loadOwner(slug){
     if(d.pendingDeletionAt)cr.appendChild(chip('deletion '+fmtD(d.pendingDeletionAt+2592000000),'bad'));
     hm.appendChild(cr);hd.appendChild(hm);c.appendChild(hd);
     var st=el('div','stats');
-    [['Subscribers',d.subscribers],['Likes',d.likes],['Live pages',d.pages.length],['Ad tier',d.adTier],['Strikes',d.strikeCount],['Reports',d.reportStats?d.reportStats.total:null],['Alerts',d.alertTotal]].forEach(function(x){var s=el('div','stat');s.appendChild(el('b',null,x[1]==null?'-':num(x[1])));s.appendChild(el('span',null,x[0]));st.appendChild(s)});
+    [['Subscribers',d.subscribers],['Likes',d.likes],['Following',d.following],['Live pages',d.pages.length],['Ad tier',d.adTier],['Strikes',d.strikeCount],['Reports',d.reportStats?d.reportStats.total:null],['Alerts',d.alertTotal]].forEach(function(x){var s=el('div','stat');s.appendChild(el('b',null,x[1]==null?'-':num(x[1])));s.appendChild(el('span',null,x[0]));st.appendChild(s)});
     c.appendChild(st);
     var k=el('div','kvs');c.appendChild(k);
     aidRow(k,d.authorId);
-    kv(k,'Signed up',fmt(d.createdAt));kv(k,'Last sign-in',fmt(d.lastSignInAt));kv(k,'Ads',String(d.ads));kv(k,'Unspent balance',num(d.creditBalance)+' views');
+    kv(k,'Signed up',fmt(d.createdAt));kv(k,'Last sign-in',fmt(d.lastSignInAt));kv(k,'Ads',String(d.ads));kv(k,'Ads running',d.adsRunning==null?'-':d.adsRunning+' / '+d.adLimit);kv(k,'Unspent balance',num(d.creditBalance)+' views');
     kv(k,'Display name',d.displayName||'-');
     kv(k,'Backup',d.backup?num(d.backup.images)+(d.backup.imagesMore?'+':'')+' images - '+Math.round(d.backup.sizeBytes/1024)+' KB - '+ago(d.backup.updatedAt):'none');
     var rf=d.referral;
@@ -7706,7 +7719,7 @@ function renderAd(a){
   var pct=a.viewsTotal?Math.min(100,Math.round(a.viewsUsed/a.viewsTotal*100)):0;
   var m=el('div'),bar=el('div','meter'),i=document.createElement('i');i.style.width=pct+'%';bar.appendChild(i);m.appendChild(bar);
   var ml=el('div','meter-l');ml.appendChild(el('span',null,num(a.viewsUsed)+' of '+num(a.viewsTotal)+' views'));ml.appendChild(el('span',null,pct+'%'));m.appendChild(ml);
-  var card=mkCard({sev:'ad',icon:'ads',slug:a.slug,chips:[stChip(a.status)],sub:(a.ownerEmail||'account missing')+(a.ownerSubs==null?'':' - '+num(a.ownerSubs)+(a.ownerSubs===1?' subscriber':' subscribers')+' - '+num(a.ownerNotes)+(a.ownerNotes===1?' note':' notes')),extra:m,key:'ad:'+a.slug});
+  var card=mkCard({sev:'ad',icon:'ads',slug:a.slug,chips:[stChip(a.status)],sub:(a.ownerEmail||'account missing')+(a.ownerSubs==null?'':' - '+num(a.ownerSubs)+(a.ownerSubs===1?' subscriber':' subscribers')+(a.ownerFollowing==null?'':' - '+num(a.ownerFollowing)+' following')+' - '+num(a.ownerNotes)+(a.ownerNotes===1?' note':' notes')),extra:m,key:'ad:'+a.slug});
   var k=el('div','kvs');
   kv(k,'Type',a.kind==='share'?'Share':'Write');if(a.likes!=null)kv(k,'Likes',num(a.likes));kv(k,'Unique viewers',num(a.uniqueViewers));kv(k,'Views left',num(left));kv(k,'Created',fmt(a.createdAt));
   card.pad.appendChild(k);
@@ -8708,7 +8721,7 @@ function ovUserRow(u){
   var r=el('button','pgrow'),l=el('div');r.type='button';
   r.onclick=function(){if(!u.authorId)return;try{navigator.clipboard.writeText(u.authorId).then(function(){msg('Author ID copied')},function(){msg(u.authorId)})}catch(e){msg(u.authorId)}};
   l.appendChild(el('div','slug',u.email||'Account missing'));
-  l.appendChild(el('small',null,(u.name?u.name+' - ':'')+'Joined '+ago(u.createdAt)+' - '+num(u.notes)+(u.notes===1?' note':' notes')+(u.subs!=null?' - '+num(u.subs)+(u.subs===1?' subscriber':' subscribers'):'')+(u.likes!=null?' - '+cntWord('likes',u.likes):'')+' - '+(u.lastSeen?'seen '+ago(u.lastSeen):'not seen yet')+(u.lastSignInAt?' - signed in '+ago(u.lastSignInAt):'')));
+  l.appendChild(el('small',null,(u.name?u.name+' - ':'')+'Joined '+ago(u.createdAt)+' - '+num(u.notes)+(u.notes===1?' note':' notes')+(u.subs!=null?' - '+num(u.subs)+(u.subs===1?' subscriber':' subscribers'):'')+(u.likes!=null?' - '+cntWord('likes',u.likes):'')+(u.following!=null?' - '+cntWord('following',u.following):'')+' - '+(u.lastSeen?'seen '+ago(u.lastSeen):'not seen yet')+(u.lastSignInAt?' - signed in '+ago(u.lastSignInAt):'')));
   if(u.authorId)l.appendChild(el('small','aid',u.authorId));
   if(u.referredBy){l.appendChild(el('small',null,'Referred by '+(u.referredBy.email||'account missing')));if(u.referredBy.authorId)l.appendChild(el('small','aid',u.referredBy.authorId))}
   if(u.referralCode)l.appendChild(el('small','aid','Referral code '+u.referralCode));
@@ -8725,7 +8738,7 @@ function ovNote(n){
   var r=el('button','pgrow');r.type='button';r.onclick=function(){openLookup(n.slug)};
   var l=el('div');l.appendChild(slugEl(n.slug));
   var nk=isCsort(ovS.nsort)?ovS.nsort.split('_')[1]:'';
-  l.appendChild(el('small',null,(n.title||'Untitled')+' - published '+ago(n.createdAt)+(n.likes==null?'':' - '+cntWord('likes',n.likes))+((nk==='subs'||nk==='posts')&&n.authorSubs!=null?' - author has '+cntWord(nk,nk==='subs'?n.authorSubs:n.authorNotes):'')));
+  l.appendChild(el('small',null,(n.title||'Untitled')+' - published '+ago(n.createdAt)+(n.likes==null?'':' - '+cntWord('likes',n.likes))+((nk==='subs'||nk==='posts'||nk==='following')&&n.authorSubs!=null?' - author has '+cntWord(nk,nk==='subs'?n.authorSubs:nk==='following'?n.authorFollowing:n.authorNotes):'')));
   r.appendChild(l);
   var m=el('div','pm');if(n.story)m.appendChild(chip('story'));
   r.appendChild(m);$('ovlist').appendChild(r)
