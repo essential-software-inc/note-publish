@@ -326,7 +326,7 @@ main{position:relative;z-index:1;max-width:720px;margin:0 auto;padding:2px 16px 
 .fab:not([hidden]){display:grid;place-items:center;animation:fade .22s ease both}
 .fab:active{transform:scale(.94);filter:brightness(1.1)}
 .fab .ico{width:26px;height:26px}
-.field.ta{display:block;height:auto;min-height:116px;padding:14px 16px;resize:vertical;line-height:1.45;font:inherit;color:inherit}
+.field.ta{display:block;height:auto;min-height:116px;max-height:60vh;max-height:60dvh;padding:14px 16px;resize:vertical;line-height:1.45;font:inherit;color:inherit}
 .cnt{margin:6px 2px 0;text-align:right;font-size:12.5px;color:var(--faint)}
 .cnt.hot{color:var(--warn)}
 .mdrow{display:flex;align-items:center;justify-content:space-between;gap:10px;margin:8px 2px 12px}
@@ -3659,7 +3659,8 @@ function lgEdit(kind,d,keep){
   function sync(){
     if(cb.checked){ma.hidden=false;ma.scrollTop=pos.alert.box}
     else{if(!ma.hidden)pos.alert.box=ma.scrollTop;ma.hidden=true}
-    tabBtns.alert.textContent='Alert: '+(cb.checked?'on':'off')
+    tabBtns.alert.textContent='Alert: '+(cb.checked?'on':'off');
+    fit()
   }
   var hint=el('div','fine','Plain markup only: h3 headings, p, ul and li, strong, em and links. Anything else is stripped in the app. The Effective date at the top is set to the publish date when you publish.');hint.style.margin='0 0 8px';
   function warnSync(){
@@ -3685,6 +3686,18 @@ function lgEdit(kind,d,keep){
     if(n<0)return;e.preventDefault();n=(n+k.length)%k.length;pick(k[n]);tabBtns[k[n]].focus()
   });
   function frWin(){var f=pvBox.firstChild;try{return f&&f.contentWindow}catch(e){return null}}
+  // Keeps each textarea's bottom edge (and its resize handle) inside the visible part of the sheet. The room is worked out from the
+  // sheet's own size limit, not from how tall it is now, so shrinking a textarea cannot shrink the room it is measured against.
+  function fit(){
+    var sb=wrap.closest('.sheet-body'),sh=sb&&sb.closest('.sheet');if(!sb||!sh)return;
+    var maxSb=window.innerHeight*0.88-(sh.offsetHeight-sb.clientHeight);
+    [ta,ma].forEach(function(t){
+      if(t.hidden||!t.offsetParent)return;
+      var top=t.getBoundingClientRect().top-sb.getBoundingClientRect().top+sb.scrollTop;
+      var room=Math.max(48,Math.floor(maxSb-top-8));
+      t.style.maxHeight=room+'px';t.style.minHeight=Math.min(116,room)+'px'
+    })
+  }
   function savePos(){
     if(!cur)return;var o=pos[cur],w;
     if(cur==='preview'){w=frWin();try{if(w)o.box=w.pageYOffset}catch(e){}}
@@ -3710,14 +3723,16 @@ function lgEdit(kind,d,keep){
       fr.addEventListener('load',function(){try{fr.contentWindow.scrollTo(0,y)}catch(e){}reveal()});
       pvBox.appendChild(fr)
     }
-    applyPos(name)
+    applyPos(name);
+    fit()
   }
   cb.onchange=sync;sync();pick(keep&&keep.tab||'text');
   // The markup note sits in the pinned header with the tabs, so it never scrolls out of view while the Text tab is open.
   var hdr=el('div');hdr.appendChild(tabs);hdr.appendChild(hint);
   var pr=ask({title:'Edit '+LG_LBL[kind],sev:'other',icon:'shield',ok:'Publish',text:d.builtin?'Starting from the copy built into the app.':'Starting from version '+d.version+'.',head:hdr,node:wrap});
-  applyPos(cur);
+  applyPos(cur);fit();window.addEventListener('resize',fit);
   return pr.then(function(ok){
+    window.removeEventListener('resize',fit);
     if(!ok){if(ta.value.trim()!==(d.html||'').trim()){LG.draft[kind]=ta.value;LG.base[kind]=base}else{delete LG.draft[kind];delete LG.base[kind];delete LG.from[kind]}return}
     savePos();
     var st={text:ta.value.trim(),notify:cb.checked,message:ma.value.trim(),tab:cur,pos:pos,base:base};
