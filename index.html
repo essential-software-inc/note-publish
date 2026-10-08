@@ -394,6 +394,18 @@ ul.alert-md-list ul.alert-md-list ul.alert-md-list { list-style: square }
 .recip b{color:var(--text)}
 .recip.err{color:var(--danger)}
 .sel .pick.flag,.field.flag{border-color:var(--danger)}
+.sel .pick.inv{border-color:var(--danger);color:var(--danger)}
+.lgd{font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+.lgd-l{white-space:pre-wrap;overflow-wrap:anywhere;padding:6px 8px;border-radius:8px;margin:0 0 4px}
+.lgd-del{background:rgba(255,77,109,.12)}
+.lgd-add{background:rgba(70,224,168,.12)}
+.lgd-d{background:rgba(255,77,109,.38);text-decoration:line-through}
+.lgd-a{background:rgba(70,224,168,.38)}
+.lgd-eq{color:var(--faint);font-size:12px;margin:2px 0 6px}
+.lgd-l{position:relative;padding-left:26px}
+.lgd-m{position:absolute;left:9px;top:6px;font-weight:700;opacity:.85}
+.lgd-leg{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 10px}
+.lgd-chip{padding:5px 10px;border-radius:999px;font:600 12px/1.2 -apple-system,Segoe UI,Roboto,sans-serif}
 .recip-go{appearance:none;-webkit-appearance:none;display:inline-flex;align-items:center;gap:4px;max-width:100%;padding:4px 0;border:0;background:none;color:var(--muted);font:inherit;text-align:left;cursor:pointer}
 .recip-go b{color:var(--accent)}
 .recip-go .ico{flex:none;width:16px;height:16px;transform:rotate(-90deg)}
@@ -485,7 +497,20 @@ body[data-auth=out] #msg{bottom:calc(24px + env(safe-area-inset-bottom,0px))}
 .sheet-actions{display:grid;gap:10px;flex:none;padding-top:6px}
 .coc-intro{margin:8px 0 12px;color:var(--muted);font-size:15px}
 .sheet-body.coc-c .tile{margin-left:auto;margin-right:auto}
-.sheet-body.coc-c h2,.sheet-body.coc-c .coc-intro{text-align:center}
+.sheet-body.coc-c h2,.sheet-body.coc-c .coc-intro,.sheet-body.coc-c .sheet-text{text-align:center}
+.lgs{display:flex;gap:8px;align-items:center}
+.lgs .field-wrap{flex:1;min-width:0}
+.lgs-b{flex:none;width:46px;min-height:50px;padding:0}
+.lgs-up .ico{transform:rotate(180deg)}
+.sheet:has(.sheet-head){background:linear-gradient(rgba(255,255,255,.04),rgba(255,255,255,.04)),var(--s1)}
+.sheet-head{position:sticky;top:0;z-index:2;display:flow-root;padding:6px 0 0;background:linear-gradient(rgba(255,255,255,.04),rgba(255,255,255,.04)),var(--s1)}
+.sheet-head .sheet-text{margin:8px 0}
+.lgs{margin:0 0 8px}
+.lge-tabs{display:flex;gap:4px;padding:4px;margin:0 0 8px;border-radius:12px;background:var(--s2,rgba(255,255,255,.06))}
+.lge-tab{flex:1;min-width:0;min-height:42px;padding:0 8px;border:0;border-radius:9px;background:transparent;color:var(--muted);font:inherit;font-weight:600;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;cursor:pointer;touch-action:manipulation}
+.lge-tab[aria-selected=true]{background:var(--accent);color:#fff}
+.lge-pane[hidden],.lge-pane .field[hidden]{display:none}
+.lge-pane .tog{border-top:0;padding-top:4px}
 .coc-tags{position:sticky;top:0;z-index:2;display:flex;flex-wrap:nowrap;gap:5px;margin:0 -22px 6px;padding:8px 22px 10px;background:linear-gradient(180deg,#242742,#242742 80%,rgba(36,39,66,0))}
 .coc-tags button{flex:1 1 auto;min-width:0;appearance:none;-webkit-appearance:none;cursor:pointer;padding:6px 4px;text-align:center;white-space:nowrap;border-radius:999px;background:var(--s2);border:1px solid var(--line2);color:var(--text);font:inherit;font-size:12.5px;font-weight:700;transition:transform .12s,filter .15s}
 .coc-tags button:active{transform:scale(.95);filter:brightness(1.2)}
@@ -578,6 +603,14 @@ body[data-auth=out] #msg{bottom:calc(24px + env(safe-area-inset-bottom,0px))}
         <span class="sel"><button type="button" class="pick" id="ovfilter" aria-label="Show" aria-haspopup="listbox" value="">All users</button><span class="ico" data-i="chev"></span></span>
         <span class="sel" hidden><button type="button" class="pick" id="ovnsort" aria-label="Sort" aria-haspopup="listbox" value="new">Newest first</button><span class="ico" data-i="chev"></span></span>
       </div>
+      <div class="filters" id="ovrng">
+        <span class="sel"><button type="button" class="pick" id="ovcper" aria-label="Joined" aria-expanded="false">Joined: any time</button><span class="ico" data-i="chev"></span></span>
+        <span class="sel"><button type="button" class="pick" id="ovsper" aria-label="Last seen" aria-expanded="false">Seen: any time</button><span class="ico" data-i="chev"></span></span>
+        <span class="sel" hidden><button type="button" class="pick" id="ovpper" aria-label="Published" aria-expanded="false">Published: any time</button><span class="ico" data-i="chev"></span></span>
+      </div>
+      <div id="ovcbox" hidden></div>
+      <div id="ovsbox" hidden></div>
+      <div id="ovpbox" hidden></div>
       <div class="sec-t" id="ovcount"></div>
       <div id="ovlist"></div>
       <button class="btn block more" id="ovmore" hidden>Load more</button>
@@ -594,9 +627,11 @@ body[data-auth=out] #msg{bottom:calc(24px + env(safe-area-inset-bottom,0px))}
       <div class="filters">
         <span class="sel"><button type="button" class="pick" id="fstatus" aria-label="Status" aria-haspopup="listbox" value="">Any status</button><span class="ico" data-i="chev"></span></span>
         <span class="sel"><button type="button" class="pick" id="fsort" aria-label="Sort" aria-haspopup="listbox" value="new">Default order</button><span class="ico" data-i="chev"></span></span>
+        <span class="sel"><button type="button" class="pick" id="repper" aria-label="Time range" aria-expanded="false">Any time</button><span class="ico" data-i="chev"></span></span>
         <label class="pillck"><input type="checkbox" id="fgroup" checked><span>Group by slug</span></label>
         <label class="pillck"><input type="checkbox" id="fdis"><span>Dismissed</span></label>
       </div>
+      <div id="repbox" hidden></div>
       <div id="list"></div>
       <button class="btn block more" id="more" hidden>Load more</button>
     </div>
@@ -617,13 +652,17 @@ body[data-auth=out] #msg{bottom:calc(24px + env(safe-area-inset-bottom,0px))}
         <span class="sel"><button type="button" class="pick" id="adst" aria-label="Ad status" aria-haspopup="listbox" value="">All ads</button><span class="ico" data-i="chev"></span></span>
         <span class="sel"><button type="button" class="pick" id="adkind" aria-label="Ad type" aria-haspopup="listbox" value="">Write &amp; Share</button><span class="ico" data-i="chev"></span></span>
         <span class="sel"><button type="button" class="pick" id="adsort" aria-label="Sort" aria-haspopup="listbox" value="new">Newest first</button><span class="ico" data-i="chev"></span></span>
+        <span class="sel"><button type="button" class="pick" id="adper" aria-label="Time range" aria-expanded="false">Any time</button><span class="ico" data-i="chev"></span></span>
       </div>
+      <div id="adbox" hidden></div>
       <div id="adlist"></div>
       <button class="btn block more" id="admore" hidden>Load more</button>
     </div>
 
     <div id="p-audit" class="pnl">
       <div class="search"><div class="field-wrap"><span class="ico" data-i="search"></span><input class="field" id="auq" placeholder="Filter by slug, detail or author ID" autocomplete="off" autocapitalize="off" spellcheck="false"></div></div>
+      <div class="filters"><span class="sel"><button type="button" class="pick" id="auper" aria-label="Time range" aria-expanded="false">Any time</button><span class="ico" data-i="chev"></span></span></div>
+      <div id="aubox" hidden></div>
       <div class="filters" id="aukeys"></div>
       <div class="tl" id="aulist"></div>
       <button class="btn block more" id="aumore" hidden>Load more</button>
@@ -658,6 +697,16 @@ body[data-auth=out] #msg{bottom:calc(24px + env(safe-area-inset-bottom,0px))}
 
     <div id="p-tools" class="pnl">
       <div class="card static">
+        <div class="sec-head"><span class="tile sev-other"><span class="ico" data-i="shield"></span></span><div><div class="card-t">Terms &amp; Privacy Policy</div><div class="card-s">Preview what the app shows, edit it here, and alert everyone when it changes.</div></div></div>
+        <div class="alrow sev-ad" id="lgsel"></div>
+        <div class="card-s" id="lgmeta" style="margin:10px 2px 12px">Loading...</div>
+        <div style="display:flex;gap:8px">
+          <button class="btn" id="lgprev" style="flex:1;min-width:0">Preview</button>
+          <button class="btn" id="lghist" style="flex:1;min-width:0">History</button>
+          <button class="btn primary" id="lgedit" style="flex:1;min-width:0">Edit</button>
+        </div>
+      </div>
+      <div class="card static">
         <div class="sec-head"><span class="tile sev-ad"><span class="ico" data-i="chart"></span></span><div><div class="card-t">Time zone</div><div class="card-s">Every date and time here, and the Custom alerts date pickers, use this zone.</div></div></div>
         <select class="field" id="tzsel" aria-label="Time zone"></select>
         <div class="card-s" id="tzcur" style="margin:8px 2px 0"></div>
@@ -678,7 +727,7 @@ body[data-auth=out] #msg{bottom:calc(24px + env(safe-area-inset-bottom,0px))}
       </div>
       <div class="tools-foot">Authorized Personnel<br>Only</div>
       <div class="tools-copy">&copy; 2026 Essential Software</div>
-      <div class="tools-copy tools-ver">v7.10.2026-release</div>
+      <div class="tools-copy tools-ver">v8.10.2026-release</div>
     </div>
   </main>
   <button type="button" class="fab" id="alfab" aria-label="Send a custom alert" hidden><span class="ico" data-i="bell"></span></button>
@@ -729,6 +778,8 @@ U('priya.nair@example.com','Priya Nair',{joined:60,subs:15});
 U('tom.becker@example.com','Tom Becker',{joined:450,seen:400,x:{suspended:true}});
 U('alex.rivera@example.com','Alex Rivera',{joined:15,seen:6});
 var RC={'maya.chen@example.com':'K7M2QX4P','lena.fischer@example.com':'H3TR9WNB','dev.patel@example.com':'P5CZ8D2F','priya.nair@example.com':'X4YB6JGA'};Object.keys(RC).forEach(function(e){users[e].referralCode=RC[e]});
+// Every account has an invite code (the worker makes it at sign-in), not only the ones that opened an ad screen.
+(function(){var AL='ABCDEFGHJKMNPQRSTUVWXYZ23456789';Object.keys(users).forEach(function(e){if(users[e].referralCode)return;var h=hash(e),c='';for(var i=0;i<8;i++){h=(h*48271)%2147483647;c+=AL.charAt(h%AL.length)}users[e].referralCode=c})})();
 users['sam.ortiz@example.com'].referredBy='maya.chen@example.com';users['alex.rivera@example.com'].referredBy='lena.fischer@example.com';users['priya.nair@example.com'].referredBy='dev.patel@example.com';users['omar.haddad@example.com'].referredBy='lena.fischer@example.com';users['omar.haddad@example.com'].refVoid={at:J(N-45*D,'pd'),reason:'account'};
 var t=users['tom.becker@example.com'];var tk='Your note \u201cLyrics collection\u201d was taken down. '+aRs('copyright')+' Its address can\u2019t be reused. '+AR,sp='Your account was suspended. '+aRs('copyright');t.strikes.push({at:E_TD,kind:'takedown',message:tk,dismissedAt:null},{at:E_SP,kind:'suspended',message:sp,dismissedAt:null});t.alerts.push({at:E_SP,kind:'suspended',strike:true,dismissedAt:null,message:sp},{at:E_TD,kind:'takedown',strike:true,dismissedAt:null,message:tk});
 P('sunday-sourdough','Sunday sourdough notes','maya.chen@example.com',{likes:84,story:1,age:40,desc:'Hydration ratios and a starter diary',tags:['baking','food']});
@@ -866,14 +917,63 @@ function mcnt(email,k){if(!email)return 0;var u=users[email],own=Object.keys(pag
 function scnt(slug,owner,k){return k==='likes'?((pages[slug]||{}).likes||0):mcnt(owner,k)}
 function aidSlugs(email){var o={};Object.keys(pages).forEach(function(k){if(pages[k].owner===email&&pages[k].status==='live')o[k]=1});reports.forEach(function(r){var g=pages[r.slug];if(g&&g.owner===email)o[r.slug]=1});return Object.keys(o).sort()}
 function body(o){try{return JSON.parse(o.body||'{}')}catch(e){return{}}}
+var LG_BUILTIN={"privacy": "      <p><em>Effective 6 October 2026</em></p>\n      <p><strong>Bluebook</strong> is published by Essential Software (&ldquo;we&rdquo;, &ldquo;us&rdquo;, and &ldquo;our&rdquo; in this policy), and we're glad you're here. This page explains in plain language what the app stores, where it lives, and what leaves your device.</p>\n      <h3>On-device storage</h3>\n      <p>Your pages, drafts, images, favourites, preferences and app settings all stay on your device. There's one exception: when you're signed in, we keep track of which stories you've opened on our servers, under your account (see \"Stories, subscriptions &amp; likes\" below). For each account signed in on the device, the app also keeps a copy of which notes you've liked and which accounts you follow (signing out clears the follow copy). It keeps a short queue of any likes or follows you tapped while offline that haven't been sent yet. It also keeps a small number that tells it how far your device's clock is off from our servers, so those taps get the right time. If you sign in with Google, your notes, along with your favorites and theme choice, are also backed up to our servers (see below).</p>\n      <h3>Google sign-in &amp; sync</h3>\n      <p>Signing in is totally optional, and Google handles it, so we never see your Google password. We get your Google account ID and email address, and we keep them along with your sign-up date, your last sign-in date, the last time the app was active on your account (see \"Activity counts\" below), and a code that keeps you signed in (a session lasts up to 30 days). While you're signed in, your notes (including embedded images), your favorites and your theme choice are backed up to our servers so you can restore them on another device. Your Pro purchase (if you have one) and any ad view-credit balance (see \"In-app purchases\" below) are linked to your account too, so they come with you. Signing out stops syncing. Your backup stays put, so you can pick it up again when you sign back in, and deleting your account removes it, as described below. If an image in your backup isn't used by any note any more (for example, after you delete a note or swap an image), the nightly clean-up deletes it once it's more than 14 days old.</p>\n      <p>Your account is yours to keep or remove. You can delete it any time by tapping the account icon and choosing Delete account under Show more. That signs this device out and schedules your account for deletion in 30 days. The deletion happens during our nightly clean-up, so it can land up to a day after the 30 days are up. When it does, we permanently delete your account record, synced notes and images, profile name and picture, subscriptions (the ones you made and the ones to you), records of the stories you've opened, your likes and follows (including the times we noted for them), running ads and their view statistics, your invite code and any invites you made or used, your ad access record, your alerts (including ones you deleted from your list), and any unspent ad view-credit balance. We also take down every page you published (we keep a copy of each page, along with its record, for about 30 more days, as described under \"Publishing a page\"). Until then, your published pages and stories stay online. Changed your mind? Sign back in with the same Google account during the 30 days and the deletion is cancelled, with full access restored. Every device where you're signed in gets signed out as part of the deletion (each one finds out the next time the app contacts our server, usually within about a minute). Deleting your account doesn't delete anything held by Google or RevenueCat. Their own policies cover that.</p>\n      <h3>In-app purchases</h3>\n      <p>Unlocking Pro and buying ad view-credit packages are both purchases made through Google Play Billing. RevenueCat, a third-party subscription service, handles them for us. RevenueCat gets the purchase details it needs to confirm what you bought, linked to an ID. Before you sign in, that's an anonymous ID RevenueCat makes for your install. Once you sign in, it's your Google account ID, which is what lets a purchase follow you to another device. After that, the two work differently. The app checks directly with RevenueCat (not through our servers) to see whether Pro is active. It keeps a saved copy of that answer on your device, and refreshes it from RevenueCat when the app launches and after a purchase or restore. Ad view-credits do go through our servers. They hear from RevenueCat (not from Google directly) that you bought views, and add the views to your account. We keep a list of your view credits: each purchase (for a particular ad, or added to your balance from Settings), each time views are put on an ad (with that ad's address), each refund or return, and each gift of free views for an invite, all with the time. Views returned to you stay in your balance, and you can put them on an ad without buying again. That doesn't involve Google Play or RevenueCat. If Google Play refunds a purchase, we take those views back. That list is deleted with your account. We never get your payment details, because Google handles those directly. See <a href=\"https://www.revenuecat.com/privacy\" target=\"_blank\" rel=\"noopener\">RevenueCat's own privacy policy</a> for how it handles what it receives.</p>\n      <h3>Publishing a page</h3>\n      <p>Publishing is always your choice, and it only happens when you tap Publish. We receive your page's content, its title, description and tags (if you've added them), when the note was created, and the address you choose, and we store them so the page can be shown at a public link. Anyone with that link can view the page. You can publish without signing in, and then the page isn't linked to any account. If you later sign in and, using that page's private token on your device, turn on \"Show in stories\" or save an update to it, we link the page to your account from then on. It then shows up among your published pages, counts toward your account's page limit, and is taken down if you delete your account. We also give you a private token for each page. It's stored on your device, and we don't keep it in its original form. We only keep a scrambled version, just enough to check that it matches when you send it back to update or unpublish. Updating a published page sends the new content the same way. Unpublishing takes the page down, and if it was running as an ad, the ad stops too. We may keep a copy for about 30 days afterward (our clean-up runs nightly), in case of an abuse report or takedown request, and then delete it. If the page was reported as child sexual abuse material, we keep the copy for 18 months instead (see \"Reporting a published page\"). The page's own record is kept for the same time and then deleted. It holds the address, a scrambled form of the private token, the title, description and tags, and, if the page was linked to an account, that account's internal ID. That's why it stays even after the account itself is deleted. If we remove a page because of a takedown request or abuse report, its address is reserved permanently. To keep that reservation in place, we keep a small record for as long as the address stays reserved: the address, a scrambled form of the private token, the title, description and tags, and, if the page was linked to an account, that account's internal ID. This record stays even after the copy or the account is deleted, because deleting it would lift the reservation. Publishing also briefly counts requests from your IP address to limit spam. That count sits in a short-lived counter that disappears on its own after about a minute, and it isn't kept afterward or linked to your account or the page. Separately, to stop spam, we also count how often you like, subscribe, mark stories as seen, add an invite code or back up. That count is linked to your account and disappears within a couple of minutes.</p>\n      <h3>Publishing as an ad</h3>\n      <p>Want more people to see a page? From the Publish sheet's \"Publish as Ad\" tab, you can turn a page you've already published into an ad. Other people using the app see it as a starting template when they start a new note in Write (or in Share, for a Share note). It isn't just for people who have the page's link, like a regular published page. You need to sign in to run an ad. Views are bought as described under \"In-app purchases\" above, and once the purchase is confirmed, we add those views to your account. We also save how many views an ad has used and its status (running, used up, or taken down). To tell you how many different people an ad reached, we save an anonymous ID that each device makes, keeps, and sends whenever a view is counted, whether or not the viewer is signed in. It isn't linked to a Google account, email address, or anything else that identifies someone. We use it to tell whether a repeat view of an ad came from a device we already counted, and for the activity counts described under \"Activity counts\" below. See \"Analytics\" below too. When you unpublish an ad, it disappears from Write and Share right away, and any views it had left go unused. That balance isn't returned to your account. The page itself and its normal link stay as they were, and taking the page down is a separate step from the Publish to Web tab. \"External images &amp; embeds\" below explains how images, video, audio and social posts inside an ad are loaded. Ads can only use images from Wikipedia or Wikimedia Commons, and video, audio and social posts added with the editor's own tools (YouTube, Spotify, Instagram, X, or Streamable).</p>\n      <h3>Ad access &amp; invites</h3>\n      <p>Some bigger ad packages have to be earned. To work out which packages you can start and how many ads you can run at once, our servers count these things, using the records described in this policy: your subscribers, published notes, stories, likes you've received and given, accounts you follow, how many of the last 30 days your account was active, your running ads, and any strikes. A strike comes from an alert we sent you about a removal, pause or suspension. We keep those alerts for up to a year, but a strike only counts for 60 days, or until we excuse it. You see these counts as your progress. We use them to enforce the limits, and other people never see them.</p>\n      <p>Every signed-in account gets a random 8-character invite code, saved with the account. When someone adds a code, we save a record of who entered whose code, when it happened, and whether and why it stopped counting (the invited account was suspended or being deleted, or we removed it for abuse). A friend can add one code, in their first 14 days. You get an alert when a friend joins, but it doesn't say who. You only see totals: how many friends added your code and how many count right now, never who. An invite counts once your friend has published a note and been active on at least two days. If your friend chooses to subscribe at the same time, that's saved like any other subscription. When you share your code, it goes through your device's share sheet or clipboard, so the message is sent by the app you pick and we never see it. When an invite counts, we add 100 free views to your balance. We add it to the list of your view credits, together with the invited account's internal ID, so the same invite can't be rewarded twice. That entry stays in that list (and only there) until you delete your account, even if your friend's account is deleted first. If either account is deleted, the record of the invite itself is deleted.</p>\n      <h3>Reporting a published page</h3>\n      <p>Reports help keep Bluebook a good place for everyone. Anyone can report a published page from its public link. To stop spam, we count how many reports come from an IP address. That count lives in a short-lived counter that disappears on its own about a minute after the last report from that address. It's never saved as part of the report. We only keep the reason and details that were sent, which page it's about, and when. A report doesn't record who sent it. A report stays on file until someone reviews it, even if the page is unpublished or its author's account is deleted in the meantime. After it's handled, it's deleted. The exception is reports of child sexual abuse material. We keep those for 18 months, along with a copy of the reported page. The report's 18 months start when it's closed. The page copy's 18 months start when it was reported, or when it was most recently reported if it's reported again. The same period covers any other copy we hold of that page. We may also send a notification with the page's address, the reason and the details to our private alerts channel. We handle reports of child sexual abuse material the way the law requires, including passing them to the proper authority. We keep a short record of each one we pass on (the page's address, the date, the authority's reference for it, and a brief note) for 18 months from the latest. When we take an action (like a takedown, a dismissed report, or a restored page), we write down the action, the page's address, the time, and a short note such as the reason given. We keep that for about 13 months, as a record of what was done.</p>\n      <p>Pages running as ads work the same way. An ad and its published page are exactly the same thing at the same web address, so there's only one way to report either: go to that page's address and use the report link there. There's no separate process for ads.</p>\n      <p>Right now, the app doesn't show you that address when an ad appears as a starting point on the Write or Share screen. To find it, save the ad without adding anything new, then open the Publish sheet for that note. It fills in the ad's own web address automatically. Open that address in a browser and you'll see the report link.</p>\n      <h3>Alerts</h3>\n      <p>We want you to know what's happening with your account and the app. When one of your pages is reported, or we remove or pause something of yours, or change your account's status, you'll get an automatic message (an alert) that says why. We also use alerts for good news and updates, like announcements, new features, a bigger ad package unlocking, a friend adding your invite code, planned maintenance, safety tips, or a change to this policy or our terms. They can go to every account or to specific ones, and they're saved, shown and deleted the same way as the others. Alerts show up under Alerts in your library, which only appears once your account has at least one. A number on it shows how many have arrived since you last looked at the list, and the list's title shows how many you have in total. We save the text of each alert (which can name the page or item it's about), when it was sent, and when you deleted it. We also save one marker on your account for the newest alert you've been shown, so the count follows you across your devices. Deleting an alert only removes it from your list. We keep the record, including deleted ones, for up to a year so we can review what was sent to an account. An alert never includes who reported, or the details they wrote, because we don't pass those on. If you delete your account, your alerts and that marker are deleted too.</p>\n      <h3>External images &amp; embeds</h3>\n      <p>Images you add to a page by URL are loaded straight from their source when the page is built. Instagram, X, Streamable, YouTube and Spotify embeds load straight from those services. We have nothing to do with these third-party hosts, with one exception: when you paste an Instagram share link or an X (t.co) short link using the editor's own tools, our server follows the link just to find out which post it points to. It doesn't read the page. It also counts requests from your IP address in a short-lived counter that disappears on its own after about a minute, and that isn't kept afterward or linked to your account. A page published as an ad can only use images linked directly from Wikipedia or Wikimedia Commons, and can't contain images uploaded from your device. We check this automatically before an ad can go live or be updated.</p>\n      <h3>Linked pages</h3>\n      <p>This section is about links inside the app. In preview, tapping a link in a page shows its address in a sheet with a copy option. The app doesn't open or load the linked page. Nothing is fetched, and we can't see what links a page contains. A published page works a bit differently, depending on how you're viewing it. If someone opens its public web address directly, outside the app, they're looking at a plain web page in their own browser, so links inside it are ordinary clickable links that open like any other link on the web. Inside the app, opening a story or a note you found through search shows that same published page in the app's own built-in viewer (see \"Stories, subscriptions &amp; likes\" below), so you don't leave the app to see it. A link you tap inside that viewer opens in your own browser, which takes you out of the app. The app doesn't load the linked page itself, and we have nothing to do with that site, but like any site you open in a browser, it can see your IP address. If the app can't open the link, it copies the address instead.</p>\n      <h3>Stories, subscriptions &amp; likes</h3>\n      <p>From a published note's Publish sheet, you can turn on \"Show in stories\" (you need to sign in). That adds the note to a stories strip that other people using the app can see, not only people who have the link. It's similar to Publish as Ad, but without purchased views. Our servers save the note's web address, title, description and tags (if you've added them), when the note was created, and up to three preview images from the note's published page (plus how many images the note has, so a feed card can show how many more there are), along with your account ID. Your story shows the title. The Subscribed feed of anyone who subscribes to you shows the title, description, tags, how long ago the note was created, and how many likes it has. Preview images that come from your device are copied to our servers, and they can be loaded without a sign-in check while the story is showing. A preview image added by URL isn't copied, so viewers' devices load it straight from its source when they see your story or feed card, and that host can see their IP address. If you turn the toggle off within the first 24 hours, or unpublish the note at any time, we delete the saved copies, including the saved description and tags. Other people's devices never get your Google account ID or email. Instead, each account has a separate random author ID that means nothing outside the app. It's sent with your stories, so your picture and display name can go with them and a Subscribe tap can reach the right account. We make it ourselves, it isn't made from your Google account, and it's deleted with your account. To tell you apart from other authors, viewers see your display name, picture, or the note's title. A story can appear in the strip for 24 hours from when you turn on \"Show in stories\" (editing the note doesn't restart that clock). After that, it leaves the strip and your Stories tab. The strip isn't a list of every story. It shows a selection of other people's stories that reshuffles every few hours, so a story still within its 24 hours may or may not be shown to a given viewer. Your own live stories always lead your own strip, and stories from accounts a viewer already follows show up in their Subscribed feed instead of the strip. A story stays in the Subscribed feed of people who follow you (from when they followed you onward) for 7 days from when you turned on \"Show in stories\", or until you unpublish the note, whichever comes first. After that it leaves the feed, but the published page itself stays online. After the first 24 hours the toggle turns itself off. That just tells you the story has left the strip and your Stories tab. It stays in your followers' feeds for the rest of the 7 days. If you turn the toggle off yourself within the first 24 hours, the story disappears from the strip and from your followers' feeds.</p>\n      <p>A display name and profile picture are both optional. If you set a display name, it's shown on your stories and, to anyone who subscribes to you, on your notes in their Subscribed feed. If you leave it blank, viewers just see the note's title in both places. A display name can be up to 30 characters. If you set a profile picture, it's only shown on your stories, as the ring around your avatar in the stories strip. It doesn't show on your notes in the Subscribed feed. A picture you upload is stored on our servers and served from a web address based on your random author ID. That address isn't behind a sign-in check, but it only serves your picture while you have at least one story showing (or to you, when you're signed in). So anyone who has your author ID, for example from seeing one of your stories, can load it during that time, and no one else can. Once you have no stories showing, the picture is no longer shown to others. If you remove the picture, it's deleted from our servers. With no picture, the story ring uses the note's own image if it has one, and only then an initial letter, taken from your display name (or the note's title if you haven't set one). That initial is never taken from your account email, which is never sent to other viewers at all.</p>\n      <p>A signed-in account can subscribe to (follow) another account from that account's story. We save who follows whom so we can build your Subscribed feed, show whether you're already following someone, and keep your follows on every device you sign in on. You can see how many accounts follow you as a total, never who, and how many accounts you follow. The app also keeps a copy of who you follow on your device, so it can show the Subscribe/Subscribed button without asking our servers each time. We also record, under your account, which stories you've opened, so a story you've already seen doesn't keep grabbing your attention in the strip. Searching your Subscribed feed happens on your device, within the stories already loaded. What you type is never sent to us. A signed-in account can also like a published note. We record, under your account, which notes you've liked so the heart shows correctly across your devices. For each note you like or unlike, and each account you follow or unfollow, we also note the time of your most recent action. That way, taps made on different devices (or offline and sent later) are applied in the right order. That note stays after you unlike or unfollow, and is removed once the like or follow is gone and the note is more than 30 days old, or when your account is deleted. Each published note's own like count shows on its card wherever that card appears: your Published and Stories tabs, and the Subscribed feed or Liked tab of anyone who sees the note, but never who liked it. You can also see one total on your account screen: the number of likes across all your published notes. If you unpublish a note, the likes it received are removed, so both that note's count and the combined total go down. When a published note that isn't showing as a story appears as a card, either in its author's Published tab or in someone's Liked tab, we may copy up to three preview images from that page to our servers. Like story preview images, these copies can be loaded without a sign-in check, and they're deleted when the note is unpublished or its author's account is deleted.</p>\n      <h3>Third-party requests &amp; server logs</h3>\n      <p>Using the app makes a few requests to other companies, which can see your IP address, like any website you visit. A script library (three.js) is loaded from Cloudflare's cdnjs when the app opens. Google's sign-in code is loaded from Google when you sign in. The app sometimes asks Google (gstatic.com) for a tiny blank page, just to check whether you're online. And if you paste a Spotify link using the editor's own tools, the app asks Spotify (open.spotify.com) for that link's embed details. Requests to our servers run on Cloudflare, which processes them and may keep standard request logs (like the time, the address requested, and your IP address) that we can use to run and fix the service. We don't use them for analytics or tracking.</p>\n      <h3>Activity counts</h3>\n      <p>We'd like to know roughly how many people use the app, and how many are using it right now, so our servers note when the app is open. While it's open, the app contacts our server when it launches, when you come back to it, and about every four minutes, sending the same anonymous device ID described under \"Publishing as an ad\" above. If you're signed in, this (and any other request you make while signed in) saves only the time your account was last active, on your account. If you're not signed in, the server saves the device ID with the times it was first and last seen (plus the daily log described below), and nothing else. It isn't linked to a name, email address or Google account, and if you later sign in on that device, the signed-out record is deleted. We use these records for private, overall totals (like total, new and currently active users and devices), to look up an account's last activity when we're running the service, and, for signed-in accounts, to count recent active days toward ad access and invites (see \"Ad access &amp; invites\"). They're never shown to other people, shared, or used for advertising. The last-activity record is deleted about 90 days after the last activity (an account's is also deleted with the account). Separately, so usage can be charted across weeks, months and years, the server keeps a minimal daily log. For each day an account or device was active, it holds one entry with just that date and the account or device ID, with no name, email or content. We use these entries for those overall charts and for the active-day counts in \"Ad access &amp; invites\", and they're removed automatically after 800 days (about 26 months). They aren't removed early when you delete your account or sign in on a device that was signed out. There's no setting to turn this off, because we don't collect anything beyond this. If you clear the app's storage, you get a fresh anonymous ID from then on.</p>\n      <h3>Analytics</h3>\n      <p>We do not collect usage tracking or crash reports from this app, and do not track what you do inside it. The only usage figures it keeps are the two uses of the anonymous device ID described above: counting an ad's unique viewers (see \"Publishing as an ad\"), and the activity counts (see \"Activity counts\").</p>\n      <h3>Contact</h3>\n      <p>Questions about this policy? We're happy to help at <a href=\"mailto:essentialsoftware.support@gmail.com\">essentialsoftware.support@gmail.com</a>.</p>\n    ", "terms": "      <p><em>Effective 6 October 2026</em></p>\n      <p>Welcome to <strong>Bluebook</strong>! It&rsquo;s published by Essential Software (&ldquo;we&rdquo;, &ldquo;us&rdquo;, &ldquo;our&rdquo;). By using it, you agree to these terms, which are here to keep the app fair and safe for everyone. We've written them in plain language, and you're welcome to reach out anytime with questions.</p>\n      <h3>Responsible Use</h3>\n      <p>Please use Bluebook kindly and lawfully. You agree to use it for lawful purposes only, and not to create, store, or export content that is illegal, harmful, threatening, abusive, untrue and damaging to someone's reputation, or that breaks someone else's rights. This applies with extra weight to anything you publish (see below).</p>\n      <h3>Your Content</h3>\n      <p>Pages you build are stored on your device. If you sign in with Google, they're also backed up to our servers so you can restore them on another device. Without an account, your content lives only on your device: we have no copy and can't recover it if it's lost. Signing in, or keeping your own backups, is how you protect it.</p>\n      <h3>Your Account</h3>\n      <p>Signing in is optional and handled by Google. Keep your Google account secure. Anyone with access to it can access your synced notes, Pro purchase, and ad view credits through this app. We record when your account was last active, and count active devices, only to run and understand the service; see the Privacy Policy's \"Activity counts\" section.</p>\n      <h3>Published Content</h3>\n      <p>A published page is stored on our servers and can be viewed by anyone with the link. You're responsible for what you publish and for having the rights to it. We may remove a published page if it breaks these terms, gets a valid takedown request, or is reported and found to be abusive. A page you publish while signed out isn't linked to an account; if you later sign in and use its private token to show it in stories or save an update, it becomes part of your account, counts toward your account's page limit, and is taken down if you delete your account. Unpublish it yourself and its address frees up right away for reuse. If we remove it instead, for a takedown or abuse report, the address stays permanently reserved and can't be reclaimed or republished.</p>\n      <h3>Reports, Alerts &amp; Suspension</h3>\n      <p>Anyone can report a published page. When one of your pages is reported, or we remove or pause something of yours (a profile picture, display name, page, story or ad), or change the status of your account, we may send you an automatic message with the reason, so you know what happened and why. These messages show up under Alerts in your library. We may also use Alerts to share announcements and updates about the app, like new features, maintenance, or changes to these terms. A profile picture that looks like it's pretending to be someone else may be removed. <strong>To keep the app safe for everyone, lots of reports about your content, or repeated rule-breaking, can lead to your account being suspended. When we remove or pause pages, stories, ads, profile pictures or display names, and when we suspend accounts, those count as strikes on your account for 60 days (unless we excuse one). Strikes affect which ad packages you can start (see Ad Access &amp; Invites below).</strong> A suspended account is signed out everywhere and can't sign in. Alerts are for your information, and you can delete them from your own list. We keep a record of the alerts we've sent to an account, including deleted ones, for up to a year, so we can run and moderate the service.</p>\n      <h3>Advertising (Publish as Ad)</h3>\n      <p>You can turn a page you've already published into an ad, and buy a set number of views through Google Play Billing (handled for us by RevenueCat; see the Privacy Policy's \"In-app purchases\" section). To be allowed as an ad, a page must: have no added text or captions beyond blank lines; keep the required attribution notice in place, unedited, and easy to see at its original size; have no more than two images; and use only images linked directly from Wikipedia or Wikimedia Commons (no images uploaded from your device). A page can also have video, audio, and social-post embeds added with the editor's own tools. YouTube, Spotify, Instagram, X and Streamable are the allowed sources, with one embed per platform at most. Embeds added any other way aren't allowed. Ads still follow the Responsible Use section above. They also can't contain sexual or adult content, or use images, embeds, attribution or branding to pretend to be a person, brand or organization, or to mislead viewers about who or what the ad is from. We check these rules automatically before an ad can go live or be updated. We may refuse or take down an ad that no longer follows them, or that breaks these terms. An ad and its page are the same thing, so reporting one reports the other.</p>\n      <p>A running ad is shown to other people using this app as a starting template on their Write screen (or their Share screen, for a page made in Share), not only to people who have its link. We can't promise an ad will get any particular number of views in a given time, that the ad service will always be available, or any particular result from an ad being shown.</p>\n      <p>A <strong>view</strong> is counted once someone actually starts editing a note that was handed to them as your ad, not just when it's shown on their Write or Share screen. Every view counts: a repeat view from the same person or device still counts and is still taken from your view balance. Views aren't limited to first-time viewers. Bluebook also shows a separate <strong>unique viewers</strong> number next to your ad's view count, just for your information. It's worked out from an anonymous ID made and stored on each device, which tells us whether a device has already been counted for a given ad (and, separately, is used for the activity counts in the Privacy Policy). It isn't linked to a Google account or any other identity, and it's sent whether or not you're signed in. Because it identifies a device rather than a person, someone using two devices counts as two unique viewers, and reinstalling the app or clearing its storage makes that device count as new from then on. The unique viewers number doesn't change your view balance or how views are taken from it.</p>\n      <p>If Google Play refunds a view purchase, we take those views back out of your balance. If that leaves your balance below zero, your running ads stop, and you can't start a new ad until your balance covers it again.</p>\n      <p>Purchased views are a one-time purchase through Google Play that gets used up. For anything about the purchase itself, see Google Play's own refund policy. Separately, if we fail to deliver a view-credit balance you paid for, or take down an ad by mistake after approving it, <a href=\"mailto:essentialsoftware.support@gmail.com\">contact us</a> and we'll decide whether to credit or refund the affected views. That's separate from, and doesn't replace, Google Play's own refund process for the purchase itself. If you unpublish an ad, it stops being shown and any views it had left go unused (so check your balance first). Those views aren't returned to your account or moved to another ad, and any unspent view-credit balance also goes unused if your account is deleted. Taking down the ad doesn't affect the published page, which stays live until you unpublish it separately. Views we return to your account (for example, a refund of an ad's unused views) stay in your balance, and you can put any amount of them on one of your ads from the Publish as Ad tab without buying again.</p>\n      <h3>Stories, Subscriptions &amp; Likes</h3>\n      <p>Turning on \"Show in stories\" for a published note shows it to other people using the app as a story, along with its title, description, tags and preview images. It also lets them subscribe to your account, whether or not they have the note's link. You're responsible for what you show in your stories, including a note's title, description and tags, just like anything else you publish, and the Responsible Use section above applies. We may remove a note from stories, or suspend your ability to use stories or subscriptions, for the same reasons we can act on any other published content. Your display name and profile picture are optional. If you add them, they're shown on your stories and to your subscribers. They don't have to be your real name or photo, but they can't pretend to be another person, account or brand, or mislead viewers about who's posting.</p>\n      <p>A signed-in account can also like a published note. Likes are a simple way to say thanks. As its author, you can see each note's own like count on its card in your Published and Stories tabs, and anyone who sees the note in their Subscribed feed or Liked tab can see it too. Nobody sees who liked it. Likes on a note are removed if it's unpublished or its author's account is deleted. Please don't misuse likes, like using multiple accounts or automated tools to push a note's count up or down. We may remove likes, or suspend your ability to like, for the same reasons we can act on any other use of the app that breaks these terms. See the Privacy Policy's \"Stories, subscriptions &amp; likes\" section for what's recorded about likes.</p>\n      <h3>Ad Access &amp; Invites</h3>\n      <p>Bigger ad packages are earned, not only bought. Everyone who's signed in can use the 1,000-view package. Larger packages, and running more ads at once, unlock as your account grows in the app. We look at subscribers, published notes, likes you've received, likes you give to other notes, accounts you follow, days you've been active, stories, and friends you've invited. Every running ad also needs at least five published notes behind it. The Publish as Ad tab shows your progress toward each requirement. We may change the requirements or packages in the future, but ads that are already running aren't affected. A strike (see Reports, Alerts &amp; Suspension) keeps larger packages locked until it expires after 60 days. One strike limits you to the 5,000-view package, and two or more limit you to the 1,000-view package. A limit only stops new ads from starting, and you'll get an alert when it lifts. Views you bought for a package that is limited or still locked stay in your balance until you can use them.</p>\n      <p>Every signed-in account has an invite code it can share. A new account can add one friend's code, once, in its first 14 days. You can't use your own code, and two accounts can't invite each other. When someone adds your code, you get an alert, and they can choose to subscribe to you at the same time (they're asked first). An invite counts toward your ad access once your friend has published a note and been active on at least two days. For packages from 5,000 views up, each invite that counts is worth three subscribers, for up to five invites. When an invite counts, we also add 100 free views to your balance, for up to five friends. Free views work like any other views in your balance: you can put them on any of your ads from the Publish as Ad tab without buying a package, but they can't be cashed out or handed to someone else. Your friend doesn't get anything. If we cancel an invite because of abuse, we take its free views back out of your balance, and return them if we restore it. Please only invite real people. Making or using extra accounts (or asking others to) to push up invites, subscribers, likes or any other number used here isn't allowed. If that happens, we may stop counting invites or any of these numbers, limit your packages, or suspend accounts. An invite also stops counting while the invited account is suspended or being deleted, and counts again if that ends.</p>\n      <h3>Purchases &amp; Eligibility</h3>\n      <p>You can buy a view package for a particular note when you publish it as an ad, or add views to your balance from Settings to put on any of your ads later. Views in your balance aren't assigned to a note until you use them.</p>\n      <p>All buying of view packages goes through Google Play Billing (RevenueCat handles it for us). Any age or account requirements for buying are set and enforced by Google Play, not by us. By buying a view package, you confirm that Google Play's own terms allow you to make purchases on the account you're using.</p>\n      <h3>Third-Party Content</h3>\n      <p>Images, video, and audio you embed by URL are loaded straight from the source you give us. You're responsible for having the right to use anything you embed. Images in an ad are limited as described above. The required attribution notice is there because third-party logos, trademarks and brand names may show up in an ad's content or images. You're still responsible for having the right to use whatever you include, and the notice doesn't give you any rights by itself.</p>\n      <h3>Changes to These Terms</h3>\n      <p>We may update these terms from time to time. If you keep using the app after changes are posted, you're accepting the revised terms.</p>\n      <h3>Contact</h3>\n      <p>Questions about these terms? We're happy to help at <a href=\"mailto:essentialsoftware.support@gmail.com\">essentialsoftware.support@gmail.com</a>.</p>\n    "},LG_NAME={privacy:'Privacy Policy',terms:'Consumer Terms'},LG_STATE={},LG_HIST={privacy:[],terms:[]};
+// Only this markup is accepted: headings, paragraphs, lists, bold/italic, line breaks and links. Anything else is refused, not
+// stripped, so what is published is exactly what was reviewed. Links may only use http, https or mailto.
+var LEGAL_TAGS = new Set(['h2', 'h3', 'h4', 'p', 'ul', 'ol', 'li', 'strong', 'b', 'em', 'i', 'br', 'a']);
+var LEGAL_TAG_RE = /^<(\/?)([a-zA-Z][a-zA-Z0-9]*)((?:\s+[a-zA-Z][a-zA-Z-]*(?:\s*=\s*(?:"[^"<>]*"|'[^'<>]*'))?)*)\s*(\/?)>/;
+var LEGAL_ATTR_RE = /\s+([a-zA-Z][a-zA-Z-]*)(?:\s*=\s*(?:"([^"<>]*)"|'([^'<>]*)'))?/g;
+var LEGAL_HISTORY_KEEP = 50;
+function legalHrefOk(v) {
+  // Decode character references the way a browser would, then drop the whitespace and control characters its URL parser ignores.
+  let s = String(v)
+    .replace(/&#x([0-9a-f]+);?/gi, (m, h) => String.fromCodePoint(Math.min(parseInt(h, 16) || 32, 0x10ffff)))
+    .replace(/&#(\d+);?/g, (m, d) => String.fromCodePoint(Math.min(parseInt(d, 10) || 32, 0x10ffff)))
+    .replace(/&(colon|tab|newline|nbsp);?/gi, (m, n) => ({ colon: ':', tab: '\t', newline: '\n', nbsp: ' ' })[n.toLowerCase()]);
+  s = s.replace(/[\u0000-\u0020\u007f-\u00a0\u2028\u2029]+/g, '').toLowerCase();
+  return /^(https?:\/\/|mailto:)/.test(s);
+}
+// '' when the text is acceptable, otherwise why not.
+function legalCheck(html) {
+  var stack = [];
+  for (let i = html.indexOf('<'); i !== -1; i = html.indexOf('<', i + 1)) {
+    var m = LEGAL_TAG_RE.exec(html.slice(i, i + 4000));
+    var near = () => 'near "' + html.slice(i, i + 30).replace(/\s+/g, ' ') + '"';
+    if (!m) return 'markup the app does not allow ' + near() + ' (attribute values need quotes, and a lone < must be written &lt;)';
+    var close = m[1] === '/', t = m[2].toLowerCase(), attrs = m[3], selfClose = m[4] === '/';
+    if (!LEGAL_TAGS.has(t)) return 'the tag <' + t + '> is not allowed (use h3, p, ul, ol, li, strong, em, br or a)';
+    if (t === 'br') { if (close || attrs.trim()) return 'markup the app does not allow ' + near(); continue; }
+    if (selfClose) return 'markup the app does not allow ' + near();
+    if (close) {
+      if (attrs.trim()) return 'markup the app does not allow ' + near();
+      if (stack.pop() !== t) return 'the tag </' + t + '> does not match an open tag ' + near();
+      continue;
+    }
+    if (t === 'a') {
+      let href = null, r;
+      LEGAL_ATTR_RE.lastIndex = 0;
+      while ((r = LEGAL_ATTR_RE.exec(attrs))) {
+        var name = r[1].toLowerCase(), val = r[2] != null ? r[2] : r[3];
+        if (val == null) return 'the link attribute ' + name + ' needs a value';
+        if (name === 'href') href = val;
+        else if (name === 'target') { if (val !== '_blank') return 'a link may only use target="_blank"'; }
+        else if (name === 'rel') { if (!val.split(/\s+/).every((x) => ['noopener', 'noreferrer', 'nofollow'].includes(x.toLowerCase()))) return 'a link rel may only use noopener, noreferrer or nofollow'; }
+        else return 'the link attribute ' + name + ' is not allowed';
+      }
+      if (href == null || !legalHrefOk(href)) return 'a link must start with https://, http:// or mailto:';
+    } else if (attrs.trim()) return 'the tag <' + t + '> cannot have attributes ' + near();
+    stack.push(t);
+  }
+  return stack.length ? 'the tag <' + stack[stack.length - 1] + '> is never closed' : '';
+}
 function route(path,o){
   o=o||{};var u=new URL(path,'https://demo.local/'),p=u.pathname,q=u.searchParams,m=(o.method||'GET').toUpperCase(),b=body(o),mt;
   if(p.indexOf('/admin/')===0||p==='/admin'){var hd=o.headers||{},tk=hd['X-Admin-Token']!=null?hd['X-Admin-Token']:hd['x-admin-token'];if(p!=='/admin'&&!tk)return err(403,'invalid admin token')}
-  if(p==='/admin/reports'){var rpD=q.get('dismissed')==='1',rpR=(q.get('reason')||'').slice(0,40),rpQ=(q.get('q')||'').toLowerCase().trim(),rpS=q.get('sort'),rpF=!q.get('cursor'),rpCo=parseInt(q.get('cursor'),10)||0,
+  if(p==='/admin/reports'){var rpD=q.get('dismissed')==='1',rpR=(q.get('reason')||'').slice(0,40),rpQ=(q.get('q')||'').toLowerCase().trim(),rpS=q.get('sort'),rpF=!q.get('cursor'),rpFr=parseInt(q.get('from'),10),rpTo=parseInt(q.get('to'),10),rpPer=function(x){return(isNaN(rpFr)||x.reportedAt>=rpFr)&&(isNaN(rpTo)||x.reportedAt<=rpTo)},rpCo=parseInt(q.get('cursor'),10)||0,
     rpIn=reports.filter(function(x){return rpD?!!x.dismissedAt:!x.dismissedAt}),
-    rpB=rpIn.filter(function(x){if(!rpQ)return true;if(/^a_[a-f0-9]{32}$/.test(rpQ)){var g=pages[x.slug],w=g&&users[g.owner];return!!w&&w.authorId===rpQ&&aidSlugs(w.email).indexOf(x.slug)>=0}var z=rpQ.replace(/[^a-z0-9-]/g,'');return!z||x.slug.indexOf(z)>=0}),
+    rpB=rpIn.filter(function(x){if(!rpPer(x))return false;if(!rpQ)return true;if(/^a_[a-f0-9]{32}$/.test(rpQ)){var g=pages[x.slug],w=g&&users[g.owner];return!!w&&w.authorId===rpQ&&aidSlugs(w.email).indexOf(x.slug)>=0}var z=rpQ.replace(/[^a-z0-9-]/g,'');return!z||x.slug.indexOf(z)>=0}),
     rpL=rpB.filter(function(x){return!rpR||x.reason===rpR}),rpC={};
-    rpIn.forEach(function(x){rpC[x.slug]=(rpC[x.slug]||0)+1});
+    rpIn.forEach(function(x){if(rpPer(x))rpC[x.slug]=(rpC[x.slug]||0)+1});
     var rpM=mcs(rpS),rpCsl={};rpIn.forEach(function(x){if(x.isCsam)rpCsl[x.slug]=1});
     var rpK=function(x){var g=pages[x.slug];return rpM[0]==='likes'?(g?g.likes:0):mcnt(g?g.owner:null,rpM[0])};
     rpL.sort(function(a,c){if(rpM)return(rpCsl[c.slug]?1:0)-(rpCsl[a.slug]?1:0)||(rpK(a)-rpK(c))*rpM[1]||(a.slug<c.slug?-1:a.slug>c.slug?1:0)||(c.reportedAt-a.reportedAt);return rpS==='old'?a.reportedAt-c.reportedAt:rpS==='most'?(rpC[c.slug]-rpC[a.slug])||(a.slug<c.slug?-1:a.slug>c.slug?1:0)||(c.reportedAt-a.reportedAt):c.reportedAt-a.reportedAt});
@@ -906,7 +1006,7 @@ function route(path,o){
   if(p==='/admin/referral'){var fsl=typeof b.slug==='string'?b.slug.toLowerCase():'';if(!SLUG_RE.test(fsl))return err(400,'invalid slug');var fo=ownerOf(fsl);if(!fo)return err(404,'no account for this slug');var fa=b.action;if(fa!=='void'&&fa!=='restore')return err(400,'invalid action');var fr=reasonOf(b);if(fa==='void'&&!fr)return err(400,'reason required');var tg=fo;if(b.aid){tg=Object.keys(users).map(function(e){return users[e]}).filter(function(x){return x.authorId===String(b.aid).toLowerCase()})[0];if(!tg)return err(404,'no account for that author ID')}var rb=tg.referredBy&&users[tg.referredBy];if(!rb||(b.aid&&rb.email!==fo.email))return err(404,'referral not found');var gx=0;
     if(fa==='void'){if(tg.refVoid&&tg.refVoid.reason==='admin')return err(409,'already voided');tg.refVoid={at:Date.now(),reason:'admin'};gx=giftMove(rb,tg,true)}else{if(!tg.refVoid)return err(409,'not voided');if(tg.refVoid.reason!=='admin')return err(409,'this referral is paused because the account is suspended or being deleted; it returns when that ends');tg.refVoid=null;gx=giftMove(rb,tg,false)}
     A('referral_'+fa,b.slug,fr+(b.aid?' ['+String(b.aid).slice(0,10)+']':'')+(gx?' ('+(fa==='void'?'-':'+')+gx+' gift views)':''));note(rb.email,'referral',fa==='void'?'A friend\u2019s invite no longer counts toward your ad access. '+(gx?'The '+gx+' free views it gave you were taken back. ':'')+aRs(fr):'A friend\u2019s invite counts toward your ad access again.'+(gx?' Its '+gx+' free views are back in your balance.':''));return ok({ok:true})}
-  if(p==='/admin/ads'){var st=['active','paused','exhausted','unpublished'].indexOf(q.get('status'))>=0?q.get('status'):'',kd=q.get('kind')==='write'||q.get('kind')==='share'?q.get('kind'):'',aq=aidQ(q.get('q')),sq=aq?'':(q.get('q')||'').toLowerCase().replace(/[^a-z0-9-]/g,'').slice(0,48),L2=Object.keys(ads).map(function(s){return ads[s]}).filter(function(x){return(!st||x.status===st)&&(!kd||x.kind===kd)&&(!aq||(users[x.ownerEmail]||{}).authorId===aq)&&(!sq||x.slug.indexOf(sq)>-1)});var acs=mcs(q.get('sort'));if(acs)L2.sort(function(a,b2){return(scnt(a.slug,a.ownerEmail,acs[0])-scnt(b2.slug,b2.ownerEmail,acs[0]))*acs[1]||b2.createdAt-a.createdAt});var apg=pgOf(L2,q.get('cursor'));return ok({ads:apg.rows.map(function(x){return{ownerSubs:mcnt(x.ownerEmail,'subs'),ownerFollowing:mcnt(x.ownerEmail,'following'),ownerNotes:mcnt(x.ownerEmail,'notes'),likes:(pages[x.slug]||{}).likes||0,slug:x.slug,ownerEmail:x.ownerEmail,viewsTotal:x.viewsTotal,viewsUsed:x.viewsUsed,status:x.status,createdAt:x.createdAt,uniqueViewers:x.uniqueViewers,kind:x.kind}}),total:apg.total,next:apg.next})}
+  if(p==='/admin/ads'){var aLo=parseInt(q.get('from'),10),aHi=parseInt(q.get('to'),10),st=['active','paused','exhausted','unpublished'].indexOf(q.get('status'))>=0?q.get('status'):'',kd=q.get('kind')==='write'||q.get('kind')==='share'?q.get('kind'):'',aq=aidQ(q.get('q')),sq=aq?'':(q.get('q')||'').toLowerCase().replace(/[^a-z0-9-]/g,'').slice(0,48),L2=Object.keys(ads).map(function(s){return ads[s]}).filter(function(x){return(!st||x.status===st)&&(!kd||x.kind===kd)&&(!aq||(users[x.ownerEmail]||{}).authorId===aq)&&(!sq||x.slug.indexOf(sq)>-1)&&(isNaN(aLo)||x.createdAt>=aLo)&&(isNaN(aHi)||x.createdAt<=aHi)});var acs=mcs(q.get('sort'));if(acs)L2.sort(function(a,b2){return(scnt(a.slug,a.ownerEmail,acs[0])-scnt(b2.slug,b2.ownerEmail,acs[0]))*acs[1]||b2.createdAt-a.createdAt});var apg=pgOf(L2,q.get('cursor'));return ok({ads:apg.rows.map(function(x){return{ownerSubs:mcnt(x.ownerEmail,'subs'),ownerFollowing:mcnt(x.ownerEmail,'following'),ownerNotes:mcnt(x.ownerEmail,'notes'),likes:(pages[x.slug]||{}).likes||0,slug:x.slug,ownerEmail:x.ownerEmail,viewsTotal:x.viewsTotal,viewsUsed:x.viewsUsed,status:x.status,createdAt:x.createdAt,uniqueViewers:x.uniqueViewers,kind:x.kind}}),total:apg.total,next:apg.next})}
   if(p==='/admin/ad'){var asl=typeof b.slug==='string'?b.slug.toLowerCase():'';if(!SLUG_RE.test(asl))return err(400,'invalid slug');var ad=ads[asl];if(!ad)return err(404,'ad not found');var ba=b.action,as=ad.status;if((ba==='pause'||ba==='takedown')&&!reasonOf(b))return err(400,'reason required');if(ba==='pause'&&as!=='active')return err(409,'ad is not active');if(ba==='resume'&&as!=='paused')return err(409,'ad is not paused');if(ba==='resume'&&users[ad.ownerEmail]&&(users[ad.ownerEmail].suspended||users[ad.ownerEmail].pendingDeletionAt))return err(409,'the owner account is suspended or being deleted');if(ba==='takedown'&&as!=='active'&&as!=='paused')return err(409,'ad is not running');if(ba==='refund'&&(as==='active'||as==='paused'))return err(409,'take the ad down first');if(ba!=='pause'&&ba!=='resume'&&ba!=='takedown'&&ba!=='refund')return err(400,'invalid action');var left=ad.viewsTotal-ad.viewsUsed,res={};
     if(b.action==='pause')ad.status='paused';else if(b.action==='resume')ad.status='active';
     else if(b.action==='takedown'){ad.status='unpublished';if(b.refund===true&&left>0&&!ad.refunded){res.refunded=left;ad.refunded=true}}
@@ -994,12 +1094,37 @@ function route(path,o){
     cR.forEach(function(e){users[e].alerts.unshift({at:cTs,kind:'notice',message:cm,cls:b.classification})});
     audit.unshift({action:'custom_alert',slug:null,detail:cm,at:cTs+5,cls:b.classification,aud:cCode,n:cR.length,ts:cTs});
     return ok({ok:true,sent:cR.length})}
+  if(p==='/admin/legal'){
+    if(m==='GET'){
+      var lgk=q.get('kind');if(!LG_NAME[lgk])return err(400,'unknown document');var lgs=LG_STATE[lgk];
+      if(q.get('history')==='1')return ok({kind:lgk,label:LG_NAME[lgk],current:lgs?lgs.version:0,versions:(LG_HIST[lgk]||[]).slice().reverse().map(function(h){return{version:h.version,updatedAt:h.at,size:h.html.length,message:h.message||null,sent:h.sent,fromVersion:h.from}})});
+      if(q.get('version')!=null){
+        var lgq=parseInt(q.get('version'),10);if(isNaN(lgq)||lgq<0)return err(400,'invalid version');
+        if(lgq===0)return ok({kind:lgk,version:0,html:LG_BUILTIN[lgk].trim(),updatedAt:null,message:null,sent:null,fromVersion:null});
+        var lgh0=(LG_HIST[lgk]||[]).filter(function(h){return h.version===lgq})[0];if(!lgh0)return err(404,'version not stored');
+        return ok({kind:lgk,version:lgh0.version,html:lgh0.html,updatedAt:lgh0.at,message:lgh0.message||null,sent:lgh0.sent,fromVersion:lgh0.from})}
+      return ok({kind:lgk,label:LG_NAME[lgk],html:lgs?lgs.html:LG_BUILTIN[lgk].trim(),version:lgs?lgs.version:0,updatedAt:lgs?lgs.at:null,builtin:!lgs,effective:lgEffIso(lgs?lgs.html:LG_BUILTIN[lgk]),builtinEffective:lgEffIso(LG_BUILTIN[lgk])})}
+    var lgk2=b.kind;if(!LG_NAME[lgk2])return err(400,'unknown document');if(b.resend===true){if(!(typeof b.version==='number'&&b.version>=1&&Math.floor(b.version)===b.version))return err(400,'version required');var lgl=LG_STATE[lgk2],lgLive=lgl?lgl.version:0;if(lgLive!==b.version)return ok({error:'version '+lgLive+' is live now, only the live version can be alerted again',current:lgLive},409);var lgr=(LG_HIST[lgk2]||[]).filter(function(h){return h.version===b.version})[0];if(!lgr||!lgr.message)return err(400,'that version was published without an alert');return err(400,'the alert for this version was already sent')}var lgh=typeof b.html==='string'?b.html.trim():'';if(!lgh||!lgBody(lgh))return err(400,'text required');var lgIn=lgh;lgh=lgStamp(lgh,Date.now());if(lgh.length>150000)return err(400,'text too long');
+    var lgbad=legalCheck(lgh);if(lgbad)return err(400,lgbad);
+    if(typeof b.base!=='number'||b.base<0||Math.floor(b.base)!==b.base)return err(400,'base version required');
+    var lgc=LG_STATE[lgk2],lgcv=lgc?lgc.version:0;
+    if(b.base!==lgcv)return ok({error:'version '+lgcv+' was published after you opened the editor',current:lgcv},409);
+    if(lgBody(lgIn)===lgBody(lgc?lgc.html:LG_BUILTIN[lgk2]))return err(400,'nothing has changed');
+    var lgm='',lgNow=Date.now();if(b.notify===true){lgm=typeof b.message==='string'?lgNorm(b.message):'';if(!lgm)return err(400,'alert message required');if(lgm.length>250||new TextEncoder().encode(lgm).length>700)return err(400,'alert message too long');if(new TextEncoder().encode(JSON.stringify({at:lgNow,action:'custom_alert',slug:null,detail:lgm,cls:'policy',aud:'all',n:99999999,ts:lgNow})).length>1000)return err(400,'too long to record in Audit, shorten the alert message')}
+    var lgv=lgcv+1,lgn=Date.now(),lgsent=0,lgfrom=typeof b.from==='number'&&b.from>=0?b.from:null;
+    if(lgc&&!(LG_HIST[lgk2]||[]).some(function(h){return h.version===lgcv}))LG_HIST[lgk2].push({version:lgcv,html:lgc.html,at:lgc.at,message:null,sent:null,from:null});
+    LG_STATE[lgk2]={html:lgh,version:lgv,at:lgn};
+    if(lgm)Object.keys(users).forEach(function(e){users[e].alerts.unshift({at:lgn,kind:'notice',message:lgm,cls:'policy'});lgsent++});
+    LG_HIST[lgk2].push({version:lgv,html:lgh,at:lgn,message:lgm||null,sent:lgm?lgsent:0,from:lgfrom});LG_HIST[lgk2]=LG_HIST[lgk2].filter(function(h){return h.version>lgv-LEGAL_HISTORY_KEEP});
+    audit.unshift({action:'legal_update',slug:null,detail:LG_NAME[lgk2]+' v'+lgv+(lgfrom!=null?' (restored from v'+lgfrom+')':'')+(lgm?', alert sent to '+lgsent:', no alert'),at:lgn,lk:lgk2,lv:lgv});
+    if(lgm)audit.unshift({action:'custom_alert',slug:null,detail:lgm,at:lgn+5,cls:'policy',aud:'all',n:lgsent,ts:lgn});
+    return ok({ok:true,kind:lgk2,version:lgv,updatedAt:lgn,sent:lgsent,alertFailed:false})}
   if(p==='/admin/audit'){var apg=pgOf(audit.filter(function(x){return Date.now()-x.at<400*D}).sort(function(a,c){return c.at-a.at}),q.get('cursor'));return ok({entries:apg.rows,nextCursor:apg.next})}
   if(p==='/admin/stats')return ok(stats());
   if(p==='/admin/users'||p==='/admin/notes'){var qq=(q.get('q')||'').toLowerCase(),isU=p==='/admin/users',uq=(q.get('q')||'').trim().slice(0,64).toLowerCase(),naq=aidQ(q.get('q')),nq=naq?'':(q.get('q')||'').toLowerCase().replace(/[^a-z0-9-]/g,'').slice(0,48);
-    if(isU){var f=q.get('f'),so=q.get('sort'),L3=Object.keys(users).map(function(e){return users[e]}).filter(function(x){return(!uq||x.authorId.toLowerCase().indexOf(uq)===0)&&(f!=='online'||isOn(x))&&(f!=='active24'||N-x.lastSeen<D)});var ucs=mcs(so);L3.sort(function(a,b2){return ucs?(mcnt(a.email,ucs[0])-mcnt(b2.email,ucs[0]))*ucs[1]||b2.createdAt-a.createdAt:so==='old'?a.createdAt-b2.createdAt:so==='active'?b2.lastSeen-a.lastSeen:b2.createdAt-a.createdAt});
+    if(isU){var f=q.get('f'),so=q.get('sort'),ovRg=function(a,b){var lo=parseInt(q.get(a),10),hi=parseInt(q.get(b),10);return function(v){return(isNaN(lo)||v>=lo)&&(isNaN(hi)||v<=hi)}},ovC=ovRg('cf','ct'),ovS2=ovRg('sf','st'),L3=Object.keys(users).map(function(e){return users[e]}).filter(function(x){return(!uq||x.authorId.toLowerCase().indexOf(uq)===0)&&(f!=='online'||isOn(x))&&(f!=='active24'||N-x.lastSeen<D)&&ovC(x.createdAt)&&ovS2(x.lastSeen)});var ucs=mcs(so);L3.sort(function(a,b2){return ucs?(mcnt(a.email,ucs[0])-mcnt(b2.email,ucs[0]))*ucs[1]||b2.createdAt-a.createdAt:so==='old'?a.createdAt-b2.createdAt:so==='active'?b2.lastSeen-a.lastSeen:b2.createdAt-a.createdAt});
       var upg=pgOf(L3,q.get('cursor'));return ok({users:upg.rows.map(function(x){return{email:x.email,name:x.displayName,authorId:x.authorId,createdAt:x.createdAt,notes:Object.keys(pages).filter(function(s){return pages[s].owner===x.email&&pages[s].status==='live'}).length,subs:x.subscribers,following:followingOf(x),likes:mcnt(x.email,'likes'),lastSeen:x.lastSeen,lastSignInAt:x.lastSignInAt,online:isOn(x),suspended:!!(x.suspended&&!x.pendingDeletionAt),deleting:!!x.pendingDeletionAt,referredBy:x.referredBy&&users[x.referredBy]?{email:x.referredBy,authorId:users[x.referredBy].authorId}:null,referralCode:x.referralCode||null}}),next:upg.next,total:upg.total})}
-    var ncs=mcs(q.get('sort')),L4=Object.keys(pages).map(function(s){return pages[s]}).filter(function(x){return x.status==='live'&&x.owner&&(!naq||(users[x.owner]||{}).authorId===naq)&&(!nq||x.slug.indexOf(nq)===0)}).sort(function(a,b2){return ncs?(scnt(a.slug,a.owner,ncs[0])-scnt(b2.slug,b2.owner,ncs[0]))*ncs[1]||b2.createdAt-a.createdAt:b2.createdAt-a.createdAt});
+    var nLo=parseInt(q.get('from'),10),nHi=parseInt(q.get('to'),10),ncs=mcs(q.get('sort')),L4=Object.keys(pages).map(function(s){return pages[s]}).filter(function(x){return x.status==='live'&&x.owner&&(!naq||(users[x.owner]||{}).authorId===naq)&&(!nq||x.slug.indexOf(nq)===0)&&(isNaN(nLo)||x.createdAt>=nLo)&&(isNaN(nHi)||x.createdAt<=nHi)}).sort(function(a,b2){return ncs?(scnt(a.slug,a.owner,ncs[0])-scnt(b2.slug,b2.owner,ncs[0]))*ncs[1]||b2.createdAt-a.createdAt:b2.createdAt-a.createdAt});
     var npg=pgOf(L4,q.get('cursor'));return ok({notes:npg.rows.map(function(x){return{slug:x.slug,title:x.story?x.story.title:null,createdAt:x.createdAt,story:x.showInStories,likes:x.likes,authorSubs:mcnt(x.owner,'subs'),authorFollowing:mcnt(x.owner,'following'),authorNotes:mcnt(x.owner,'notes')}}),next:npg.next,total:npg.total})}
   if(p==='/admin/trends'){var tb=q.get('bucket')||'day',tf=parseInt(q.get('from')||'',10),tt=parseInt(q.get('to')||'',10),to2=parseInt(q.get('off')||'0',10);if(['day','week','month','year'].indexOf(tb)<0)return err(400,'invalid bucket');if(!isFinite(tf)||!isFinite(tt)||tf<0||tt<=tf||tt-tf>70*366*864e5)return err(400,'invalid range');if(!isFinite(to2)||Math.abs(to2)>15*36e5||!offsOk(q.get('offs')))return err(400,'invalid offset');var tr=trends(q);tr.bucket=tb;tr.from=tf;tr.to=tt;tr.off=to2;return ok(tr)}
   if(p==='/admin/purge'){var n=0,PC=30*D;Object.keys(pages).forEach(function(s){var x=pages[s];if(x.status==='unpublished'&&x.deletedAt&&!x.csamHold&&N-x.deletedAt>PC){n+=x.snaps.filter(function(q){return N-q.ts>PC}).length+1;delete pages[s]}});Object.keys(pages).forEach(function(s){var x=pages[s];if(x.csamHold)return;var k=x.snaps.length;x.snaps=x.snaps.filter(function(q){return N-q.ts<=PC});n+=k-x.snaps.length});Object.keys(users).forEach(function(e){var x=users[e];if(!(x.pendingDeletionAt&&N-x.pendingDeletionAt>PC))return;Object.keys(pages).forEach(function(s){var q=pages[s];if(q.owner!==e||q.status!=='live')return;snap(q,'unpublish',N);q.status='unpublished';q.deletedAt=N;q.likes=0;q.showInStories=false;q.story=null});Object.keys(ads).forEach(function(s){if(ads[s].ownerEmail===e)delete ads[s]});Object.keys(users).forEach(function(o){if(users[o].referredBy===e)users[o].referredBy=null});delete users[e];n++});Object.keys(users).forEach(function(e){var a=users[e].alerts,k=a.length;users[e].alerts=a.filter(function(x){return N-x.at<=365*D});n+=k-users[e].alerts.length});var rl=reports.length;reports=reports.filter(function(x){return!(x.isCsam&&x.dismissedAt&&N-x.dismissedAt>548*D)});n+=rl-reports.length;Object.keys(stale).forEach(function(k){n+=stale[k];stale[k]=0});A('purge','',n+' removed');return ok({purged:n})}
@@ -1275,8 +1400,10 @@ function ask(o){
     sh.appendChild(el('div','grab'));
     var sb=el('div','sheet-body');sh.appendChild(sb);
     sb.appendChild(tile(o.sev||(o.danger?'csam':'ad'),o.icon||(o.danger?'alert':'shield')));
-    sb.appendChild(el('h2',null,o.title));
-    if(o.text)sb.appendChild(el('div','sheet-text',o.text));
+    var hd=sb;if(o.head){hd=el('div','sheet-head');sb.appendChild(hd)}
+    hd.appendChild(el('h2',null,o.title));
+    if(o.text)hd.appendChild(el('div','sheet-text',o.text));
+    if(o.head)hd.appendChild(o.head);
     if(o.node){sb.classList.add('coc-c');sb.style.margin='0 -22px';sb.style.padding='0 22px';sb.appendChild(o.node)}
     var inputs=[];
     (o.fields||[]).forEach(function(f){
@@ -1410,10 +1537,13 @@ function applyNav(s,y){
   if(y!=null)navRestore(y);else window.scrollTo(0,0)
 }
 /* Sheets take one history entry while open, so the device Back button closes the sheet instead of leaving the page behind it */
-function sheetOpen(){if(!sheetH){history.pushState(Object.assign({},history.state||{},{sh:1}),'',location.href);sheetH=true}}
+var openPend=false;
+function sheetPush(){history.pushState(Object.assign({},history.state||{},{sh:1}),'',location.href);sheetH=true}
+/* A sheet that opens right after another closed must wait for the closing sheet's history.back() to land, or that back pops the new sheet's entry and the next close steps out of the page */
+function sheetOpen(){if(sheetH)return;if(ignorePop){openPend=true;return}sheetPush()}
 function sheetClose(keep){if(sheetH&&!keep){sheetH=false;ignorePop=true;history.back()}}
 window.addEventListener('popstate',function(e){
-  if(ignorePop){ignorePop=false;return}
+  if(ignorePop){ignorePop=false;if(openPend){openPend=false;if(curSheet&&!sheetH)sheetPush()}return}
   if(curSheet){sheetH=false;curSheet.done(false);return}
   if(document.body.dataset.auth!=='in')return;
   var s=e.state;
@@ -1444,6 +1574,7 @@ function showTab(t){
   if(t==='overview'&&!ovS.loaded){ovS.loaded=true;loadOverview();ovList(true)}
   if(t==='ads'&&!$('adlist').firstChild)loadAds(true);
   if(t==='audit'&&!auAll.length&&!$('aulist').firstChild)loadAudit(true);
+  if(t==='tools'){lgLoad();lgWarm()}
   requestAnimationFrame(xHintAll)
 }
 function goTab(t){showTab(t);navPush();window.scrollTo(0,0)}
@@ -1557,7 +1688,8 @@ function repQuery(first){
     var r=$('freason').value,q=fqv(),so=$('fsort').value;
     if(r)p.push('reason='+encodeURIComponent(r));
     if(q)p.push('q='+encodeURIComponent(q));
-    if(so&&so!=='new')p.push('sort='+so)
+    if(so&&so!=='new')p.push('sort='+so);
+    var pr=perRng('reports');if(pr){if(pr.from!=null)p.push('from='+pr.from);if(pr.to!=null)p.push('to='+pr.to)}
   }
   if(next&&!first)p.push('cursor='+encodeURIComponent(next));
   return p.join('&')
@@ -1575,7 +1707,10 @@ function startReindex(){
 }
 function loadReports(reset){
   var L=$('list'),g;
-  if(reset){g=++rGen;all=[];next=null;L.textContent='';skel(L,3)}else{g=rGen;moreBusy($('more'),true)}
+  if(reset){
+    g=++rGen;perSnap('reports');all=[];next=null;L.textContent='';
+    skel(L,3)
+  }else{g=rGen;moreBusy($('more'),true)}
   return api('/admin/reports?'+repQuery()).then(function(o){
     if(g!==rGen)return;
     unskel(L);moreBusy($('more'),false);
@@ -1616,8 +1751,8 @@ function renderQueue(base){
 }
 function repBase(){
   var fs=$('fstatus').value,fq=fqv();
-  var fa=isAid(fq)?(rIdx?{all:1}:(aidMap[fq]||{set:{}})):null;
-  return all.filter(function(r){return(!fs||r.status===fs)&&(!fq||(fa?(fa.all||!!fa.set[r.slug]):r.slug.indexOf(fq)>=0))})
+  var fa=isAid(fq)?(rIdx?{all:1}:(aidMap[fq]||{set:{}})):null,pr=perRng('reports');
+  return all.filter(function(r){return(!fs||r.status===fs)&&auIn({at:r.reportedAt},pr)&&(!fq||(fa?(fa.all||!!fa.set[r.slug]):r.slug.indexOf(fq)>=0))})
 }
 function repGroups(base){
   var fr=$('freason').value,grp=$('fgroup').checked,so=$('fsort').value;
@@ -1673,12 +1808,12 @@ function renderAll(){
   var n=groups.length;
   repCounts(groups,base);
   if(!n){
-    if(all.length||(rIdx&&(fr||fq)))L.appendChild(empty('Nothing matches','Change the filters above to see more reports.','search'));
+    if(all.length||(rIdx&&(fr||fq||perRng('reports'))))L.appendChild(empty('Nothing matches','Change the filters above to see more reports.','search'));
     else L.appendChild(empty(dis?'No dismissed reports':'All clear',dis?'Dismissed reports show up here.':'There are no open reports.','check'))
   }
   // Filters, the reason chips and "Most reported" only see what's loaded, so pull the remaining pages
   // (up to 1000 reports) before they apply. Stops if a page fails to load or adds nothing.
-  if(next&&!fullBusy&&all.length<1000&&(fs||(!rIdx&&(fr||fq||so==='most')))){
+  if(next&&!fullBusy&&all.length<1000&&(fs||(!rIdx&&(fr||fq||so==='most'||perRng('reports'))))){
     var n0=all.length;fullBusy=true;
     loadReports(false).then(function(){fullBusy=false;if(next&&all.length>n0)renderAll()})
   }
@@ -1804,6 +1939,7 @@ function mkView(r,s,row){
   });
   return b
 }
+var snapN=0;
 function mkSnaps(slug,status,hitTs,card,csam,done){
   var box=null;
   var t=btn('Snapshots',null,function(){
@@ -1814,8 +1950,8 @@ function mkSnaps(slug,status,hitTs,card,csam,done){
       t.disabled=false;
       if(!o.ok){showErr(o,'Could not load snapshots');return}
       box=el('div','snaps');
-      if(!o.j.snapshots.length)box.appendChild(el('div','snap-none','No snapshots for /'+slug));
-      o.j.snapshots.forEach(function(s){
+      var all=o.j.snapshots,list=el('div'),snk='snap'+(++snapN);
+      function snapRow(s){
         var d=el('div','snap-row'+(s.ts===hitTs?' hit':'')),line=el('div','snap-line');
         line.appendChild(el('span','when',fmt(s.ts)));
         line.appendChild(chip(s.source));
@@ -1825,8 +1961,22 @@ function mkSnaps(slug,status,hitTs,card,csam,done){
         d.appendChild(line);
         var m=el('div','snap-meta');m.appendChild(el('code',null,fmt(s.ts)+' '+tzAbbr()+' / '+s.ts+' / '+Math.round(s.size/1024)+' KB'));
         d.insertBefore(m,line.nextSibling);
-        box.appendChild(d)
-      });
+        return d
+      }
+      // The copies are all loaded already, so a time range just filters them here.
+      function draw(){
+        list.textContent='';var r=perRng(snk),n=0;
+        all.forEach(function(s){if(r&&!((r.from==null||s.ts>=r.from)&&(r.to==null||s.ts<=r.to)))return;n++;list.appendChild(snapRow(s))});
+        if(!n)list.appendChild(el('div','snap-none',all.length?'No snapshots in this range for /'+slug:'No snapshots for /'+slug))
+      }
+      if(all.length>1){
+        AL_WHEN[snk]='When the copy was saved';
+        var fb=el('div','filters'),sl=el('span','sel'),pb=el('button','pick','Any time'),pw=el('div');
+        pb.type='button';pb.setAttribute('aria-label','Time range');pb.setAttribute('aria-expanded','false');pw.hidden=true;
+        pb.onclick=function(){var op=pw.hidden;if(op){pw.textContent='';pw.appendChild(alBox(snk,'Time range',function(){var t=alPerText(snk);pb.textContent=t.charAt(0).toUpperCase()+t.slice(1);draw()}))}pw.hidden=!op;pb.setAttribute('aria-expanded',op?'true':'false')};
+        sl.appendChild(pb);sl.appendChild(ico('chev'));fb.appendChild(sl);box.appendChild(fb);box.appendChild(pw)
+      }
+      box.appendChild(list);draw();
       card.appendChild(box);
       if(box.scrollIntoView)box.scrollIntoView({behavior:'smooth',block:'start'})
     }).catch(function(e){t.disabled=false;netFail(e)})
@@ -2083,19 +2233,28 @@ function aidResolve(v){return aidMap[v]?Promise.resolve(aidMap[v]):aidFetch(v,''
 function aidMore(v){var r=aidMap[v];return r&&r.next?aidFetch(v,r.next):Promise.resolve(r)}
 var adT=null,adFocus='';
 // " - active - share" style suffix for the Ads subtitle: the status and type filters that are on.
-function adFiltLbl(){var t=[];if($('adst').value)t.push($('adst').textContent.toLowerCase());if($('adkind').value)t.push($('adkind').textContent.toLowerCase());return t.length?' - '+t.join(' - '):''}
+function adPerQs(){var r=perRng('adstart'),s='';if(r){if(r.from!=null)s+='&from='+r.from;if(r.to!=null)s+='&to='+r.to}return s}
+var adWT=null;
+function adRun(){if(perToast('adstart'))return;loadAds(true)}
+function adPerChg(imm){perLbl('adstart','adper');clearTimeout(adWT);if(imm)adRun();else adWT=setTimeout(adRun,300)}
+function adFiltLbl(){var t=[];if(perRng('adstart'))t.push(alPerText('adstart'));if($('adst').value)t.push($('adst').textContent.toLowerCase());if($('adkind').value)t.push($('adkind').textContent.toLowerCase());return t.length?' - '+t.join(' - '):''}
 function adqv(){return $('adq').value.trim().toLowerCase().replace(/^[/@]+/,'')}
 // Lookup's "Ads tab": show the ad of one note, opened, in the Ads screen (status filter reset so it cannot be hidden).
 function openAd(slug){
   openSet['ad:'+slug]=true;adFocus=slug;
-  $('adq').value=slug;pickSet('adst','');pickSet('adkind','');
+  $('adq').value=slug;pickSet('adst','');pickSet('adkind','');perReset('adstart','adper','adbox');
   $('adlist').textContent='';adCur='';
   goTab('ads');if(cur==='ads'&&!$('adlist').firstChild)loadAds(true)
 }
+var adGen=0;
 function loadAds(reset){
-  var L=$('adlist');
-  if(reset){adCur='';adTotal=0;L.textContent='';skel(L,3)}else moreBusy($('admore'),true);
-  return api('/admin/ads?status='+encodeURIComponent($('adst').value)+'&kind='+encodeURIComponent($('adkind').value)+'&sort='+encodeURIComponent($('adsort').value)+'&q='+encodeURIComponent(adqv())+'&cursor='+encodeURIComponent(adCur)).then(function(o){
+  var L=$('adlist'),g;
+  if(reset){
+    g=++adGen;perSnap('adstart');adCur='';adTotal=0;L.textContent='';
+    skel(L,3)
+  }else{g=adGen;moreBusy($('admore'),true)}
+  return api('/admin/ads?status='+encodeURIComponent($('adst').value)+'&kind='+encodeURIComponent($('adkind').value)+'&sort='+encodeURIComponent($('adsort').value)+'&q='+encodeURIComponent(adqv())+adPerQs()+'&cursor='+encodeURIComponent(adCur)).then(function(o){
+    if(g!==adGen)return;
     unskel(L);moreBusy($('admore'),false);
     if(!o.ok){bad(o,'Could not load ads');return}
     if(o.j.total!=null)adTotal=o.j.total;SUBS.ads=num(adTotal)+(adTotal===1?' campaign':' campaigns')+adFiltLbl();if(cur==='ads')setSub();
@@ -2103,7 +2262,7 @@ function loadAds(reset){
     if(adFocus){var f=o.j.ads.filter(function(x){return x.slug===adFocus})[0];adFocus='';if(f&&f._c&&f._c.scrollIntoView)f._c.scrollIntoView({behavior:'smooth',block:'start'})}
     adCur=o.j.next;$('admore').hidden=adCur==null;
     if(!L.firstChild)L.appendChild(empty('No ads','No ads match this search or filter.','ads'))
-  }).catch(function(e){unskel(L);moreBusy($('admore'),false);netFail(e)})
+  }).catch(function(e){if(g!==adGen)return;unskel(L);moreBusy($('admore'),false);netFail(e)})
 }
 // The server's result applied to the card on screen: no list reload. Under a status filter a card that no
 // longer matches leaves the list, and the campaign count follows.
@@ -2151,7 +2310,7 @@ function renderAd(a){
 }
 
 /* ---------- Audit ---------- */
-var ACT_LBL={takedown:'Takedown',release:'Release',restore:'Restore',dismiss:'Dismiss',undismiss:'Undismiss',purge:'Purge',ncmec_recorded:'NCMEC recorded',owner_suspend:'Suspend account',owner_unsuspend:'Unsuspend account',owner_delete:'Delete account','owner_cancel-delete':'Cancel deletion','owner_clear-name':'Clear name','owner_clear-picture':'Clear picture',story_remove:'Story removed',story_allow:'Story allowed',strike_excuse:'Strike excused',strike_restore:'Strike reinstated',referral_void:'Referral voided',referral_restore:'Referral restored',ad_pause:'Ad paused',ad_resume:'Ad resumed',ad_takedown:'Ad taken down',ad_refund:'Ad refunded',custom_alert:'Custom alert'};
+var ACT_LBL={takedown:'Takedown',release:'Release',restore:'Restore',dismiss:'Dismiss',undismiss:'Undismiss',purge:'Purge',ncmec_recorded:'NCMEC recorded',owner_suspend:'Suspend account',owner_unsuspend:'Unsuspend account',owner_delete:'Delete account','owner_cancel-delete':'Cancel deletion','owner_clear-name':'Clear name','owner_clear-picture':'Clear picture',story_remove:'Story removed',story_allow:'Story allowed',strike_excuse:'Strike excused',strike_restore:'Strike reinstated',referral_void:'Referral voided',referral_restore:'Referral restored',ad_pause:'Ad paused',ad_resume:'Ad resumed',ad_takedown:'Ad taken down',ad_refund:'Ad refunded',custom_alert:'Custom alert',legal_update:'Policy update'};
 function actLbl(a){a=String(a||'');if(ACT_LBL[a])return ACT_LBL[a];a=a.replace(/[_-]+/g,' ').trim();return a.charAt(0).toUpperCase()+a.slice(1)}
 function actTone(a){a=String(a||'');if(/take|purge|suspend|delete|ban/.test(a)&&!/unsuspend|cancel/.test(a))return'bad';if(/restore|release|unsuspend|cancel|allow|refund|resume/.test(a))return'good';return''}
 var auT=null,auBusy=false;
@@ -2168,21 +2327,59 @@ function auSearch(){
     loadAudit(false).then(function(){if(auAll.length>before)step()})
   })()
 }
+// A range is worked out once (when it is edited or the list is reloaded) and reused, so "last N days" does not slide while paging.
+var perSnapM={};
+function perSnap(k){delete perSnapM[k]}
+// Why the range cannot be used (empty when it is fine or off).
+function perBad(k){var p=alPer[k];return p&&p.m!=='any'?alPerWhy(k):''}
+var perLast={};
+// An invalid range keeps the last valid one in force, so the lists stay as they were until the range is fixed.
+function perRng(k){if(!(k in perSnapM)){if(perBad(k))perSnapM[k]=k in perLast?perLast[k]:null;else perSnapM[k]=perLast[k]=perRngNow(k)}return perSnapM[k]}
+function perToast(k){var w=perBad(k);if(!w)return false;var p=alPer[k];if(!(p.m==='last'&&p.n===''))msg(w+' Showing the last valid results.','err');return true}
+function perRngNow(k){
+  var p=alPer[k];if(!p||p.m==='any'||alPerWhy(k))return null;
+  if(p.m==='last'){var n=parseInt(p.n,10);return{from:Date.now()-n*(p.u==='h'?36e5:864e5),to:null}}
+  return{from:p.from?Date.parse(alU(p.from)+':00Z'):null,to:p.to?Date.parse(alU(p.to)+':00Z')+59999:null}
+}
+function auRange(){return perRng('audit')}
+function perOpen(k,btn,box,chg){var b=$(box),o=b.hidden;if(o){b.textContent='';b.appendChild(alBox(k,'Time range',chg))}b.hidden=!o;$(btn).setAttribute('aria-expanded',o?'true':'false')}
+function perLbl(k,btn,pre){var b=$(btn),w=perBad(k);b.classList.toggle('inv',!!w);b.setAttribute('aria-invalid',w?'true':'false');b.title=w;if(w){b.textContent=(pre||'')+'Invalid range';return}var t=alPerText(k);b.textContent=pre!=null?pre+t:t.charAt(0).toUpperCase()+t.slice(1)}
+function perReset(k,btn,box){alPer[k]=alPerNew(k);perSnap(k);delete perLast[k];$(btn).classList.remove('inv');$(btn).title='';$(box).hidden=true;$(box).textContent='';$(btn).textContent='Any time';$(btn).setAttribute('aria-expanded','false')}
+var repWT=null;
+function repRun(){if(perToast('reports'))return;repFilter()}
+function repPerChg(imm){perLbl('reports','repper');clearTimeout(repWT);if(imm)repRun();else repWT=setTimeout(repRun,300)}
+function auIn(e,r){return!r||((r.from==null||e.at>=r.from)&&(r.to==null||e.at<=r.to))}
+// Entries come newest first: page on until the oldest loaded one is before the start (or, with only an end, until one is inside the period).
+function auNeed(){var r=auRange();if(!r)return false;if(r.from!=null)return!(auAll.length&&auAll[auAll.length-1].at<r.from);return!auAll.some(function(e){return auIn(e,r)})}
+function auPast(){var r=auRange();return!!(r&&r.from!=null&&auAll.length&&auAll[auAll.length-1].at<r.from)}
+var auWT=null;
+function auRun(){if(perToast('audit'))return;auWin()}
+function auPerChg(imm){
+  perLbl('audit','auper');
+  clearTimeout(auWT);if(imm)auRun();else auWT=setTimeout(auRun,300)
+}
+function auWin(){
+  renderAudit();var n=0;
+  (function step(){
+    if(!auNeed()||!auNext||n++>=10){$('aumore').hidden=!auNext||auPast();return}
+    loadAudit(false).then(step)
+  })()
+}
 function loadAudit(reset){
   var L=$('aulist');
   if(!reset&&auBusy)return Promise.resolve();
   auBusy=true;
-  if(reset){auNext=null;auAll=[];L.textContent='';skel(L,4)}else moreBusy($('aumore'),true);
+  if(reset){perSnap('audit');auNext=null;auAll=[];L.textContent='';skel(L,4)}else moreBusy($('aumore'),true);
   return api('/admin/audit'+(auNext?'?cursor='+encodeURIComponent(auNext):'')).then(function(o){
     auBusy=false;unskel(L);moreBusy($('aumore'),false);
     if(!o.ok){bad(o,'Could not load Audit');return}
-    auAll=auAll.concat(o.j.entries);auNext=o.j.nextCursor;$('aumore').hidden=!auNext;
+    auAll=auAll.concat(o.j.entries);auNext=o.j.nextCursor;$('aumore').hidden=!auNext||auPast();
     renderAudit()
   }).catch(function(e){auBusy=false;unskel(L);moreBusy($('aumore'),false);netFail(e)})
 }
 function renderAudit(){
   var keys=$('aukeys');keys.textContent='';
-  var q=auqv(),hits=auAll.filter(function(e){return auHit(e,q)});
+  var q=auqv(),cut=auRange(),hits=auAll.filter(function(e){return auIn(e,cut)&&auHit(e,q)});
   var seen=[],cnt={};hits.forEach(function(e){if(cnt[e.action]==null){cnt[e.action]=0;seen.push(e.action)}cnt[e.action]++});
   if(auFilter&&cnt[auFilter]==null){cnt[auFilter]=0;seen.push(auFilter)}
   if(seen.length>1||auFilter){
@@ -2213,12 +2410,13 @@ function renderAudit(){
       var main=el('div','log-main');
       if(e.slug){var lb=el('button','lnk','/'+e.slug);lb.type='button';lb.onclick=function(){openLookup(e.slug)};main.appendChild(lb)}
       if(e.detail)main.appendChild(el('span','det',e.detail));
-      d.appendChild(main)
+      d.appendChild(main);
+      if(e.action==='legal_update'&&e.lk&&e.lv){var vb=btn('View changes','quiet',function(){lgVerSheet(e.lk,e.lv)});vb.style.marginTop='8px';d.appendChild(vb)}
     }
     L.appendChild(d)
   });
   if(!L.firstChild){
-    if(auAll.length&&(q||auFilter))L.appendChild(empty('No matching entries','Nothing in the log matches this filter.','audit'));
+    if(auAll.length&&(q||auFilter||cut))L.appendChild(empty('No matching entries','Nothing in the log matches this filter.','audit'));
     else L.appendChild(empty('No audit entries yet','Takedowns, releases and other admin actions are logged here.','audit'))
   }
   var am=isAid(q)?aidMap[q]:null;
@@ -2808,7 +3006,7 @@ var AL_CLS=[['announcement','Announcement'],['update','Product update'],['mainte
 var AL_CATS=[['signup','Signed up'],['seen','Seen in the app'],['away','Gone quiet'],['published','Published a note'],['storied','Shared to stories'],['followed','Gained a follower'],['following','Followed someone'],['liked','Liked a note'],['gotliked','Got a like'],['advertisers','Ran an ad'],['buyers','Bought ad views'],['struck','Got a strike'],['reported','Was reported'],['takendown','Had a note taken down'],['suspended','Was suspended'],['neverpub','Never published'],['neverstory','Never shared to stories'],['neverad','Never ran an ad']];
 // Groups older Audit entries refer to (fixed windows), kept so those entries still read correctly.
 var AL_LEGACY=[['new7','New this week'],['active7','Active in 7 days'],['inactive30','Away 30+ days'],['publishers','Publishers']];
-var AL_WHEN={signup:'When the account was created',seen:'When the account was last seen',away:'How long since the account was last seen',published:'When a note was published',storied:'When a note was shared to stories',followed:'When someone started following',advertisers:'When an ad was started',buyers:'When ad views were bought',struck:'When a strike was recorded',reported:'When a report was filed',following:'When they started following someone',liked:'When a note was liked',gotliked:'When a note of theirs was liked',takendown:'When a note was taken down',suspended:'When the account was suspended'};
+var AL_WHEN={signup:'When the account was created',seen:'When the account was last seen',away:'How long since the account was last seen',published:'When a note was published',storied:'When a note was shared to stories',followed:'When someone started following',advertisers:'When an ad was started',buyers:'When ad views were bought',struck:'When a strike was recorded',reported:'When a report was filed',following:'When they started following someone',liked:'When a note was liked',gotliked:'When a note of theirs was liked',takendown:'When a note was taken down',suspended:'When the account was suspended',audit:'When the action was logged',reports:'When the report was filed',ovsign:'When the account was created',ovseen:'When the account was last seen',ovpub:'When the note was published',adstart:'When the ad was started'};
 var AL_MODES=[['all','Everyone'],['categories','Groups'],['users','Specific accounts']];
 var AL_QUICK=[['h',12],['h',24],['d',3],['d',7],['d',14],['d',30],['d',90],['d',180]];
 var alMode='all',alCats={},alPer={},alBoxes={},alMatch='any',alRT=null,alGen=0,alCount=null,alUnknown=[],alBusy=false;
@@ -2904,7 +3102,7 @@ function alSync(){
   b.classList.toggle('wait',alBusy)
 }
 // Counts who the current audience reaches (no alert is sent), so the admin sees the number before confirming.
-function alRecip(){
+function alRecip(imm){
   clearTimeout(alRT);alCount=null;alCountWhy='';alUnknown=[];
   var r=$('alrecip'),a=alAudience(),g=++alGen,why=alWhy(a);
   r.className='recip'+(why&&((a.type==='users'&&a.users.length)||(a.type==='categories'&&a.categories.length))?' err':'');
@@ -2921,7 +3119,7 @@ function alRecip(){
       else{var go=el('button','recip-go');go.type='button';go.setAttribute('aria-label','View recipients');go.appendChild(el('b',null,num(alCount)));go.appendChild(document.createTextNode(' account'+(alCount===1?'':'s')+' will receive it'));go.appendChild(ico('chev'));go.onclick=alList;r.appendChild(go)}
       alSync()
     },function(){if(g===alGen){r.className='recip err';alCountWhy='Could not count recipients. Check your connection and try again.';r.textContent=alCountWhy}})
-  },320)
+  },imm===true?0:320)
 }
 // The recipients behind the count on the Message screen.
 function alList(){
@@ -2988,25 +3186,26 @@ function recipSheet(o){
 }
 // The period editor for one group: any time / in the last N hours or days / between two date-times in the chosen time zone.
 // Built once and updated in place, so typing in it never loses focus.
-function alBox(k,label){
+function alBox(k,label,onch){
   var p=alPer[k]||(alPer[k]=alPerNew(k)),away=k==='away',box=el('div','perbox');
+  function fire(imm){perSnap(k);(onch||alRecip)(!!imm)}
   var hd=el('div','per-h'),val=el('span','per-v');hd.appendChild(el('span','per-t',label));hd.appendChild(val);box.appendChild(hd);
   box.appendChild(el('div','per-s',AL_WHEN[k]));
   var modes=el('div','alrow sev-ad'),last=el('div','per-last'),range=el('div'),err=el('div','per-err');
   var ms=away?[['last','For at least'],['range','Since a date']]:[['any','Any time'],['last','In the last'],['range','Between dates']];
-  ms.forEach(function(m){var b=el('button','key');b.type='button';b.setAttribute('data-v',m[0]);b.appendChild(el('span',null,m[1]));b.onclick=function(){p.m=m[0];sync();alRecip()};modes.appendChild(b)});
+  ms.forEach(function(m){var b=el('button','key');b.type='button';b.setAttribute('data-v',m[0]);b.appendChild(el('span',null,m[1]));b.onclick=function(){p.m=m[0];sync();fire(1)};modes.appendChild(b)});
   box.appendChild(modes);
   var ni=el('input','field per-n');ni.type='number';ni.min='1';ni.step='1';ni.setAttribute('inputmode','numeric');ni.setAttribute('aria-label','Amount');ni.value=p.n;
-  ni.oninput=function(){p.n=ni.value;sync();alRecip()};
+  ni.oninput=function(){p.n=ni.value;sync();fire(0)};
   last.appendChild(ni);
   var us=el('div','alrow sev-ad'),ub=[];
   us.style.margin='0';
-  [['h','Hours'],['d','Days']].forEach(function(u){var b=el('button','key');b.type='button';b.appendChild(el('span',null,u[1]));b.onclick=function(){p.u=u[0];sync();alRecip()};ub.push([u[0],b]);us.appendChild(b)});
+  [['h','Hours'],['d','Days']].forEach(function(u){var b=el('button','key');b.type='button';b.appendChild(el('span',null,u[1]));b.onclick=function(){p.u=u[0];sync();fire(1)};ub.push([u[0],b]);us.appendChild(b)});
   last.appendChild(us);box.appendChild(last);
   var qk=el('div','alrow sev-ad'),qb=[];
-  AL_QUICK.forEach(function(x){var b=el('button','key');b.type='button';b.appendChild(el('span',null,x[1]+x[0]));b.onclick=function(){p.m='last';p.u=x[0];p.n=String(x[1]);ni.value=p.n;sync();alRecip()};qb.push([x,b]);qk.appendChild(b)});
+  AL_QUICK.forEach(function(x){var b=el('button','key');b.type='button';b.appendChild(el('span',null,x[1]+x[0]));b.onclick=function(){p.m='last';p.u=x[0];p.n=String(x[1]);ni.value=p.n;sync();fire(1)};qb.push([x,b]);qk.appendChild(b)});
   last.appendChild(qk);qk.style.flexBasis='100%';
-  function dt(txt,key){var l=el('label'),w=el('div','field tr-date dt-wrap'),tx=el('span','dt-txt'),i=el('input');l.appendChild(el('span','per-lab',txt));i.type='datetime-local';i.value=p[key];i.setAttribute('aria-label',txt);i.oninput=function(){p[key]=i.value;sync();alRecip()};var MO=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];function upd(){var v=i.value,m=/^(\d{4})-(\d\d)-(\d\d)T(\d\d):(\d\d)/.exec(v||'');w.classList.toggle('empty',!m);tx.textContent=m?MO[+m[2]-1]+' '+(+m[3])+', '+m[1]+' at '+m[4]+':'+m[5]:'Select date and time'}upd();i.addEventListener('input',upd);i.addEventListener('change',upd);i.onclick=function(){try{i.showPicker&&i.showPicker()}catch(e){}};w.appendChild(tx);w.appendChild(i);l.appendChild(w);return[l,i,upd]}
+  function dt(txt,key){var l=el('label'),w=el('div','field tr-date dt-wrap'),tx=el('span','dt-txt'),i=el('input');l.appendChild(el('span','per-lab',txt));i.type='datetime-local';i.value=p[key];i.setAttribute('aria-label',txt);i.oninput=function(){p[key]=i.value;sync();fire(0)};var MO=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];function upd(){var v=i.value,m=/^(\d{4})-(\d\d)-(\d\d)T(\d\d):(\d\d)/.exec(v||'');w.classList.toggle('empty',!m);tx.textContent=m?MO[+m[2]-1]+' '+(+m[3])+', '+m[1]+' at '+m[4]+':'+m[5]:'Select date and time'}upd();i.addEventListener('input',upd);i.addEventListener('change',upd);i.addEventListener('change',function(){fire(1)});i.onclick=function(){try{i.showPicker&&i.showPicker()}catch(e){}};w.appendChild(tx);w.appendChild(i);l.appendChild(w);return[l,i,upd]}
   var rg=el('div','per-range'),f=dt(away?'Not seen since ('+tzAbbr()+')':'From ('+tzAbbr()+')','from'),t=away?null:dt('To ('+tzAbbr()+')','to');
   rg.appendChild(f[0]);if(t)rg.appendChild(t[0]);range.appendChild(rg);
   if(!away){
@@ -3015,7 +3214,7 @@ function alBox(k,label){
     var nw=new Date(tzShift(Date.now())),Y=nw.getUTCFullYear(),M=nw.getUTCMonth(),D=nw.getUTCDate();
     [['Today',iso(Y,M,D,0,0),iso(Y,M,D,23,59)],['Yesterday',iso(Y,M,D-1,0,0),iso(Y,M,D-1,23,59)],['This month',iso(Y,M,1,0,0),iso(Y,M+1,0,23,59)],['Last month',iso(Y,M-1,1,0,0),iso(Y,M,0,23,59)]].forEach(function(x){
       var b=el('button','key');b.type='button';b.appendChild(el('span',null,x[0]));
-      b.onclick=function(){p.m='range';p.from=x[1];p.to=x[2];f[1].value=p.from;t[1].value=p.to;f[2]();t[2]();sync();alRecip()};qr.appendChild(b)
+      b.onclick=function(){p.m='range';p.from=x[1];p.to=x[2];f[1].value=p.from;t[1].value=p.to;f[2]();t[2]();sync();fire(1)};qr.appendChild(b)
     });
     range.appendChild(qr)
   }
@@ -3093,6 +3292,388 @@ $('alcls').onclick=function(){pick('alcls',alSync)};
 $('alsend').onclick=alSend;
 tzInit();
 $('alaudit').onclick=function(){auOpenAlerts()};
+/* ---------- Terms & Privacy Policy (Tools) ---------- */
+var LG={kind:'privacy',data:{},draft:{},base:{},from:{},openEdit:false},LG_LBL={privacy:'Privacy Policy',terms:'Consumer Terms'};
+function lgSel(){
+  var box=$('lgsel');box.textContent='';
+  [['privacy','Privacy Policy'],['terms','Consumer Terms']].forEach(function(x){
+    var b=el('button','key');b.type='button';b.setAttribute('aria-pressed',LG.kind===x[0]?'true':'false');b.appendChild(el('span',null,x[1]));
+    b.onclick=function(){LG.kind=x[0];lgSel();lgLoad()};box.appendChild(b)
+  })
+}
+function lgMeta(){
+  var d=LG.data[LG.kind],m=$('lgmeta');
+  if(!d){m.textContent='Loading...';return}
+  m.textContent=d.builtin?'Showing the copy built into the app. Nothing has been published from here yet.':'Live: version '+d.version+', published '+fmt(d.updatedAt)+'.'+(d.builtinEffective&&d.effective&&d.builtinEffective>d.effective?' The built-in copy is dated '+d.builtinEffective+', later than the live text ('+d.effective+'). An app that shows the published text over its own may still show the older one; publish the newer text here to match.':'')
+}
+function lgWarm(){
+  ['privacy','terms'].forEach(function(k){
+    if(k===LG.kind||LG.data[k])return;
+    api('/admin/legal?kind='+k).then(function(o){if(o.ok&&!LG.data[k]){LG.data[k]=o.j;if(k===LG.kind)lgMeta()}})
+  })
+}
+function lgLoad(force){
+  var k=LG.kind;
+  if(LG.data[k]&&!force){lgMeta();return Promise.resolve(LG.data[k])}
+  lgMeta();
+  return api('/admin/legal?kind='+k).then(function(o){
+    if(!o.ok){if(k===LG.kind)$('lgmeta').textContent='Could not load the '+LG_LBL[k]+'.';showErr(o,'Could not load the '+LG_LBL[k]);return null}
+    LG.data[k]=o.j;if(k===LG.kind)lgMeta();return o.j
+  })
+}
+/* The text in a sandboxed frame, so it reads like the app's own pages and nothing in it can run. */
+function lgFrame(html){
+  var f=document.createElement('iframe');f.setAttribute('sandbox','');f.referrerPolicy='no-referrer';f.title='Preview';
+  f.style.cssText='display:block;width:100%;height:52vh;border:0;border-radius:12px;background:#fff';
+  f.srcdoc='<!doctype html><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src '+"'none'"+'; style-src '+"'unsafe-inline'"+'"><meta name="viewport" content="width=device-width,initial-scale=1"><style>body{margin:0;padding:14px 16px;font:15px/1.55 -apple-system,Segoe UI,Roboto,sans-serif;color:#202122;background:#fff}h3{font-size:16px;margin:22px 0 6px}h3:first-child{margin-top:0}p,li{margin:0 0 10px}ul,ol{padding-left:20px}a{color:#1a56c4}</style><body>'+html;
+  return f
+}
+/* Search inside the preview. The frame has no scripts, but is same-origin so this page can find and mark text in it. */
+function lgSearchFrame(html){
+  var f=lgFrame(html);f.setAttribute('sandbox','allow-same-origin');f.style.height='max(180px,calc(88vh - 230px))';f.style.height='max(180px,calc(88dvh - 230px))';var bar=el('div','lgs'),wrap=el('div','field-wrap'),i=el('input','field'),marks=[],cur=-1,tm=0,lastQ=null,capped=false;
+  wrap.appendChild(ico('search'));wrap.appendChild(i);
+  i.placeholder='Search page';i.autocomplete='off';i.spellcheck=false;i.setAttribute('autocapitalize','off');i.setAttribute('aria-label','Search page');
+  function label(t){var e=document.querySelector('.sheet-head .sheet-text');if(!e)return;if(e._orig==null){e._orig=e.textContent;e.setAttribute('aria-live','polite')}e.textContent=t==null?e._orig:t}
+  var lastPD=0,up=btn('','quiet lgs-b lgs-up',function(){if(Date.now()-lastPD<700)return;press(-1)}),dn=btn('','quiet lgs-b',function(){if(Date.now()-lastPD<700)return;press(1)});
+  up.appendChild(ico('chev'));dn.appendChild(ico('chev'));
+  up.setAttribute('aria-label','Previous match');dn.setAttribute('aria-label','Next match');
+  up.disabled=dn.disabled=true;
+  [[up,-1],[dn,1]].forEach(function(x){x[0].style.touchAction='manipulation';x[0].addEventListener('pointerdown',function(e){e.preventDefault();lastPD=Date.now();press(x[1])})});
+  bar.appendChild(wrap);bar.appendChild(up);bar.appendChild(dn);
+  
+  clearable(i);
+  function doc(){try{return f.contentDocument}catch(e){return null}}
+  function norm(s){
+    var o='',m=[],sp=false,k,c,l;
+    for(k=0;k<s.length;k++){
+      c=s.charCodeAt(k);
+      if(c===32||c===160||(c>=9&&c<=13)){if(!sp){o+=' ';m.push(k);sp=true}continue}
+      sp=false;
+      if(c===8216||c===8217||c===700)l="'";
+      else if(c===8220||c===8221)l='"';
+      else{l=s.charAt(k).toLowerCase();if(l.length!==1)l=s.charAt(k)}
+      o+=l;m.push(k)
+    }
+    return {s:o,m:m}
+  }
+  function clear(){
+    var ps=[];
+    marks.forEach(function(x){var p=x.parentNode;if(!p)return;while(x.firstChild)p.insertBefore(x.firstChild,x);p.removeChild(x);if(ps.indexOf(p)<0)ps.push(p)});
+    ps.forEach(function(p){p.normalize()});
+    marks=[];cur=-1
+  }
+  function show(){
+    marks.forEach(function(x,k){x.classList.toggle('lgs-cur',k===cur)});
+    label((cur+1)+' of '+marks.length+(capped?'+':'')+(marks.length===1?' match':' matches'));
+    var w=f.contentWindow,r=marks[cur].getBoundingClientRect();
+    if(r.top<w.innerHeight*.15||r.bottom>w.innerHeight*.85)w.scrollTo(0,Math.max(0,r.top+w.pageYOffset-w.innerHeight/3))
+  }
+  function go(d){if(!marks.length)return;if(!marks[0].isConnected){lastQ=null;run();return}cur=(cur+d+marks.length)%marks.length;show()}
+  function flush(){clearTimeout(tm);tm=0;if(norm(i.value).s.trim()!==lastQ){run();return true}return false}
+  function press(d){if(!flush())go(d);i.blur()}
+  function run(){
+    var d=doc();if(!d||!d.body)return;
+    var q=norm(i.value).s.trim();
+    if(q===lastQ)return;
+    lastQ=q;capped=false;
+    clear();
+    up.disabled=dn.disabled=true;label(null);
+    if(q.length<2)return;
+    if(!d.getElementById('lgs-css')){var st=d.createElement('style');st.id='lgs-css';st.textContent='mark.lgs-hit{background:rgba(139,155,255,.34);color:inherit;border-radius:3px}mark.lgs-cur{background:#8B9BFF;color:#0D0F24;box-shadow:0 0 0 2px #8B9BFF}';d.head.appendChild(st)}
+    var w=d.createTreeWalker(d.body,4,null),nodes=[],made=0;
+    while(w.nextNode())nodes.push(w.currentNode);
+    nodes.forEach(function(t){
+      var pn=t.parentNode?t.parentNode.nodeName:'';
+      if(pn==='STYLE'||pn==='SCRIPT')return;
+      var o=norm(t.nodeValue),hits=[],p=0,k;
+      while((k=o.s.indexOf(q,p))>-1){hits.push(k);p=k+q.length}
+      var room=300-made;
+      if(room<=0){capped=true;return}
+      if(hits.length>room){hits.length=room;capped=true}
+      made+=hits.length;
+      for(var h=hits.length-1;h>=0;h--){
+        var r=d.createRange(),mk=d.createElement('mark');
+        r.setStart(t,o.m[hits[h]]);r.setEnd(t,o.m[hits[h]+q.length-1]+1);
+        mk.className='lgs-hit';
+        try{r.surroundContents(mk)}catch(e){}
+      }
+    });
+    marks=[].slice.call(d.querySelectorAll('mark.lgs-hit'));
+    if(!marks.length){label('No matches');return}
+    up.disabled=dn.disabled=marks.length<2;
+    cur=0;show()
+  }
+  i.addEventListener('input',function(){clearTimeout(tm);tm=setTimeout(function(){tm=0;run()},220)});
+  i.addEventListener('keydown',function(e){
+    if(e.key==='Enter'){e.preventDefault();if(!flush()&&marks.length)go(e.shiftKey?-1:1)}
+    else if(e.key==='Escape'&&i.value){e.stopPropagation();i.value='';run()}
+  });
+  f.addEventListener('load',function(){marks=[];cur=-1;lastQ=null;if(i.value.trim())run()});
+  return {head:bar,node:f}
+}
+function lgPreview(kind,d){
+  var s=lgSearchFrame(d.html);
+  return ask({title:LG_LBL[kind]+' preview',sev:'other',icon:'shield',single:true,ok:'Close',text:d.builtin?'This is the copy built into the app.':'Version '+d.version+', as the app shows it.',head:s.head,node:s.node})
+}
+/* Compare two texts: lines first, then the words inside each changed line. */
+var NL=String.fromCharCode(10);
+/* The Effective line at the top is set by the server when publishing, so it never counts as an edit. */
+var LG_EFF=/^\s*<p>\s*<em>\s*Effective\s+[^<]*<\/em>\s*<\/p>/i;
+function lgBody(t){return String(t||'').replace(LG_EFF,'').trim()}
+function lgStamp(t,ts){var d=new Date(ts),M=['January','February','March','April','May','June','July','August','September','October','November','December'],l='<p><em>Effective '+d.getUTCDate()+' '+M[d.getUTCMonth()]+' '+d.getUTCFullYear()+'</em></p>';return LG_EFF.test(t)?t.replace(LG_EFF,l):l+NL+t}
+/* Same reading of the Effective line as the worker's legalEffectiveIso: yyyy-mm-dd, or null. */
+function lgEffIso(h){var m=/^\s*<p>\s*<em>\s*Effective\s+(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})\s*<\/em>\s*<\/p>/i.exec(String(h||''));if(!m)return null;var M=['january','february','march','april','may','june','july','august','september','october','november','december'],k=M.indexOf(m[2].toLowerCase());return k<0?null:m[3]+'-'+String(k+1).padStart(2,'0')+'-'+String(Number(m[1])).padStart(2,'0')}
+/* Same clean-up as the worker's normalizeAlertMessage. */
+function lgNorm(t){return String(t).replace(/\r\n?/g,'\n').replace(/\t/g,'    ').replace(/[\u0000-\u0009\u000b-\u001f\u007f\u2028\u2029]/g,' ').replace(/\n[ \u00a0]*(?=\n)/g,'\n').replace(/\n{3,}/g,'\n\n').trim()}
+function lgSeq(a,b){
+  var n=a.length,m=b.length,s=0,e=0,i,ops=[];
+  while(s<n&&s<m&&a[s]===b[s])s++;
+  while(e<n-s&&e<m-s&&a[n-1-e]===b[m-1-e])e++;
+  var A=a.slice(s,n-e),B=b.slice(s,m-e),x=A.length,y=B.length;
+  for(i=0;i<s;i++)ops.push([0,a[i]]);
+  if(!x||!y||x*y>4e6){A.forEach(function(t){ops.push([-1,t])});B.forEach(function(t){ops.push([1,t])})}
+  else{
+    var w=y+1,T=new Uint16Array((x+1)*w),p,q;
+    for(p=x-1;p>=0;p--)for(q=y-1;q>=0;q--)T[p*w+q]=A[p]===B[q]?T[(p+1)*w+q+1]+1:Math.max(T[(p+1)*w+q],T[p*w+q+1]);
+    p=0;q=0;
+    while(p<x&&q<y){
+      if(A[p]===B[q]){ops.push([0,A[p]]);p++;q++}
+      else if(T[(p+1)*w+q]>=T[p*w+q+1]){ops.push([-1,A[p]]);p++}
+      else{ops.push([1,B[q]]);q++}
+    }
+    while(p<x)ops.push([-1,A[p++]]);
+    while(q<y)ops.push([1,B[q++]])
+  }
+  for(i=n-e;i<n;i++)ops.push([0,a[i]]);
+  return ops
+}
+function lgWords(a,b){
+  var L=[],R=[];
+  lgSeq(a.split(' '),b.split(' ')).forEach(function(o){
+    var t=o[1]+' ';
+    if(o[0]===0){L.push(t);R.push(t)}
+    else if(o[0]<0)L.push(el('span','lgd-d',t));
+    else R.push(el('span','lgd-a',t))
+  });
+  return[L,R]
+}
+function lgDiffNode(oldT,newT){
+  var box=el('div','lgd'),sp=function(t){t=String(t||'').replace(/\s+$/,'');return t===''?[]:t.split(NL)},ops=lgSeq(sp(oldT),sp(newT)),i=0,add=0,del=0;
+  function line(cls,parts){var d=el('div','lgd-l '+cls);d.appendChild(el('span','lgd-m',cls==='lgd-del'?'-':'+'));parts.forEach(function(x){d.appendChild(typeof x==='string'?document.createTextNode(x):x)});return d}
+  while(i<ops.length){
+    if(ops[i][0]===0){
+      var c=0;while(i<ops.length&&ops[i][0]===0){c++;i++}
+      box.appendChild(el('div','lgd-eq',c+(c===1?' unchanged line':' unchanged lines')));continue
+    }
+    var D=[],A=[],k,j;
+    while(i<ops.length&&ops[i][0]!==0){(ops[i][0]<0?D:A).push(ops[i][1]);i++}
+    del+=D.length;add+=A.length;k=Math.max(D.length,A.length);
+    for(j=0;j<k;j++){
+      if(j<D.length&&j<A.length){var w=lgWords(D[j],A[j]);box.appendChild(line('lgd-del',w[0]));box.appendChild(line('lgd-add',w[1]))}
+      else if(j<D.length)box.appendChild(line('lgd-del',[D[j]]));
+      else box.appendChild(line('lgd-add',[A[j]]))
+    }
+  }
+  if(!add&&!del)box.appendChild(el('div','lgd-eq','No changes.'));
+  else{
+    var lg=el('div','lgd-leg');
+    lg.appendChild(el('span','lgd-chip lgd-del','- Removed: '+del+(del===1?' line':' lines')));
+    lg.appendChild(el('span','lgd-chip lgd-add','+ Added: '+add+(add===1?' line':' lines')));
+    box.insertBefore(lg,box.firstChild)
+  }
+  box._st={add:add,del:del};
+  return box
+}
+/* One stored version against the one before it (version 0 is the copy built into the app). cur is the live version, or null to hide Restore. */
+function lgBackBtn(fn){var b=btn('','quiet',fn);b.textContent='';b.appendChild(ico('back'));b.setAttribute('aria-label','Back');b.title='Back';b.style.width='44px';b.style.padding='0';b.style.flex='none';return b}
+function lgVerNode(kind,v,cur,back,bar,txt){
+  var n=el('div');n.appendChild(el('div','fine','Loading...'));
+  if(back&&bar){bar.textContent='';var bb0=lgBackBtn(back);bb0.style.margin='4px 0 6px';bar.style.cssText='display:flex;align-items:center;gap:12px';bar.appendChild(bb0)}
+  var f=function(x){return api('/admin/legal?kind='+kind+'&version='+x).then(function(o){return o.ok?o.j:null})};
+  Promise.all([f(v),v>0?f(v-1):Promise.resolve(null)]).then(function(r){
+    n.textContent='';
+    if(back&&!bar){var bb=lgBackBtn(back);bb.style.marginBottom='8px';n.appendChild(bb)}
+    if(!r[0]){n.appendChild(el('div','fine','This version is no longer stored.'));return}
+    var info=(v?'Version '+v:'Copy built into the app')+(r[0].updatedAt?', published '+fmt(r[0].updatedAt):'');
+    if(v){info+=r[0].message?(r[0].sent!=null?'. Alert sent: ':'. Alert not sent: ')+r[0].message:r[0].sent===0?'. No alert.':'.'}
+    if(txt)txt.textContent=info;else{var fi=el('div','fine',info);fi.style.margin='0 0 8px';n.appendChild(fi)}
+    if(v>0&&!r[1]){var fn=el('div','fine','The version before it is not stored, so all of it shows as added.');fn.style.margin='0 0 8px';n.appendChild(fn)}
+    var dn=lgDiffNode(r[1]?r[1].html:'',r[0].html),lgc=bar?dn.querySelector('.lgd-leg'):null;
+    if(lgc){
+      lgc.parentNode.removeChild(lgc);
+      var cw=el('div');cw.style.cssText='display:flex;gap:8px;margin:0 0 0 auto;flex:none';
+      [['Removed',dn._st.del,'#FF6A86'],['Added',dn._st.add,'#46E0A8']].forEach(function(c){
+        var bx=el('div','btn quiet');bx.style.cssText='flex-direction:column;gap:4px;min-height:44px;padding:6px 14px;pointer-events:none';
+        var cn=el('div',null,num(c[1]));cn.style.cssText='font-size:16px;font-weight:700;line-height:1;color:'+c[2];
+        var lb=el('div',null,c[0]);lb.style.cssText='font-size:11.5px;font-weight:600;line-height:1;color:var(--muted)';
+        bx.appendChild(cn);bx.appendChild(lb);cw.appendChild(bx)
+      });
+      bar.appendChild(cw)
+    }
+    n.appendChild(dn);
+    if(v>0&&v===cur&&r[0].message&&r[0].sent==null){
+      var sb=btn('Send the alert','primary block',function(){lgResend(kind,v)});
+      sb.style.marginTop='12px';n.appendChild(sb)
+    }
+    if(cur!=null&&v!==cur){
+      var rb=btn('Restore into editor','primary block',function(){
+        LG.draft[kind]=r[0].html;LG.base[kind]=cur;LG.from[kind]=v;LG.openEdit=true;
+        msg((v?'Version '+v:'The built-in copy')+' is loaded in the editor. Close this to review and publish it.')
+      });
+      rb.style.marginTop='12px';n.appendChild(rb)
+    }
+  });
+  return n
+}
+function lgVerSheet(kind,v){
+  var w=el('div'),pr=ask({title:LG_LBL[kind]+' version '+v,sev:'other',icon:'shield',single:true,ok:'Close',text:v?'Version '+v:'Copy built into the app',node:w});
+  var sh=w.closest('.sheet');w.appendChild(lgVerNode(kind,v,null,null,null,sh?sh.querySelector('.sheet-text'):null));
+  return pr
+}
+function lgHistory(kind){
+  return api('/admin/legal?kind='+kind+'&history=1').then(function(o){
+    if(!o.ok){showErr(o,'Could not load the history');return}
+    var cur=o.j.current,vs=o.j.versions.concat([{version:0}]),box=el('div'),hd=el('div'),sc=null,y=0,tx=null,hint='Tap a version to see what it changed.';
+    function list(){
+      box.textContent='';hd.textContent='';hd.style.cssText='';if(tx)tx.textContent=hint;
+      vs.forEach(function(x){
+        var r=el('button','pgrow'),l=el('div');r.type='button';
+        l.appendChild(el('div','slug',x.version?'Version '+x.version:'Copy built into the app'));
+        l.appendChild(el('small',null,x.version?fmt(x.updatedAt)+' - '+num(Math.round((x.size||0)/1024))+' KB'+(x.fromVersion!=null?' - restored from '+(x.fromVersion?'version '+x.fromVersion:'the built-in copy'):'')+(x.message?(x.sent!=null?' - alert sent to '+num(x.sent):' - alert not sent'):x.sent===0?' - no alert':''):'What the app shows until something is published'));
+        r.appendChild(l);
+        var m=el('div','pm');if(x.version===cur||(!cur&&!x.version))m.appendChild(chip('live','st good'));r.appendChild(m);
+        r.onclick=function(){
+          sc=box.closest('.sheet-body');y=sc?sc.scrollTop:0;
+          if(tx)tx.textContent=x.version?'Version '+x.version:'Copy built into the app';
+          box.textContent='';box.appendChild(lgVerNode(kind,x.version,cur,function(){list();requestAnimationFrame(function(){if(sc)sc.scrollTop=y})},hd,tx));
+          if(sc)sc.scrollTop=0
+        };
+        box.appendChild(r)
+      })
+    }
+    list();
+    LG.openEdit=false;
+    var pr=ask({title:LG_LBL[kind]+' history',sev:'other',icon:'shield',single:true,ok:'Close',text:hint,head:hd,node:box});
+    var sh0=box.closest('.sheet');tx=sh0?sh0.querySelector('.sheet-text'):null;
+    return pr.then(function(){
+      if(LG.openEdit){LG.openEdit=false;return lgLoad().then(function(d){if(d)lgEdit(kind,d,null)})}
+    })
+  })
+}
+function lgResend(kind,v){
+  return api('/admin/legal',{method:'POST',body:{kind:kind,resend:true,version:v}}).then(function(o){
+    if(!o.ok){showErr(o,'Could not send the alert');return lgLoad(true)}
+    if(o.j.alertFailed)msg('The alert could not be sent. Try again.','err');else msg('Alert sent to '+num(o.j.sent)+' signed-in accounts');
+    return lgLoad(true)
+  })
+}
+function lgDefaultMsg(kind){return 'We updated our '+LG_LBL[kind]+'. You can read it any time from your account screen in the app.'}
+function lgEdit(kind,d,keep){
+  var wrap=el('div'),ta=el('textarea','field ta'),tabs=el('div','lge-tabs'),panes={},tabBtns={},cur='';
+  var base=keep&&keep.base!=null?keep.base:(LG.base[kind]!=null?LG.base[kind]:d.version),warn=el('div'),chBox=el('div');
+  ta.rows=14;ta.spellcheck=false;ta.autocomplete='off';ta.setAttribute('autocapitalize','off');ta.setAttribute('aria-label',LG_LBL[kind]+' text');
+  ta.style.cssText='font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;line-height:1.5';
+  ta.value=keep?keep.text:(LG.draft[kind]||d.html);
+  tabs.setAttribute('role','tablist');tabs.setAttribute('aria-label','Edit sections');
+  var pvBox=el('div');
+  var tg=el('label','tog'),tt=el('span','tog-text'),cb=document.createElement('input');
+  tt.appendChild(el('b',null,'Alert signed-in accounts'));tt.appendChild(el('small',null,'Every signed-in account gets an alert about the change. Everyone, signed in or not, sees the new text the next time the app shows it.'));
+  cb.type='checkbox';cb.checked=keep?keep.notify:true;tg.appendChild(tt);tg.appendChild(cb);
+  var ma=el('textarea','field ta');ma.rows=4;ma.maxLength=250;ma.setAttribute('aria-label','Alert message');ma.value=keep?keep.message:lgDefaultMsg(kind);
+  var pos=keep&&keep.pos||{text:{box:0,body:0},preview:{box:0,body:0},changes:{box:0,body:0},alert:{box:0,body:0}};
+  function sync(){
+    if(cb.checked){ma.hidden=false;ma.scrollTop=pos.alert.box}
+    else{if(!ma.hidden)pos.alert.box=ma.scrollTop;ma.hidden=true}
+    tabBtns.alert.textContent='Alert: '+(cb.checked?'on':'off')
+  }
+  var hint=el('div','fine','Plain markup only: h3 headings, p, ul and li, strong, em and links. Anything else is stripped in the app. The Effective date at the top is set to the publish date when you publish.');hint.style.margin='8px 0 0';
+  function warnSync(){
+    warn.textContent='';
+    if(LG.from[kind]!=null){var rf=el('div','fine','Restored from '+(LG.from[kind]?'version '+LG.from[kind]:'the built-in copy')+'.');rf.style.margin='8px 0 0';warn.appendChild(rf)}
+    if(base===d.version)return;
+    var wn=el('div','fine','This draft started from version '+base+', but version '+d.version+' is live now, so it cannot be published as it is. Check the Changes tab, then tap Use live text and redo your edits (or paste them in).');wn.style.margin='8px 0 0';wn.style.color='var(--danger)';warn.appendChild(wn);
+    var ub=btn('Use live text','quiet',function(){ta.value=d.html;base=d.version;delete LG.from[kind];warnSync()});ub.style.marginTop='8px';warn.appendChild(ub)
+  }
+  warnSync();
+  var P={text:[ta,hint,warn],preview:[pvBox],changes:[chBox],alert:[tg,ma]};
+  [['text','Text'],['preview','Preview'],['changes','Changes'],['alert','Alert']].forEach(function(t){
+    var b=document.createElement('button');b.type='button';b.className='lge-tab';b.id='lge-t-'+t[0];b.textContent=t[1];
+    b.setAttribute('role','tab');b.setAttribute('aria-controls','lge-p-'+t[0]);
+    b.onclick=function(){pick(t[0])};
+    tabs.appendChild(b);tabBtns[t[0]]=b;
+    var pn=el('div','lge-pane');pn.id='lge-p-'+t[0];pn.setAttribute('role','tabpanel');pn.setAttribute('aria-labelledby',b.id);
+    P[t[0]].forEach(function(n){pn.appendChild(n)});
+    panes[t[0]]=pn;pn.hidden=true;wrap.appendChild(pn)
+  });
+  tabs.addEventListener('keydown',function(e){
+    var k=['text','preview','changes','alert'],i=k.indexOf(cur),n=e.key==='ArrowRight'?i+1:e.key==='ArrowLeft'?i-1:-1;
+    if(n<0)return;e.preventDefault();n=(n+k.length)%k.length;pick(k[n]);tabBtns[k[n]].focus()
+  });
+  function frWin(){var f=pvBox.firstChild;try{return f&&f.contentWindow}catch(e){return null}}
+  function savePos(){
+    if(!cur)return;var o=pos[cur],w;
+    if(cur==='preview'){w=frWin();try{if(w)o.box=w.pageYOffset}catch(e){}}
+    else if(cur==='text')o.box=ta.scrollTop;
+    else if(cur==='alert'&&!ma.hidden)o.box=ma.scrollTop
+  }
+  function applyPos(name){
+    var o=pos[name];
+    if(name==='text')ta.scrollTop=o.box;else if(name==='alert'&&!ma.hidden)ma.scrollTop=o.box
+  }
+  function pick(name){
+    if(name===cur)return;
+    savePos();cur=name;
+    Object.keys(panes).forEach(function(k){var on=k===name;panes[k].hidden=!on;tabBtns[k].setAttribute('aria-selected',on?'true':'false');tabBtns[k].tabIndex=on?0:-1});
+    if(name==='changes'){
+      chBox.textContent='';
+      var ci=el('div','fine',(d.builtin?'The copy built into the app':'Version '+d.version+' (live)')+' against what you have now. Red is removed, green is added.');ci.style.margin='0 0 8px';chBox.appendChild(ci);
+      chBox.appendChild(lgDiffNode(d.html,ta.value))
+    }
+    if(name==='preview'){
+      pvBox.textContent='';var fr=lgFrame(ta.value),y=pos.preview.box;
+      fr.setAttribute('sandbox','allow-same-origin');
+      fr.style.height='max(180px,calc(88vh - 270px))';fr.style.height='max(180px,calc(88dvh - 270px))';
+      // Hold the frame hidden until its scroll is restored, so it never shows at the top first.
+      var shown=false,reveal=function(){if(!shown){shown=true;fr.style.visibility=''}};
+      if(y>0){fr.style.visibility='hidden';setTimeout(reveal,600)}
+      fr.addEventListener('load',function(){try{fr.contentWindow.scrollTo(0,y)}catch(e){}reveal()});
+      pvBox.appendChild(fr)
+    }
+    applyPos(name)
+  }
+  cb.onchange=sync;sync();pick(keep&&keep.tab||'text');
+  var pr=ask({title:'Edit '+LG_LBL[kind],sev:'other',icon:'shield',ok:'Publish',text:d.builtin?'Starting from the copy built into the app.':'Starting from version '+d.version+'.',head:tabs,node:wrap});
+  applyPos(cur);
+  return pr.then(function(ok){
+    if(!ok){if(ta.value.trim()!==(d.html||'').trim()){LG.draft[kind]=ta.value;LG.base[kind]=base}else{delete LG.draft[kind];delete LG.base[kind];delete LG.from[kind]}return}
+    savePos();
+    var st={text:ta.value.trim(),notify:cb.checked,message:ma.value.trim(),tab:cur,pos:pos,base:base};
+    if(!st.text){msg('The text cannot be empty','err');return lgEdit(kind,d,st)}
+    if(lgBody(st.text)===lgBody(d.html)){msg('Nothing has changed','err');return lgEdit(kind,d,st)}
+    if(st.notify&&!st.message){msg('Write the alert, or turn it off','err');st.tab='alert';return lgEdit(kind,d,st)}
+    var go=function(){
+      return api('/admin/legal',{method:'POST',body:{kind:kind,base:base,from:LG.from[kind],html:st.text,notify:st.notify,message:st.message}}).then(function(o){
+        if(o.s===409){
+          LG.draft[kind]=st.text;LG.base[kind]=base;LG.data[kind]=null;
+          msg('Someone published version '+((o.j&&o.j.current)||'')+' first, so nothing was changed. Your text is kept as a draft: open Edit and check the Changes tab.','err');
+          return lgLoad(true)
+        }
+        if(!o.ok){showErr(o,'Could not publish the '+LG_LBL[kind]);return lgEdit(kind,d,st)}
+        delete LG.draft[kind];delete LG.base[kind];delete LG.from[kind];LG.data[kind]=null;
+        msg('Published '+LG_LBL[kind]+' version '+o.j.version+(st.notify?(o.j.alertFailed?', but the alert could not be sent':', alert sent to '+num(o.j.sent)+' signed-in accounts'):''));
+        if(st.notify&&o.j.alertFailed){return lgLoad(true).then(function(){return ask({title:'Alert not sent',sev:'ad',icon:'bell',text:'The new text is live, but the alert could not be sent. Send it again?',ok:'Send alert'})}).then(function(y){if(y)return lgResend(kind,o.j.version)})}
+        return lgLoad(true)
+      })
+    };
+    var cs=lgDiffNode(d.html,st.text)._st,sum=' ('+cs.add+(cs.add===1?' line':' lines')+' added, '+cs.del+' removed, version '+d.version+' to '+(d.version+1)+')';
+    if(!st.notify)return ask({title:'Publish without an alert?',sev:'ad',icon:'shield',text:'This puts the new '+LG_LBL[kind]+' live for everyone'+sum+' with no alert. People see it the next time the app shows it.',ok:'Publish'}).then(function(y){return y?go():lgEdit(kind,d,st)});
+    return ask({title:'Alert signed-in accounts?',sev:'ad',icon:'bell',text:'This publishes the new '+LG_LBL[kind]+sum+' and sends every signed-in account this alert: '+st.message,ok:'Publish and alert'}).then(function(y){return y?go():lgEdit(kind,d,st)})
+  })
+}
+$('lghist').onclick=function(){lgHistory(LG.kind)};
+$('lgprev').onclick=function(){lgLoad().then(function(d){if(d)lgPreview(LG.kind,d)})};
+$('lgedit').onclick=function(){lgLoad().then(function(d){if(d)lgEdit(LG.kind,d,null)})};
+lgSel();
 $('alfab').onclick=function(){goTab('alerts')};
 alRender();alSync();
 
@@ -3125,8 +3706,17 @@ function loadOverview(){
     $('ovnote').textContent='Online means active in the last '+o.j.onlineWindowMin+' minutes. '+(o.j.trackingSince?'Activity tracked since '+fmtD(o.j.trackingSince)+'. ':'No activity recorded yet. ')+'Notes cover signed-in publishers only.'
   }).catch(function(e){fail();netFail(e)})
 }
+var OV_PRE={ovsign:'Joined: ',ovseen:'Seen: ',ovpub:'Published: '},OV_HD={ovsign:'Joined',ovseen:'Last seen',ovpub:'Published'},ovPT=null;
+function ovPerQs(users){var s='',add=function(k,a,b){var r=perRng(k);if(r){if(r.from!=null)s+='&'+a+'='+r.from;if(r.to!=null)s+='&'+b+'='+r.to}};if(users){add('ovsign','cf','ct');add('ovseen','sf','st')}else add('ovpub','from','to');return s}
+function ovBad(users){return users?(perBad('ovsign')||perBad('ovseen')):perBad('ovpub')}
+function ovSnap(users){(users?['ovsign','ovseen']:['ovpub']).forEach(perSnap)}
+function ovRun(k){if(perToast(k))return;ovList(true)}
+function ovPerChg(k,btn,imm){perLbl(k,btn,OV_PRE[k]);clearTimeout(ovPT);if(imm)ovRun(k);else ovPT=setTimeout(function(){ovRun(k)},300)}
+function ovPerOpen(k,btn,box){var b=$(box),o=b.hidden;if(o){b.textContent='';b.appendChild(alBox(k,OV_HD[k],function(imm){ovPerChg(k,btn,imm)}))}b.hidden=!o;$(btn).setAttribute('aria-expanded',o?'true':'false')}
+function ovPerReset(k,btn,box){alPer[k]=alPerNew(k);perSnap(k);delete perLast[k];$(btn).classList.remove('inv');$(btn).title='';$(box).hidden=true;$(box).textContent='';$(btn).textContent=OV_PRE[k]+'any time';$(btn).setAttribute('aria-expanded','false')}
 function ovSync(){
   var users=ovS.view==='users';
+  [['ovcper','ovcbox',users],['ovsper','ovsbox',users],['ovpper','ovpbox',!users]].forEach(function(x){$(x[0]).parentNode.hidden=!x[2];if(!x[2]){$(x[1]).hidden=true;$(x[0]).setAttribute('aria-expanded','false')}});
   [].forEach.call($('ovseg').children,function(b){b.setAttribute('aria-pressed',b.getAttribute('data-v')===ovS.view?'true':'false')});
   $('ovsort').parentNode.hidden=!users;$('ovfilter').parentNode.hidden=!users;$('ovnsort').parentNode.hidden=users;
   $('ovq').placeholder=users?'Search by author ID':'Search by slug or author ID'
@@ -3160,9 +3750,12 @@ function ovNote(n){
 }
 function ovList(reset){
   var L=$('ovlist'),m=$('ovmore'),users=ovS.view==='users',g=++ovS.gen;
-  if(reset){ovS.cur='';ovS.total=0;ovS.shown=0;L.textContent='';moreBusy(m,false);m.hidden=true;$('ovcount').textContent='';skel(L,4,'row')}
+  if(reset){
+    ovSnap(users);ovS.cur='';ovS.total=0;ovS.shown=0;L.textContent='';moreBusy(m,false);m.hidden=true;$('ovcount').textContent='';
+    skel(L,4,'row')
+  }
   else moreBusy(m,true);
-  var qs='cursor='+encodeURIComponent(ovS.cur)+'&q='+encodeURIComponent(ovS.q)+'&sort='+(users?ovS.sort+'&f='+ovS.fil:ovS.nsort);
+  var qs='cursor='+encodeURIComponent(ovS.cur)+'&q='+encodeURIComponent(ovS.q)+'&sort='+(users?ovS.sort+'&f='+ovS.fil:ovS.nsort)+ovPerQs(users);
   return api('/admin/'+ovS.view+'?'+qs).then(function(o){
     if(g!==ovS.gen)return;
     unskel(L);moreBusy(m,false);
@@ -3493,8 +4086,8 @@ $('rf').onclick=function(){
 $('so').onclick=function(){
   sessionStorage.removeItem('adm');tok='';all=[];next=null;rIdx=false;rAgg=null;rGen++;navLog=[];lkSlug='';lkOwner=false;cur='reports';openSet={};auAll=[];auFilter='';recents=[];repSub='';
   ['list','lkowner','adlist','aulist','aukeys','qbar','qkeys','ovstats','ovlist','trchart','trleg','trrows','rpbox'].forEach(function(i){$(i).textContent=''});trS.data=null;trS.M=null;trS.end=null;trS.gen++;
-  ovS.loaded=false;ovS.view='users';ovS.q='';ovS.fil='';ovS.sort='new';ovS.nsort='new';ovS.gen++;$('ovq').value='';pickSet('ovsort','new');pickSet('ovfilter','');pickSet('ovnsort','new');$('ovcount').textContent='';$('ovnote').textContent='';ovSync();
-  $('queue').hidden=true;$('freason').value='';$('fq').value='';$('adq').value='';$('auq').value='';aidMap={};lkAid='';
+  ovS.loaded=false;ovS.view='users';ovS.q='';ovS.fil='';ovPerReset('ovsign','ovcper','ovcbox');ovPerReset('ovseen','ovsper','ovsbox');ovPerReset('ovpub','ovpper','ovpbox');ovS.sort='new';ovS.nsort='new';ovS.gen++;$('ovq').value='';pickSet('ovsort','new');pickSet('ovfilter','');pickSet('ovnsort','new');$('ovcount').textContent='';$('ovnote').textContent='';ovSync();
+  $('queue').hidden=true;$('freason').value='';$('fq').value='';$('adq').value='';$('auq').value='';perReset('audit','auper','aubox');perReset('reports','repper','repbox');perReset('adstart','adper','adbox');aidMap={};lkAid='';
   lookupHint();renderRecents();setBadge(0);document.body.dataset.alert='';$('tok').value='';
   navSync();loggedIn(false);msg('Signed out','ok')
 };
@@ -3536,6 +4129,7 @@ var COC=[
   {h:"Take care",items:[
     ["Everything you do is saved in Audit.","That keeps all of us trustworthy."],
     ["Custom alerts carry approved messages only.","Send the wording exactly as approved. If you are not sure, please check with another admin first."],
+    ["Terms and policy changes need approval first.","Please make only approved changes, and use the wording exactly as approved. Not sure if something is approved? A quick check with another admin keeps us all on the same page."],
     ["Send to the intended audience.","Before you tap Send alert, check the audience and recipient count so it reaches just the people it was meant for."],
     ["Slow down for permanent actions.","Take down all and Run purge cannot be undone, and purge already runs every night."],
     ["Ads:","pause first, and take down only if it keeps breaking the rules. Unused views can be refunded."],
@@ -3562,15 +4156,21 @@ $("coc").onclick=function(){ask({title:"Admin Code of Conduct",icon:"book",sev:"
 $('ovsort').onclick=function(){pick('ovsort',function(){ovS.sort=$('ovsort').value;ovList(true)})};
 $('ovfilter').onclick=function(){pick('ovfilter',function(){ovS.fil=$('ovfilter').value;ovList(true)})};
 $('ovnsort').onclick=function(){pick('ovnsort',function(){ovS.nsort=$('ovnsort').value;ovList(true)})};
+$('ovcper').onclick=function(){ovPerOpen('ovsign','ovcper','ovcbox')};
+$('ovsper').onclick=function(){ovPerOpen('ovseen','ovsper','ovsbox')};
+$('ovpper').onclick=function(){ovPerOpen('ovpub','ovpper','ovpbox')};
 $('ovq').oninput=function(){clearTimeout(ovS.t);ovS.t=setTimeout(function(){ovS.q=$('ovq').value.trim().toLowerCase();ovList(true)},300)};
 [].forEach.call($('ovseg').children,function(b){b.onclick=function(){var v=b.getAttribute('data-v');if(ovS.view===v)return;ovS.view=v;ovS.q='';$('ovq').value='';ovSync();ovList(true)}});
 $('adst').onclick=function(){pick('adst',function(){loadAds(true)})};
 $('adkind').onclick=function(){pick('adkind',function(){loadAds(true)})};
 $('adsort').onclick=function(){pick('adsort',function(){loadAds(true)})};
+$('adper').onclick=function(){perOpen('adstart','adper','adbox',adPerChg)};
+$('auper').onclick=function(){perOpen('audit','auper','aubox',auPerChg)};
 $('auq').oninput=function(){clearTimeout(auT);auT=setTimeout(auSearch,300)};
 $('adq').oninput=function(){clearTimeout(adT);adT=setTimeout(function(){loadAds(true)},300)};
 $('fstatus').onclick=function(){pick('fstatus',renderAll)};
 $('fsort').onclick=function(){pick('fsort',repFilter)};
+$('repper').onclick=function(){perOpen('reports','repper','repbox',repPerChg)};
 $('fgroup').onchange=renderAll;
 $('fq').oninput=function(){var fv=fqv();if(!rIdx&&isAid(fv)&&!aidMap[fv])aidResolve(fv).then(function(){if(fqv()===fv)renderAll()},function(){});renderAll();if(rIdx){clearTimeout(qT);qT=setTimeout(function(){loadReports(true)},300)}};
 $('fdis').onchange=function(){loadReports(true)};
