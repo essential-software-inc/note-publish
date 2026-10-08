@@ -9436,7 +9436,7 @@ function lgEdit(kind,d,keep){
     else{if(!ma.hidden)pos.alert.box=ma.scrollTop;ma.hidden=true}
     tabBtns.alert.textContent='Alert: '+(cb.checked?'on':'off')
   }
-  var hint=el('div','fine','Plain markup only: h3 headings, p, ul and li, strong, em and links. Anything else is stripped in the app. The Effective date at the top is set to the publish date when you publish.');hint.style.margin='8px 0 0';
+  var hint=el('div','fine','Plain markup only: h3 headings, p, ul and li, strong, em and links. Anything else is stripped in the app. The Effective date at the top is set to the publish date when you publish.');hint.style.margin='0 0 8px';
   function warnSync(){
     warn.textContent='';
     if(LG.from[kind]!=null){var rf=el('div','fine','Restored from '+(LG.from[kind]?'version '+LG.from[kind]:'the built-in copy')+'.');rf.style.margin='8px 0 0';warn.appendChild(rf)}
@@ -9445,7 +9445,7 @@ function lgEdit(kind,d,keep){
     var ub=btn('Use live text','quiet',function(){ta.value=d.html;base=d.version;delete LG.from[kind];warnSync()});ub.style.marginTop='8px';warn.appendChild(ub)
   }
   warnSync();
-  var P={text:[ta,hint,warn],preview:[pvBox],alert:[tg,ma]};
+  var P={text:[ta,warn],preview:[pvBox],alert:[tg,ma]};
   [['text','Text'],['preview','Preview'],['alert','Alert']].forEach(function(t){
     var b=document.createElement('button');b.type='button';b.className='lge-tab';b.id='lge-t-'+t[0];b.textContent=t[1];
     b.setAttribute('role','tab');b.setAttribute('aria-controls','lge-p-'+t[0]);
@@ -9474,6 +9474,7 @@ function lgEdit(kind,d,keep){
     if(name===cur)return;
     savePos();cur=name;
     Object.keys(panes).forEach(function(k){var on=k===name;panes[k].hidden=!on;tabBtns[k].setAttribute('aria-selected',on?'true':'false');tabBtns[k].tabIndex=on?0:-1});
+    hint.hidden=name!=='text';
     if(name==='preview'){
       pvBox.textContent='';var fr=lgFrame(ta.value),y=pos.preview.box;
       fr.setAttribute('sandbox','allow-same-origin');
@@ -9487,7 +9488,9 @@ function lgEdit(kind,d,keep){
     applyPos(name)
   }
   cb.onchange=sync;sync();pick(keep&&keep.tab||'text');
-  var pr=ask({title:'Edit '+LG_LBL[kind],sev:'other',icon:'shield',ok:'Publish',text:d.builtin?'Starting from the copy built into the app.':'Starting from version '+d.version+'.',head:tabs,node:wrap});
+  // The markup note sits in the pinned header with the tabs, so it never scrolls out of view while the Text tab is open.
+  var hdr=el('div');hdr.appendChild(tabs);hdr.appendChild(hint);
+  var pr=ask({title:'Edit '+LG_LBL[kind],sev:'other',icon:'shield',ok:'Publish',text:d.builtin?'Starting from the copy built into the app.':'Starting from version '+d.version+'.',head:hdr,node:wrap});
   applyPos(cur);
   return pr.then(function(ok){
     if(!ok){if(ta.value.trim()!==(d.html||'').trim()){LG.draft[kind]=ta.value;LG.base[kind]=base}else{delete LG.draft[kind];delete LG.base[kind];delete LG.from[kind]}return}
