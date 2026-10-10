@@ -2503,6 +2503,48 @@ async function handleLikedNotes(env, request) {
   });
 }
 
+// What the Subscribed feed holds for one account: everything in it (same age cutoff and per-author subscribe-time
+// floor as handleSubscriptionsFeed's own query) and how much of that this account hasn't opened yet (no story_seen
+// row). Opening a note from the feed or the stories strip writes that row (handleMarkStorySeen), on any device.
+async function subscriptionsFeedCounts(env, sub) {
+  try {
+    const row = await env.ADS_DB.prepare(
+      `SELECT COUNT(*) AS c, COALESCE(SUM(CASE WHEN seen.slug IS NULL THEN 1 ELSE 0 END), 0) AS u
+         FROM stories s
+         JOIN subscriptions sub ON sub.author_sub = s.author_sub AND sub.subscriber_sub = ? AND s.created_at >= sub.created_at AND s.created_at >= ?
+         LEFT JOIN story_seen seen ON seen.slug = s.slug AND seen.subscriber_sub = ?`
+    ).bind(sub, Date.now() - SUBSCRIPTIONS_FEED_MAX_AGE_MS, sub).first();
+    const total = row && Number(row.c), unread = row && Number(row.u);
+    return Number.isFinite(total) && Number.isFinite(unread) ? { total, unread } : null;
+  } catch (e) { return null; }
+}
+// GET /account/counts — the sizes behind the app's Published, Stories, Liked and Subscribed tab counts, in one request
+// of plain COUNT queries. The list endpoints also send a `total`, but they build whole pages of cards (a KV read and
+// card images per row) to do it; this is what the app polls instead. Same definitions as those lists' totals:
+// published = this account's published_notes rows, stories = its stories still inside the 24h window, liked = its
+// likes, unread = Subscribed-feed notes it hasn't opened. A count that can't be read is left out.
+async function handleAccountCounts(env, request) {
+  const sub = await requireSession(env, request);
+  if (!sub) return textError(401, 'sign-in required');
+  const cutoff = Date.now() - STORIES_LOOKBACK_MS;
+  const [published, stories, liked, feed] = await Promise.all([
+    listTotal(env, 'SELECT COUNT(*) AS c FROM published_notes WHERE author_sub = ?', [sub]),
+    listTotal(env, 'SELECT COUNT(*) AS c FROM stories WHERE author_sub = ? AND created_at >= ?', [sub, cutoff]),
+    listTotal(env, 'SELECT COUNT(*) AS c FROM likes WHERE liker_sub = ?', [sub]),
+    subscriptionsFeedCounts(env, sub)
+  ]);
+  return json({ published, stories, liked, unread: feed ? feed.unread : undefined });
+}
+// GET /subscriptions/unread — drives the count on the app's Subscribed tab: how many notes in the feed are still
+// unopened, plus how many the feed holds. Light enough to poll, like /alerts/unread.
+async function handleSubscriptionsUnread(env, request) {
+  const sub = await requireSession(env, request);
+  if (!sub) return textError(401, 'sign-in required');
+  const c = await subscriptionsFeedCounts(env, sub);
+  if (!c) return textError(500, 'could not count the feed');
+  return json({ count: c.unread, total: c.total });
+}
+
 // GET /subscriptions/feed — the "Subscribed" category: a regular social
 // feed, not a Stories surface. No 24h expiry (that ephemerality is
 // specific to the discovery strip/ring — see handleStoriesStrip), but
@@ -2571,11 +2613,12 @@ async function handleSubscriptionsFeed(env, request) {
 
   const origin = new URL(request.url).origin;
   const last = results[results.length - 1];
-  const total = cursorParam ? undefined : await listTotal(env,
-    `SELECT COUNT(*) AS c FROM stories s
-       JOIN subscriptions sub ON sub.author_sub = s.author_sub AND sub.subscriber_sub = ? AND s.created_at >= sub.created_at AND s.created_at >= ?`, [sub, feedCutoff]);
+  // First page only: the feed's size and how much of it is still unopened (the app's Subscribed tab count).
+  const feedCounts = cursorParam ? null : await subscriptionsFeedCounts(env, sub);
+  const total = cursorParam ? undefined : (feedCounts ? feedCounts.total : undefined);
   return json({
     total,
+    unread: feedCounts ? feedCounts.unread : undefined,
     stories: results.map(r => {
       const card = expandStoryImageUrls(origin, r.slug, r.image_urls);
       return {
@@ -10211,6 +10254,12 @@ export default {
       }
       if (method === 'GET' && pathname === '/subscriptions') {
         return handleGetSubscriptions(env, request);
+      }
+      if (method === 'GET' && pathname === '/account/counts') {
+        return handleAccountCounts(env, request);
+      }
+      if (method === 'GET' && pathname === '/subscriptions/unread') {
+        return handleSubscriptionsUnread(env, request);
       }
       if (method === 'GET' && pathname === '/subscriptions/feed') {
         return handleSubscriptionsFeed(env, request);
