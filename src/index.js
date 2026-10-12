@@ -2643,11 +2643,11 @@ async function handleSubscriptionsFeed(env, request) {
 }
 
 async function handleServe(env, slug) {
-  if (!SLUG_RE.test(slug)) return new Response('Not found', { status: 404 });
+  if (!SLUG_RE.test(slug)) return new Response('Not found', { status: 404, headers: corsHeaders() });
   const meta = await getMeta(env, slug);
-  if (!meta || meta.deletedAt) return new Response('Not found', { status: 404 });
+  if (!meta || meta.deletedAt) return new Response('Not found', { status: 404, headers: corsHeaders() });
   const obj = await env.NOTES_BUCKET.get(slug + '.html');
-  if (!obj) return new Response('Not found', { status: 404 });
+  if (!obj) return new Response('Not found', { status: 404, headers: corsHeaders() });
 
   // Security hardening: this page is now attacker-reachable at a
   // public URL, unlike the locally-opened export it started as. Restrict
@@ -2670,7 +2670,10 @@ async function handleServe(env, slug) {
       'Content-Type': 'text/html; charset=utf-8',
       'Content-Security-Policy': csp,
       'X-Content-Type-Options': 'nosniff',
-      'Referrer-Policy': 'strict-origin-when-cross-origin'
+      'Referrer-Policy': 'strict-origin-when-cross-origin',
+      // The app reads published pages with fetch() (Media > Likes scans liked notes for media links). Without this the browser/WebView
+      // blocks the read, and the 404s above, so every liked note looked unreadable. Public pages only; nothing here is private.
+      ...corsHeaders()
     }
   });
 }
