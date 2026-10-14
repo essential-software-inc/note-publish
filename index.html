@@ -23,7 +23,8 @@
 html{color-scheme:dark}
 body{margin:0;background:var(--bg);color:var(--text);font:15px/1.45 var(--font);-webkit-font-smoothing:antialiased;overflow-x:hidden}
 body[data-alert=csam]{--glow:rgba(255,77,109,.26)}
-body[data-auth=out] #app{display:none}
+body[data-auth=out] #app,body[data-auth=out] .sheet-back{display:none}
+body[data-role=admin] .fo{display:none}
 body[data-auth=in] #login{display:none}
 button,input,select{font:inherit;color:inherit}
 button{cursor:pointer}
@@ -294,6 +295,7 @@ main{position:relative;z-index:1;max-width:720px;margin:0 auto;padding:2px 16px 
 @supports (text-box:trim-both cap alphabetic){.pgrow .lk .n{text-box:trim-both cap alphabetic}}
 
 .snaps{margin-top:14px;padding:2px 14px;border-radius:14px;background:var(--well)}
+.snaps .filters{margin:0 -14px 10px;padding:4px 14px 6px}
 .snap-row{padding:12px 0;border-top:1px solid var(--line)}
 .snap-row:first-child{border-top:0}
 .snap-line{display:flex;flex-wrap:wrap;align-items:center;gap:8px}
@@ -321,7 +323,7 @@ main{position:relative;z-index:1;max-width:720px;margin:0 auto;padding:2px 16px 
 .log-main{display:flex;flex-direction:column;align-items:flex-start;gap:4px;margin-top:10px}
 .log-main .det{color:var(--muted);font-size:14px;word-break:break-word;white-space:pre-wrap}
 .log-meta{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}
-.log-when{margin-top:8px;font-size:12.5px;color:var(--faint)}
+.log-when,.log-by{margin-top:8px;font-size:12.5px;color:var(--faint)}
 .fab{position:fixed;z-index:25;right:max(16px,calc((100vw - 720px)/2 + 16px));bottom:calc(92px + env(safe-area-inset-bottom,0px));width:56px;height:56px;padding:0;border:0;border-radius:20px;background:linear-gradient(180deg,#A0AEFF,#7F90FF);color:var(--accent-ink);box-shadow:0 12px 28px -6px rgba(127,144,255,.55),0 2px 8px rgba(2,3,18,.5);transition:transform .15s,filter .15s}
 .fab:not([hidden]){display:grid;place-items:center;animation:fade .22s ease both}
 .fab:active{transform:scale(.94);filter:brightness(1.1)}
@@ -437,7 +439,7 @@ select.field::-ms-expand{display:none}
 .sheet-top{flex:none;margin:0 0 6px;padding:0 0 12px;border-bottom:1px solid var(--line)}
 .sheet-top .ptitle{margin:0 0 4px}
 .sheet-top .search{margin:10px 0 0}
-.sheet-top .filters{margin:8px 0 0;padding:0 0 2px}
+.sheet-top .filters{margin:8px -22px 0;padding:0 22px 2px}
 .rsub,.rcnt{font-size:13px;color:var(--muted)}
 .rsub:empty,.rcnt:empty,.rchk:empty{display:none}
 .rsub{margin:0 0 2px}
@@ -486,11 +488,18 @@ body[data-auth=out] #msg{bottom:calc(24px + env(safe-area-inset-bottom,0px))}
 /* sheets */
 .sheet-back{--o:0;--y:36px;position:fixed;inset:0;z-index:60;display:flex;align-items:flex-end;justify-content:center;padding:0 8px calc(8px + env(safe-area-inset-bottom,0px));background:rgba(4,5,20,.64);-webkit-backdrop-filter:blur(6px);backdrop-filter:blur(6px);opacity:var(--o);transition:opacity .22s}
 .sheet-back.open{--o:1;--y:0px}
+html:has(.sheet-back){overflow:hidden}
 .sheet{display:flex;flex-direction:column;width:100%;max-width:520px;max-height:88vh;max-height:88dvh;padding:10px 22px 22px;border-radius:30px;border:1px solid var(--line2);background:linear-gradient(180deg,rgba(255,255,255,.06),rgba(255,255,255,.02)),var(--s1);box-shadow:0 30px 70px -10px rgba(2,3,18,.9);transform:translateY(var(--y));transition:transform .3s cubic-bezier(.2,.9,.25,1)}
 .grab{flex:none;width:38px;height:5px;border-radius:3px;background:var(--s3);margin:0 auto 18px}
 .sheet .tile{margin-bottom:14px}
 .sheet h2{margin:0;font-size:24px;line-height:1.15;font-weight:750;letter-spacing:-.025em;word-break:break-word}
-.sheet-text{margin:8px 0 20px;color:var(--muted);white-space:pre-wrap;font-size:15px}
+.sheet-text{margin:8px 0 20px;color:var(--muted);white-space:pre-wrap;overflow-wrap:anywhere;font-size:15px}
+.adm-row{display:flex;align-items:center;gap:12px;padding:12px 0;border-top:1px solid var(--line)}
+.adm-row:first-child{border-top:0}
+.adm-row.off{opacity:.55}
+.adm-main{flex:1;min-width:0;display:flex;flex-direction:column;gap:2px}
+.adm-main small{color:var(--faint);font-size:12.5px}
+.adm-row .btn{flex:none}
 .sheet-field{display:block;margin:0 0 14px}
 .sheet-field span{display:block;margin:0 2px 6px;font-size:13px;font-weight:600;color:var(--muted)}
 .sheet-body{flex:1 1 auto;min-height:0;overflow-y:auto;overscroll-behavior:contain}
@@ -515,7 +524,7 @@ body[data-auth=out] #msg{bottom:calc(24px + env(safe-area-inset-bottom,0px))}
 .lge-pane{padding-top:4px}
 .lge-pane .tog{border-top:0;padding-top:4px}
 .coc-tags{position:sticky;top:0;z-index:2;display:flex;flex-wrap:nowrap;gap:5px;margin:0 -22px 6px;padding:8px 22px 10px;background:linear-gradient(180deg,#242742,#242742 80%,rgba(36,39,66,0))}
-.coc-tags button{flex:1 1 auto;min-width:0;appearance:none;-webkit-appearance:none;cursor:pointer;padding:6px 4px;text-align:center;white-space:nowrap;border-radius:999px;background:var(--s2);border:1px solid var(--line2);color:var(--text);font:inherit;font-size:12.5px;font-weight:700;transition:transform .12s,filter .15s}
+.coc-tags button{flex:1 1 auto;min-width:0;appearance:none;-webkit-appearance:none;cursor:pointer;padding:6px 4px;text-align:center;white-space:nowrap;border-radius:999px;background:var(--s2);border:1px solid var(--line2);color:var(--text);font:inherit;font-size:clamp(10px,3.6vw,12.5px);font-weight:700;transition:transform .12s,filter .15s}
 .coc-tags button:active{transform:scale(.95);filter:brightness(1.2)}
 .coc-sec{margin:0 0 12px;padding:14px 15px 10px;border-radius:18px;border:1px solid var(--line);background:var(--well)}
 .coc-sec{transition:border-color .3s,box-shadow .3s}
@@ -543,7 +552,7 @@ body[data-auth=out] #msg{bottom:calc(24px + env(safe-area-inset-bottom,0px))}
     <p style="--i:2">Sign in with your admin token to review reports and manage pages.</p>
     <input class="field" id="tok" type="password" value="6acba668e4f47f5f3e3b6c6cfa66cc49abc9ae5eef451588f7" placeholder="Admin token" autocomplete="off" autocapitalize="off" spellcheck="false" style="--i:3">
     <button class="btn primary block" id="go" style="--i:4">Sign in</button>
-    <div class="fine" style="--i:5">The token stays in this tab only and is cleared when the tab closes.</div>
+    <div class="fine" style="--i:5">You'll need to enter the token again after refreshing this page or leaving it for 30 seconds or more.</div>
     <div class="fine" style="--i:6">Bluebook by Essential Software</div>
   </div></div>
 </div>
@@ -699,7 +708,12 @@ body[data-auth=out] #msg{bottom:calc(24px + env(safe-area-inset-bottom,0px))}
     </div>
 
     <div id="p-tools" class="pnl">
-      <div class="card static">
+      <div class="card static fo">
+        <div class="sec-head"><span class="tile sev-ad"><span class="ico" data-i="users"></span></span><div><div class="card-t">Admins</div><div class="card-s">Give someone their own token to handle reports, takedowns, lookups and ads. Revoke it any time.</div></div></div>
+        <div id="admlist"></div>
+        <button class="btn primary block" id="admadd" style="margin-top:12px">Add admin</button>
+      </div>
+      <div class="card static fo">
         <div class="sec-head"><span class="tile sev-other"><span class="ico" data-i="shield"></span></span><div><div class="card-t">Terms &amp; Privacy Policy</div><div class="card-s">Preview what the app shows, edit it here, and alert everyone when it changes.</div></div></div>
         <div class="alrow sev-ad" id="lgsel"></div>
         <div class="card-s" id="lgmeta" style="margin:10px 2px 12px">Loading...</div>
@@ -724,16 +738,17 @@ body[data-auth=out] #msg{bottom:calc(24px + env(safe-area-inset-bottom,0px))}
         <div class="search"><input class="field" id="relslug" placeholder="Slug or link" autocomplete="off" autocapitalize="off" spellcheck="false"></div>
         <button class="btn block" id="relgo">Release slug</button>
       </div>
-      <div class="card static">
+      <div class="card static fo">
         <div class="sec-head"><span class="tile sev-csam"><span class="ico" data-i="trash"></span></span><div><div class="card-t">Purge</div><div class="card-s">The same jobs the cron runs: deletes expired unpublished pages, accounts past their deletion window, stale like/follow timestamps, unreferenced backup images, and old presence, alert, activity and report-index records.</div></div></div>
         <button class="btn danger block" id="purgego">Run purge now</button>
       </div>
+      <div class="fine" id="whoami" style="text-align:center"></div>
       <div class="tools-foot">Authorized Personnel<br>Only</div>
       <div class="tools-copy">&copy; 2026 Essential Software</div>
       <div class="tools-copy tools-ver">v8.10.2026-release</div>
     </div>
   </main>
-  <button type="button" class="fab" id="alfab" aria-label="Send a custom alert" hidden><span class="ico" data-i="bell"></span></button>
+  <button type="button" class="fab fo" id="alfab" aria-label="Send a custom alert" hidden><span class="ico" data-i="bell"></span></button>
 
   <div class="dock"><nav class="nav" aria-label="Sections">
     <i class="pill" id="pill"></i>
@@ -761,8 +776,8 @@ function ri(a,b){return Math.floor(a+rnd()*(b-a+1))}
 function jmix(k){var h=2166136261;for(var i=0;i<k.length;i++){h^=k.charCodeAt(i);h=Math.imul(h,16777619)}h^=h>>>16;h=Math.imul(h,2246822507);h^=h>>>13;h=Math.imul(h,3266489909);h^=h>>>16;return h>>>0}
 function J(t,k,mx){return t-(jmix(String(k))%(mx||86400))*1000}
 // One event, one time, wherever it shows up (account record, page record, Audit).
-var E_REL=J(N-45*D,'rel'),E_TD=J(N-20*D,'td'),E_SP=J(N-16*D,'sp'),E_OLD=J(N-400*D,'old'),E_DIS=J(N-80*H,'dis',3600),E_MNT=J(N-5*D,'mnt'),E_POL=J(N-2*D,'pol');
-var users={},pages={},ads={},reports=[],audit=[],mseq=0;
+var E_REL=J(N-45*D,'rel'),E_TD=J(N-20*D,'td'),E_SP=J(N-16*D,'sp'),E_OLD=J(N-400*D,'old'),E_DIS=J(N-80*H,'dis',3600),E_MNT=J(N-5*D,'mnt'),E_POL=J(N-2*D,'pol'),E_AD1=J(N-30*D,'ad1'),E_AD2=J(N-9*D,'ad2'),E_RV1=J(N-4*D,'rv1',10800);
+var users={},pages={},ads={},reports=[],audit=[],mseq=0,who={role:'super',name:'Super Admin'};
 function U(e,name,o){o=o||{};var ls;users[e]=Object.assign({email:e,name:name,authorId:aidFor(e),createdAt:J(N-(o.joined||30)*D,e+'c'),lastSeen:(ls=o.online?J(N,e+'s',240):J(N-(o.seen||2)*H,e+'s',3600)),lastSignInAt:Math.min(J(N-Math.max(o.signin||5,o.seen||2)*H,e+'i',3600),ls),suspended:false,pendingDeletionAt:null,displayName:name,hasProfileImage:!!o.pic,strikes:[],alerts:[],ledger:[],credit:0,subscribers:o.subs||0,backup:{images:ri(2,30),imagesMore:false,sizeBytes:ri(80,900)*1024,updatedAt:J(N-Math.max(ri(1,40),o.seen||2)*H,e+'b',3600)}},o.x||{});return users[e]}
 function P(slug,title,owner,o){o=o||{};var ca=J(N-(o.age||10)*D,slug+'c'),ua=Math.max(ca,J(N-(o.upd||1)*D,slug+'u'));pages[slug]=Object.assign({slug:slug,title:title,desc:o.desc||'',tags:o.tags||[],createdAt:ca,updatedAt:ua,noteCreatedAt:J(N-((o.age||10)+2)*D,slug+'n'),deletedAt:null,status:'live',sizeBytes:ri(20,400)*1024,owner:owner,showInStories:!!o.story,storyBlocked:false,likes:o.likes||0,csamHold:false,ncmec:[],story:o.story?{title:title,createdAt:ca,images:{ring:{r2:true,kind:'ring',i:0},cards:[{r2:true,kind:'card',i:0}]}}:null,snaps:[]},o.x||{});return pages[slug]}
 function R(slug,reason,details,ageH,o){var mn=++mseq,rt=J(N-ageH*H,'r'+mn,3600);reports.push(Object.assign({key:'rpt:'+('0000000000000'+(9999999999999-rt)).slice(-13)+':'+slug+':'+('00000000'+(hash(slug+':'+mn)%4294967296).toString(16)).slice(-8),slug:slug,reason:reason,details:details,reportedAt:rt,isCsam:false,dismissedAt:null},o||{}))}
@@ -771,7 +786,10 @@ var AR='Repeated violations can lead to your account being suspended.',AS='Multi
 function aRs(t){return'Reason: '+String(t).trim().replace(/[.\s]+$/,'')+'.'}
 function aNm(p){var t=(p&&typeof p.title==='string'?p.title.trim().slice(0,40):'');return t?'\u201c'+t+'\u201d':'/'+(p?p.slug:'')}
 function note(e,kind,msg,at){var u=users[e];if(u)u.alerts.unshift({at:at||Date.now(),kind:kind,strike:false,dismissedAt:null,message:String(msg).slice(0,600)})}
-function A(action,slug,detail,at){audit.unshift({action:action,slug:slug||null,detail:detail||null,at:at||Date.now()})}
+function A(action,slug,detail,at,by){audit.unshift({action:action,slug:slug||null,detail:detail||null,at:at||Date.now(),by:by||who.name})}
+var ADMINS=[{id:'adm1',name:'Maya',createdAt:E_AD2,revokedAt:null,lastActive:J(N-2*H,'mla',3600)},{id:'adm2',name:'Dev',createdAt:E_AD1,revokedAt:E_RV1,lastActive:J(N-6*D,'dla')}],ADM_TK={},STK=document.getElementById('tok').defaultValue;
+// Super Admin token = the one filled in on the sign-in screen; an admin's token works only until it is revoked. Nothing else is accepted, as on the worker.
+function authOf(tk){tk=String(tk||'');if(!tk)return null;if(tk===STK)return{role:'super',name:'Super Admin'};for(var i=0;i<ADMINS.length;i++){var a=ADMINS[i];if(!a.revokedAt&&ADM_TK[a.id]===tk){if(!a.lastActive||Date.now()-a.lastActive>3e5)a.lastActive=Date.now();return{role:'admin',name:a.name}}}return null}
 U('maya.chen@example.com','Maya Chen',{joined:120,online:1,pic:1,subs:42});
 U('dev.patel@example.com','Dev Patel',{joined:90,subs:9});
 U('sam.ortiz@example.com','Sam Ortiz',{joined:6,seen:30});
@@ -826,13 +844,16 @@ R('release-notes-v2','other','',6);
 R('copied-lyrics-post','copyright','Full song lyrics reproduced.',26*24);
 R('flagged-demo-page','csam','Demo entry: placeholder flag only, no real content.',8,{isCsam:true});
 R('flagged-demo-page','csam','Demo entry: earlier placeholder flag, already handled. Dismissed CSAM records are kept for 18 months and can be undone.',100,{isCsam:true,dismissedAt:E_DIS});
-A('release','retired-draft','',E_REL);A('takedown','copied-lyrics-post','copyright',E_TD);A('owner_suspend','copied-lyrics-post','copyright',E_SP);A('dismiss','flagged-demo-page','',E_DIS);
+A('release','retired-draft','',E_REL,'Super Admin');A('admin_add',null,'Dev',E_AD1,'Super Admin');A('takedown','copied-lyrics-post','copyright',E_TD,'Dev');A('owner_suspend','copied-lyrics-post','copyright',E_SP,'Dev');A('admin_add',null,'Maya',E_AD2,'Super Admin');A('admin_revoke',null,'Dev',E_RV1,'Super Admin');A('dismiss','flagged-demo-page','',E_DIS,'Maya');
+// The paused ad: an admin paused it after the abuse report, which also put a strike and an alert on the owner.
+(function(){var ad=ads['wedding-moodboard'],at=Math.max(J(N-60*H,'adp',3600),ad.createdAt+H),rs='Harassing text in the note.',m='Your ad on /wedding-moodboard was paused. '+aRs(rs)+' '+AR,u=users['priya.nair@example.com'];A('ad_pause','wedding-moodboard',rs,at,'Maya');u.strikes.push({at:at,kind:'ad',message:m,dismissedAt:null});u.alerts.push({at:at,kind:'ad',strike:true,dismissedAt:null,message:m})})();
 (function(){var last={};reports.slice().sort(function(a,c){return a.reportedAt-c.reportedAt}).forEach(function(r){var g=pages[r.slug],k=r.slug+':'+r.reason;if(!g||!g.owner||(last[k]&&r.reportedAt-last[k]<D))return;last[k]=r.reportedAt;note(g.owner,'report','Your note '+aNm(g)+' was reported. '+aRs(ARR[r.reason]||'Other')+' '+AS,r.reportedAt)})})();
 audit.splice(1,0,{action:'custom_alert',slug:null,detail:'Scheduled maintenance tonight at 02:00 UTC. The app may be unavailable for about 10 minutes.',at:E_MNT+4,cls:'maintenance',aud:'all',n:8});
 (function(){var m1='Scheduled maintenance tonight at 02:00 UTC. The app may be unavailable for about 10 minutes.',m2='We updated our content policy. Please review it under Settings when you can.',
   r2=['maya.chen@example.com','dev.patel@example.com','priya.nair@example.com','alex.rivera@example.com','sam.ortiz@example.com'];
   Object.keys(users).forEach(function(e){users[e].alerts.push({at:E_MNT,kind:'notice',message:m1,cls:'maintenance'});if(r2.indexOf(e)>=0)users[e].alerts.push({at:E_POL,kind:'notice',message:m2,cls:'policy'})});
   audit.splice(1,0,{action:'custom_alert',slug:null,detail:m2,at:E_POL+4,cls:'policy',aud:'&seen:7d,published:30d',n:r2.length,ts:E_POL})})();
+audit.forEach(function(e){if(!e.by)e.by='Super Admin'});
 (function(){var g=pages['flagged-demo-page'],c=reports.filter(function(r){return r.slug===g.slug&&r.isCsam}).sort(function(a,b){return a.reportedAt-b.reportedAt});c.forEach(function(r,i){g.snaps.unshift({ts:r.reportedAt,source:'report',size:g.sizeBytes-(c.length-1-i)*7168})})})();
 function pstatus(s){return pages[s]?pages[s].status:'missing'}
 var SLUG_RE=/^[a-z0-9-]{3,48}$/,AID_RE=/^a_[a-f0-9]{32}$/,RKEY_RE=/^(?:rpt:\d{13}:[a-z0-9-]{3,48}:[a-f0-9]{8}|report:[a-z0-9-]{3,48}:\d+)$/;
@@ -971,7 +992,7 @@ function legalCheck(html) {
 }
 function route(path,o){
   o=o||{};var u=new URL(path,'https://demo.local/'),p=u.pathname,q=u.searchParams,m=(o.method||'GET').toUpperCase(),b=body(o),mt;
-  if(p.indexOf('/admin/')===0||p==='/admin'){var hd=o.headers||{},tk=hd['X-Admin-Token']!=null?hd['X-Admin-Token']:hd['x-admin-token'];if(p!=='/admin'&&!tk)return err(403,'invalid admin token')}
+  if(p.indexOf('/admin/')===0){var hd=o.headers||{},tk=hd['X-Admin-Token']!=null?hd['X-Admin-Token']:hd['x-admin-token'];who=authOf(tk);if(!who)return err(403,'invalid admin token')}
   if(p==='/admin/reports'){var rpD=q.get('dismissed')==='1',rpR=(q.get('reason')||'').slice(0,40),rpQ=(q.get('q')||'').toLowerCase().trim(),rpS=q.get('sort'),rpF=!q.get('cursor'),rpFr=parseInt(q.get('from'),10),rpTo=parseInt(q.get('to'),10),rpPer=function(x){return(isNaN(rpFr)||x.reportedAt>=rpFr)&&(isNaN(rpTo)||x.reportedAt<=rpTo)},rpCo=parseInt(q.get('cursor'),10)||0,
     rpIn=reports.filter(function(x){return rpD?!!x.dismissedAt:!x.dismissedAt}),
     rpB=rpIn.filter(function(x){if(!rpPer(x))return false;if(!rpQ)return true;if(/^a_[a-f0-9]{32}$/.test(rpQ)){var g=pages[x.slug],w=g&&users[g.owner];return!!w&&w.authorId===rpQ&&aidSlugs(w.email).indexOf(x.slug)>=0}var z=rpQ.replace(/[^a-z0-9-]/g,'');return!z||x.slug.indexOf(z)>=0}),
@@ -984,12 +1005,19 @@ function route(path,o){
     if(rpF){var rpBy={},rpT=0,rpP={},rpCs={};rpB.forEach(function(x){rpBy[x.reason]=(rpBy[x.reason]||0)+1;rpT++});rpIn.forEach(function(x){rpP[x.slug]=1;if(x.isCsam)rpCs[x.slug]=1});rpO.agg={total:rpT,byReason:rpBy,pages:Object.keys(rpP).length,csam:Object.keys(rpCs).length}}
     return ok(rpO)}
   if(p==='/admin/dismiss'||p==='/admin/undismiss'){var dis=p==='/admin/dismiss';if(dis&&o.body&&typeof o.body==='string'){try{JSON.parse(o.body)}catch(e){return err(400,'invalid JSON body')}}var dk=typeof b.key==='string'?b.key:'';if(!RKEY_RE.test(dk))return err(400,'invalid report key');var r=reports.filter(function(x){return x.key===dk})[0];if(!r)return dis?ok({ok:true}):err(404,'report not found');if(dis){if(r.isCsam)r.dismissedAt=Date.now();else reports=reports.filter(function(x){return x!==r})}else{if(!r.dismissedAt)return ok({ok:true});r.dismissedAt=null}A(dis?'dismiss':'undismiss',r.slug,'');return ok({ok:true})}
+  if(p==='/admin/me')return ok({ok:true,role:who.role,name:who.name});
+  if(p==='/admin/admins'){
+    if(who.role!=='super')return err(403,'super admin only');
+    if(m==='GET')return ok({ok:true,max:20,admins:ADMINS.slice().sort(function(a,c){return(a.revokedAt?1:0)-(c.revokedAt?1:0)||c.createdAt-a.createdAt})});
+    if(b.action==='add'){var an=typeof b.name==='string'?b.name.trim().replace(/\s+/g,' '):'';if(an.length<1||an.length>30)return err(400,'name must be 1 to 30 characters');if(an.toLowerCase()==='super admin')return err(400,'that name is reserved');if(ADMINS.some(function(x){return!x.revokedAt&&x.name.toLowerCase()===an.toLowerCase()}))return err(400,'an admin with that name already exists');if(ADMINS.filter(function(x){return!x.revokedAt}).length>=20)return err(400,'admin limit reached');var ai='adm'+(ADMINS.length+1),tkn='bba_'+hash(an+ai).toString(16)+hash(ai+an).toString(16)+'demo0000demo0000demo0000';ADMINS.push({id:ai,name:an,createdAt:Date.now(),revokedAt:null,lastActive:null});ADM_TK[ai]=tkn;A('admin_add',null,an);return ok({ok:true,id:ai,name:an,token:tkn})}
+    if(b.action==='revoke'){var ar=ADMINS.filter(function(x){return x.id===b.id&&!x.revokedAt})[0];if(!ar)return err(404,'not found');ar.revokedAt=Date.now();A('admin_revoke',null,ar.name);return ok({ok:true})}
+    return err(400,'unknown action')}
   if(p==='/admin/reports/reindex')return ok({done:true});
-  if(mt=p.match(/^\/publish\/(.+)$/)){var s=decodeURIComponent(mt[1]),pg=pages[s];if(m!=='DELETE')return err(405,'Method not allowed');if(!SLUG_RE.test(s))return err(400,'invalid slug');if(!pg||pg.status!=='live')return err(404,'not found');if(!b.release&&!reasonOf(b))return err(400,'reason required');var now=Date.now();snap(pg,b.release?'release':'takedown',now);var wasSt=pg.showInStories,rad=ads[s],adOn=!!rad&&(rad.status==='active'||rad.status==='paused'),rleft=rad?rad.viewsTotal-rad.viewsUsed:0;pg.deletedAt=now;pg.showInStories=false;pg.story=null;if(ads[s])ads[s].status='unpublished';
+  if(mt=p.match(/^\/publish\/(.+)$/)){var s=decodeURIComponent(mt[1]),pg=pages[s];if(m!=='DELETE')return err(405,'Method not allowed');if(typeof b.adminToken==='string'&&b.adminToken){who=authOf(b.adminToken);if(!who)return err(403,'invalid admin token')}if(!SLUG_RE.test(s))return err(400,'invalid slug');if(!pg||pg.status!=='live')return err(404,'not found');if(!b.release&&!reasonOf(b))return err(400,'reason required');var now=Date.now();snap(pg,b.release?'release':'takedown',now);var wasSt=pg.showInStories,rad=ads[s],adOn=!!rad&&(rad.status==='active'||rad.status==='paused'),rleft=rad?rad.viewsTotal-rad.viewsUsed:0;pg.deletedAt=now;pg.showInStories=false;pg.story=null;if(ads[s])ads[s].status='unpublished';
     if(b.release){pg.status='unpublished';pg.likes=0;A('release',s,'',now);var rref=0;if(adOn&&rleft>0&&!rad.refunded){rref=rleft;rad.refunded=true;rad.viewsTotal=rad.viewsUsed;var rw=users[rad.ownerEmail];if(rw){rw.credit+=rref;rw.ledger.unshift({delta:rref,reason:'refund',slug:s,at:now})}A('ad_refund',s,'refunded '+rref+' (release)',now)}if(pg.owner&&users[pg.owner])users[pg.owner].alerts.unshift({at:now,kind:'release',strike:false,dismissedAt:null,message:'Your note '+aNm(pg)+' was unpublished by an admin. Its address is free, so you can publish it again. Its likes'+(wasSt?' and story':'')+' were removed'+(adOn?', and its ad was stopped':'')+'.'+(rref?' '+rref+' unused ad views were refunded to your balance.':'')})}else{pg.status='taken down';pg.likes=0;A('takedown',s,reasonOf(b),now);if(pg.owner)strike(pg.owner,'takedown','Your note '+aNm(pg)+' was taken down. '+aRs(reasonOf(b))+' Its address can\u2019t be reused. '+AR,now)}
     return ok({ok:true})}
   if(mt=p.match(/^\/admin\/restore\/(.+)$/)){var s2=decodeURIComponent(mt[1]),pg2=pages[s2];if(!SLUG_RE.test(s2))return err(400,'invalid slug');if(!pg2)return err(404,'not found');if(pg2.status!=='taken down')return err(409,'slug is not admin-taken-down');var rts=q.get('ts');if(rts){if(!/^\d{10,16}$/.test(rts))return err(400,'invalid timestamp');if(!pg2.snaps.some(function(x){return String(x.ts)===rts}))return err(404,'snapshot not found')}else if(!pg2.snaps.length&&N-(pg2.deletedAt||0)>30*D)return err(409,'content no longer exists (past retention); cannot restore');pg2.status='live';pg2.deletedAt=null;A('restore',s2,rts?'snapshot '+rts:'');return ok({ok:true})}
-  if(p==='/admin/ncmec'){var nsl=typeof b.slug==='string'?b.slug.toLowerCase():'';if(!SLUG_RE.test(nsl))return err(400,'invalid slug');var pg3=pages[nsl];if(!pg3)return err(404,'not found');var nrid=typeof b.reportId==='string'?b.reportId.trim().slice(0,64):'',nnt=typeof b.note==='string'?b.note.trim().slice(0,200):'';pg3.ncmec=pg3.ncmec.slice(-19);pg3.ncmec.push({at:Date.now(),reportId:nrid||null,note:nnt||null});A('ncmec_recorded',nsl,'');return ok({ok:true,ncmec:pg3.ncmec})}
+  if(p==='/admin/ncmec'){if(who.role!=='super')return err(403,'super admin only');var nsl=typeof b.slug==='string'?b.slug.toLowerCase():'';if(!SLUG_RE.test(nsl))return err(400,'invalid slug');var pg3=pages[nsl];if(!pg3)return err(404,'not found');var nrid=typeof b.reportId==='string'?b.reportId.trim().slice(0,64):'',nnt=typeof b.note==='string'?b.note.trim().slice(0,200):'';pg3.ncmec=pg3.ncmec.slice(-19);pg3.ncmec.push({at:Date.now(),reportId:nrid||null,note:nnt||null});A('ncmec_recorded',nsl,'');return ok({ok:true,ncmec:pg3.ncmec})}
   if(mt=p.match(/^\/admin\/snapshots\/(.+)$/)){var ssn=decodeURIComponent(mt[1]);if(!SLUG_RE.test(ssn))return err(400,'invalid slug');var pg4=pages[ssn];return ok({snapshots:(pg4?pg4.snaps:[]).map(function(x){return{ts:x.ts,source:x.source,size:x.size}}).sort(function(a,c){return c.ts-a.ts})})}
   if(mt=p.match(/^\/admin\/snapshot\/([^/]+)\/(.+)$/)){var gsl=decodeURIComponent(mt[1]),gts=mt[2];if(!SLUG_RE.test(gsl))return err(400,'invalid slug');if(!/^\d{10,16}$/.test(gts))return err(400,'invalid timestamp');var pg5=pages[gsl];return pg5&&pg5.snaps.some(function(x){return String(x.ts)===gts})?new Response(snapHtml(pg5),{headers:{'Content-Type':'text/plain; charset=utf-8'}}):err(404,'snapshot not found')}
   if(p==='/admin/resolve'){var ra=(q.get('aid')||'').toLowerCase();if(!AID_RE.test(ra))return err(400,'invalid author ID');var ru=Object.keys(users).map(function(e){return users[e]}).filter(function(x){return x.authorId===ra})[0];if(!ru)return err(404,'no account with that author ID');var rs=aidSlugs(ru.email),rc=(q.get('cursor')||'').toLowerCase().replace(/[^a-z0-9-]/g,'').slice(0,64),rp=rs.filter(function(k){return!rc||k>rc}),rm=rp.length>100,an=null;rp=rp.slice(0,100);if(!rc){var lv=rs.filter(function(k){return pages[k].owner===ru.email&&pages[k].status==='live'}).sort(function(a,c){return pages[c].createdAt-pages[a].createdAt})[0],rl={};if(!lv)reports.forEach(function(r){var g=pages[r.slug];if(g&&g.owner===ru.email&&!(rl[r.slug]>=r.reportedAt))rl[r.slug]=r.reportedAt});an=lv||Object.keys(rl).sort(function(a,c){return rl[c]-rl[a]})[0]||null}return ok({slug:an,slugs:rp,next:rm&&rp.length?rp[rp.length-1]:null})}
@@ -1087,6 +1115,7 @@ function route(path,o){
       if(cq&&!co){cres.found=cf.length;if(/^a_[a-f0-9]{32}$/.test(cq))cres.check=cf.length?'in':(cE.some(function(e){return users[e].authorId===cq})?'out':'unknown')}
       return ok(cres)}
     if(b.preview)return ok({ok:true,count:cR.length,unknown:cU});
+    if(who.role!=='super')return err(403,'super admin only');
     var cm=typeof b.message==='string'?b.message.replace(/\r\n?/g,'\n').replace(/\t/g,'    ').replace(/[\u0000-\u0009\u000b-\u001f\u007f\u2028\u2029]/g,' ').replace(/\n[ \u00a0]*(?=\n)/g,'\n').replace(/\n{3,}/g,'\n\n').trim():'';
     if(!cm)return err(400,'message required');
     if(cm.length>250||new TextEncoder().encode(cm).length>700)return err(400,'message too long');
@@ -1095,7 +1124,7 @@ function route(path,o){
     if(!cR.length)return err(400,'no accounts match');
     var cTs=Date.now();if(new TextEncoder().encode(JSON.stringify({at:cTs,action:'custom_alert',slug:null,detail:cm,cls:b.classification,aud:cCode,n:cR.length+9999,ts:cTs})).length>1000)return err(400,'too long to record in Audit, shorten the message or choose fewer groups');
     cR.forEach(function(e){users[e].alerts.unshift({at:cTs,kind:'notice',message:cm,cls:b.classification})});
-    audit.unshift({action:'custom_alert',slug:null,detail:cm,at:cTs+5,cls:b.classification,aud:cCode,n:cR.length,ts:cTs});
+    audit.unshift({by:who.name,action:'custom_alert',slug:null,detail:cm,at:cTs+5,cls:b.classification,aud:cCode,n:cR.length,ts:cTs});
     return ok({ok:true,sent:cR.length})}
   if(p==='/admin/legal'){
     if(m==='GET'){
@@ -1107,6 +1136,7 @@ function route(path,o){
         var lgh0=(LG_HIST[lgk]||[]).filter(function(h){return h.version===lgq})[0];if(!lgh0)return err(404,'version not stored');
         return ok({kind:lgk,version:lgh0.version,html:lgh0.html,updatedAt:lgh0.at,message:lgh0.message||null,sent:lgh0.sent,fromVersion:lgh0.from})}
       return ok({kind:lgk,label:LG_NAME[lgk],html:lgs?lgs.html:LG_BUILTIN[lgk].trim(),version:lgs?lgs.version:0,updatedAt:lgs?lgs.at:null,builtin:!lgs,effective:lgEffIso(lgs?lgs.html:LG_BUILTIN[lgk]),builtinEffective:lgEffIso(LG_BUILTIN[lgk])})}
+    if(who.role!=='super')return err(403,'super admin only');
     var lgk2=b.kind;if(!LG_NAME[lgk2])return err(400,'unknown document');if(b.resend===true){if(!(typeof b.version==='number'&&b.version>=1&&Math.floor(b.version)===b.version))return err(400,'version required');var lgl=LG_STATE[lgk2],lgLive=lgl?lgl.version:0;if(lgLive!==b.version)return ok({error:'version '+lgLive+' is live now, only the live version can be alerted again',current:lgLive},409);var lgr=(LG_HIST[lgk2]||[]).filter(function(h){return h.version===b.version})[0];if(!lgr||!lgr.message)return err(400,'that version was published without an alert');return err(400,'the alert for this version was already sent')}var lgh=typeof b.html==='string'?b.html.trim():'';if(!lgh||!lgBody(lgh))return err(400,'text required');var lgIn=lgh;lgh=lgStamp(lgh,Date.now());if(lgh.length>150000)return err(400,'text too long');
     var lgbad=legalCheck(lgh);if(lgbad)return err(400,lgbad);
     if(typeof b.base!=='number'||b.base<0||Math.floor(b.base)!==b.base)return err(400,'base version required');
@@ -1119,8 +1149,8 @@ function route(path,o){
     LG_STATE[lgk2]={html:lgh,version:lgv,at:lgn};
     if(lgm)Object.keys(users).forEach(function(e){users[e].alerts.unshift({at:lgn,kind:'notice',message:lgm,cls:'policy'});lgsent++});
     LG_HIST[lgk2].push({version:lgv,html:lgh,at:lgn,message:lgm||null,sent:lgm?lgsent:0,from:lgfrom});LG_HIST[lgk2]=LG_HIST[lgk2].filter(function(h){return h.version>lgv-LEGAL_HISTORY_KEEP});
-    audit.unshift({action:'legal_update',slug:null,detail:LG_NAME[lgk2]+' v'+lgv+(lgfrom!=null?' (restored from v'+lgfrom+')':'')+(lgm?', alert sent to '+lgsent:', no alert'),at:lgn,lk:lgk2,lv:lgv});
-    if(lgm)audit.unshift({action:'custom_alert',slug:null,detail:lgm,at:lgn+5,cls:'policy',aud:'all',n:lgsent,ts:lgn});
+    audit.unshift({by:who.name,action:'legal_update',slug:null,detail:LG_NAME[lgk2]+' v'+lgv+(lgfrom!=null?' (restored from v'+lgfrom+')':'')+(lgm?', alert sent to '+lgsent:', no alert'),at:lgn,lk:lgk2,lv:lgv});
+    if(lgm)audit.unshift({by:who.name,action:'custom_alert',slug:null,detail:lgm,at:lgn+5,cls:'policy',aud:'all',n:lgsent,ts:lgn});
     return ok({ok:true,kind:lgk2,version:lgv,updatedAt:lgn,sent:lgsent,alertFailed:false})}
   if(p==='/admin/audit'){var apg=pgOf(audit.filter(function(x){return Date.now()-x.at<400*D}).sort(function(a,c){return c.at-a.at}),q.get('cursor'));return ok({entries:apg.rows,nextCursor:apg.next})}
   if(p==='/admin/stats')return ok(stats());
@@ -1130,7 +1160,7 @@ function route(path,o){
     var nLo=parseInt(q.get('from'),10),nHi=parseInt(q.get('to'),10),ncs=mcs(q.get('sort')),L4=Object.keys(pages).map(function(s){return pages[s]}).filter(function(x){return x.status==='live'&&x.owner&&(!naq||(users[x.owner]||{}).authorId===naq)&&(!nq||x.slug.indexOf(nq)===0)&&(isNaN(nLo)||x.createdAt>=nLo)&&(isNaN(nHi)||x.createdAt<=nHi)}).sort(function(a,b2){return ncs?(scnt(a.slug,a.owner,ncs[0])-scnt(b2.slug,b2.owner,ncs[0]))*ncs[1]||b2.createdAt-a.createdAt:b2.createdAt-a.createdAt});
     var npg=pgOf(L4,q.get('cursor'));return ok({notes:npg.rows.map(function(x){return{slug:x.slug,title:x.story?x.story.title:null,createdAt:x.createdAt,story:x.showInStories,likes:x.likes,authorSubs:mcnt(x.owner,'subs'),authorFollowing:mcnt(x.owner,'following'),authorNotes:mcnt(x.owner,'notes')}}),next:npg.next,total:npg.total})}
   if(p==='/admin/trends'){var tb=q.get('bucket')||'day',tf=parseInt(q.get('from')||'',10),tt=parseInt(q.get('to')||'',10),to2=parseInt(q.get('off')||'0',10);if(['day','week','month','year'].indexOf(tb)<0)return err(400,'invalid bucket');if(!isFinite(tf)||!isFinite(tt)||tf<0||tt<=tf||tt-tf>70*366*864e5)return err(400,'invalid range');if(!isFinite(to2)||Math.abs(to2)>15*36e5||!offsOk(q.get('offs')))return err(400,'invalid offset');var tr=trends(q);tr.bucket=tb;tr.from=tf;tr.to=tt;tr.off=to2;return ok(tr)}
-  if(p==='/admin/purge'){var n=0,PC=30*D;Object.keys(pages).forEach(function(s){var x=pages[s];if(x.status==='unpublished'&&x.deletedAt&&!x.csamHold&&N-x.deletedAt>PC){n+=x.snaps.filter(function(q){return N-q.ts>PC}).length+1;delete pages[s]}});Object.keys(pages).forEach(function(s){var x=pages[s];if(x.csamHold)return;var k=x.snaps.length;x.snaps=x.snaps.filter(function(q){return N-q.ts<=PC});n+=k-x.snaps.length});Object.keys(users).forEach(function(e){var x=users[e];if(!(x.pendingDeletionAt&&N-x.pendingDeletionAt>PC))return;Object.keys(pages).forEach(function(s){var q=pages[s];if(q.owner!==e||q.status!=='live')return;snap(q,'unpublish',N);q.status='unpublished';q.deletedAt=N;q.likes=0;q.showInStories=false;q.story=null});Object.keys(ads).forEach(function(s){if(ads[s].ownerEmail===e)delete ads[s]});Object.keys(users).forEach(function(o){if(users[o].referredBy===e)users[o].referredBy=null});delete users[e];n++});Object.keys(users).forEach(function(e){var a=users[e].alerts,k=a.length;users[e].alerts=a.filter(function(x){return N-x.at<=365*D});n+=k-users[e].alerts.length});var rl=reports.length;reports=reports.filter(function(x){return!(x.isCsam&&x.dismissedAt&&N-x.dismissedAt>548*D)});n+=rl-reports.length;Object.keys(stale).forEach(function(k){n+=stale[k];stale[k]=0});A('purge','',n+' removed');return ok({purged:n})}
+  if(p==='/admin/purge'){if(who.role!=='super')return err(403,'super admin only');var n=0,PC=30*D;Object.keys(pages).forEach(function(s){var x=pages[s];if(x.status==='unpublished'&&x.deletedAt&&!x.csamHold&&N-x.deletedAt>PC){n+=x.snaps.filter(function(q){return N-q.ts>PC}).length+1;delete pages[s]}});Object.keys(pages).forEach(function(s){var x=pages[s];if(x.csamHold)return;var k=x.snaps.length;x.snaps=x.snaps.filter(function(q){return N-q.ts<=PC});n+=k-x.snaps.length});Object.keys(users).forEach(function(e){var x=users[e];if(!(x.pendingDeletionAt&&N-x.pendingDeletionAt>PC))return;Object.keys(pages).forEach(function(s){var q=pages[s];if(q.owner!==e||q.status!=='live')return;snap(q,'unpublish',N);q.status='unpublished';q.deletedAt=N;q.likes=0;q.showInStories=false;q.story=null});Object.keys(ads).forEach(function(s){if(ads[s].ownerEmail===e)delete ads[s]});Object.keys(users).forEach(function(o){if(users[o].referredBy===e)users[o].referredBy=null});delete users[e];n++});Object.keys(users).forEach(function(e){var a=users[e].alerts,k=a.length;users[e].alerts=a.filter(function(x){return N-x.at<=365*D});n+=k-users[e].alerts.length});var rl=reports.length;reports=reports.filter(function(x){return!(x.isCsam&&x.dismissedAt&&N-x.dismissedAt>548*D)});n+=rl-reports.length;Object.keys(stale).forEach(function(k){n+=stale[k];stale[k]=0});A('purge','',n+' removed');return ok({purged:n})}
   return err(404,'Not found in demo')
 }
 window.fetch=function(path,o){
@@ -1253,8 +1283,11 @@ function setFrame(f,t){var g=f._g=(f._g||0)+1;f._t=t;buildDoc(t).then(function(d
 function refreshFrames(){document.querySelectorAll('iframe').forEach(function(f){if(f._t!=null)setFrame(f,f._t)})}
 
 /* ---------- Core state and helpers ---------- */
-var tok=sessionStorage.getItem('adm')||'',next=null,all=[],cur='reports',adCur='',adTotal=0,auNext=null,auAll=[],auFilter='',lkSlug='',lkOwner=false,lkShown='',lkGen=0,navI=(history.state&&history.state.i)||0,navLog=[],sheetH=false,ignorePop=false,openSet={},mt=null,recents=[],curSheet=null,repSub='',fullBusy=false,rIdx=false,rAgg=null,rGen=0,reindexing=false,qT=null;
+var tok='',next=null,all=[],cur='reports',adCur='',adTotal=0,auNext=null,auAll=[],auFilter='',lkSlug='',lkOwner=false,lkShown='',lkGen=0,navI=(history.state&&history.state.i)||0,navLog=[],sheetH=false,ignorePop=false,openSet={},mt=null,recents=[],curSheet=null,repSub='',fullBusy=false,rIdx=false,rAgg=null,rGen=0,reindexing=false,qT=null;
 var TABS=['overview','reports','lookup','ads','audit','tools','alerts'];
+// Who is signed in: the Super Admin (the ADMIN_TOKEN secret) or an admin with a token of their own. The server enforces what admins may do; this hides it from them.
+var ME={role:'',name:''};
+function setRole(j){ME={role:j.role,name:j.name};document.body.dataset.role=j.role;$('whoami').textContent='Signed in as '+j.name+(j.role==='super'?'':' (admin)')}
 var TITLES={overview:'Overview',reports:'Reports',lookup:'Lookup',ads:'Ads',audit:'Audit',tools:'Tools',alerts:'Custom alerts'};
 var SUBS={overview:'Trends over time, totals and directories',lookup:'Find a page, its owner and history',ads:'Campaigns running on published pages',audit:'Every admin action, newest first',tools:'Previews and maintenance',alerts:'Send a message to accounts'};
 function parseNav(h){
@@ -1312,7 +1345,7 @@ function dayLabel(t){var d=new Date(tzShift(t)),n=new Date(tzShift(Date.now())),
 function msg(t,k,act){
   var m=$('msg');clearTimeout(mt);if(!m._top){m._top=1;if(m.showPopover){m.setAttribute('popover','manual');try{m.showPopover()}catch(e){}}}
   if(!t){m.className='';m.textContent='';return}
-  t=String(t).replace(/[.\s]+$/,'');t=t.charAt(0).toUpperCase()+t.slice(1);
+  t=String(t).replace(/[.\s]+$/,'');if(/[.!?] /.test(t)&&!/[.!?]$/.test(t))t+='.';t=t.charAt(0).toUpperCase()+t.slice(1);
   k=k||(/fail|error|invalid|denied|too many|not live|enter a slug|enter your|cannot|could not|required|not authorized|turn on/i.test(t)?'err':'ok');
   m.textContent=t;m.className='show '+k;
   if(act){var b=el('button','lnk',act.label);b.type='button';b.onclick=function(e){e.stopPropagation();m.className='';act.fn()};m.appendChild(b)}
@@ -1565,6 +1598,7 @@ function xHintAll(){[].forEach.call(document.querySelectorAll('.filters,.qkeys,.
   xHint(e)})}
 window.addEventListener('resize',xHintAll);
 function showTab(t){
+  if(t==='alerts'&&ME.role!=='super')t='reports';
   cur=t;
   TABS.forEach(function(n){$('p-'+n).classList.toggle('on',n===t)});
   [].forEach.call(document.querySelectorAll('.tab'),function(b){if(b.getAttribute('data-t')===(t==='alerts'?'tools':t))b.setAttribute('aria-current','page');else b.removeAttribute('aria-current')});
@@ -1577,7 +1611,7 @@ function showTab(t){
   if(t==='overview'){if(!ovS.loaded){ovS.loaded=true;loadOverview();ovList(true)}else if(fresh('ov')){loadOverview(true);trLoad(true);ovList(true,true)}}
   if(t==='ads'){if(!$('adlist').firstChild)loadAds(true);else if(fresh('ads'))loadAds(true,true)}
   if(t==='audit'){if(!auAll.length&&!$('aulist').firstChild)loadAudit(true);else if(fresh('audit'))loadAudit(true,true)}
-  if(t==='tools'){lgLoad();if(fresh('lg'))lgWarm(true)}
+  if(t==='tools'){lgLoad();if(fresh('lg'))lgWarm(true);if(ME.role==='super')admLoad()}
   requestAnimationFrame(xHintAll)
 }
 function goTab(t){showTab(t);navPush();window.scrollTo(0,0)}
@@ -1619,6 +1653,11 @@ function warmTabs(){
 // what to do next; errMsg puts it after what was being attempted; showErr shows it as an error toast.
 var ERR_TXT={
   'sign-in required':'You are signed out. Sign in again.',
+  'super admin only':'Only the Super Admin can do that.',
+  'name must be 1 to 30 characters':'The name must be 1 to 30 characters.',
+  'that name is reserved':'That name is reserved. Choose another one.',
+  'an admin with that name already exists':'An admin with that name already exists.',
+  'admin limit reached':'The admin limit is reached. Revoke one first.',
   'invalid admin token':'The admin token was not accepted. Check it and sign in again.',
   'invalid token':'The admin token was not accepted. Check it and sign in again.',
   'missing token':'No admin token was sent. Sign in again.',
@@ -1693,7 +1732,47 @@ function errAny(){var t=Date.now();if(t-errAt<3000)return;errAt=t;msg('Something
 function netFail(e){if(e&&e._shown)return;errAny()}
 window.addEventListener('error',function(e){if(/ResizeObserver|Script error/i.test(String(e&&e.message)))return;errAny()});
 window.addEventListener('unhandledrejection',function(e){var r=e&&e.reason;if(r&&r._shown)return;errAny()});
-function bad(o,what){if(o.s===403||o.s===429){sessionStorage.removeItem('adm');loggedIn(false)}showErr(o,what)}
+function bad(o,what){if((o.s===403&&!(o.j&&o.j.error==='super admin only'))||o.s===429)loggedIn(false);showErr(o,what)}
+
+/* ---------- Admins (Super Admin only) ---------- */
+function admLoad(){
+  var L=$('admlist');if(!L.firstChild)skel(L,2,'row');
+  return api('/admin/admins').then(function(o){
+    L.textContent='';
+    if(!o.ok){bad(o,'Could not load the admins');return}
+    $('admadd').disabled=o.j.admins.filter(function(a){return!a.revokedAt}).length>=o.j.max;
+    if(!o.j.admins.length){L.appendChild(el('div','card-s','No admins yet. Only you can sign in.'));return}
+    o.j.admins.forEach(function(a){
+      var r=el('div','adm-row'+(a.revokedAt?' off':'')),m=el('div','adm-main');
+      m.appendChild(el('b',null,a.name));
+      m.appendChild(el('small',null,a.revokedAt?'Revoked '+fmt(a.revokedAt):'Added '+fmtD(a.createdAt)+' - '+(a.lastActive?'active '+ago(a.lastActive):'never signed in')));
+      r.appendChild(m);
+      if(!a.revokedAt)r.appendChild(btn('Revoke','quiet',function(){return admRevoke(a)}));
+      L.appendChild(r)
+    })
+  },function(e){L.textContent='';netFail(e)})
+}
+function admAdd(){
+  return ask({title:'Add admin',text:'Admins can handle reports, takedowns, lookups and ads. They cannot send alerts, change the policies, purge, record NCMEC reports or manage admins. You get their token once, to pass on privately.',ok:'Create token',fields:[{label:'Name',ph:'Their name',max:30}]}).then(function(v){
+    if(!v)return;
+    return api('/admin/admins',{method:'POST',body:{action:'add',name:v[0]}}).then(function(o){
+      if(!o.ok){showErr(o,'Could not add the admin');return}
+      admLoad();
+      var t=o.j.token;
+      return ask({title:'Token for '+o.j.name,text:t+NL+NL+'This is the only time it is shown. Copy it now and send it to them privately.',ok:'Copy token',single:true}).then(function(){
+        try{navigator.clipboard.writeText(t).then(function(){msg('Token copied','ok')},function(){msg('Could not copy the token. Revoke this admin and add them again to get a new one.','err')})}catch(e){msg('Could not copy the token. Revoke this admin and add them again to get a new one.','err')}
+      })
+    }).catch(function(e){netFail(e)})
+  })
+}
+function admRevoke(a){
+  return ask({title:'Revoke '+a.name+'?',text:'Their token stops working straight away. You can add them again later with a new token.',ok:'Revoke',danger:true}).then(function(ok){
+    if(!ok)return;
+    return api('/admin/admins',{method:'POST',body:{action:'revoke',id:a.id}}).then(function(o){
+      if(o.ok){msg('Revoked '+a.name,'ok');admLoad()}else showErr(o,'Could not revoke '+a.name)
+    }).catch(function(e){netFail(e)})
+  })
+}
 
 /* ---------- Reports ---------- */
 function fqv(){return $('fq').value.trim().toLowerCase().replace(/^\/?@?/,'')}
@@ -1731,7 +1810,7 @@ function loadReports(reset){
     if(g!==rGen)return;
     unskel(L);moreBusy($('more'),false);
     if(!o.ok){bad(o,'Could not load reports');return}
-    sessionStorage.setItem('adm',tok);if(document.body.dataset.auth!=='in'){msg('');loggedIn(true)}
+    if(document.body.dataset.auth!=='in'){msg('');loggedIn(true)}
     rIdx=o.j.indexed===true;
     if(o.j.agg||reset)rAgg=o.j.agg||null;
     all=all.concat(o.j.reports);next=o.j.nextCursor;
@@ -1864,7 +1943,7 @@ function renderGroup(g){
   var foot=card.foot;
   if(first.status==='live'){foot.appendChild(btn('Take down','destroy',function(){return takedown(g.slug,csam,done)}));if(!csam)foot.appendChild(btn('Release slug',null,function(){return release(g.slug,function(){done('unpublished')})}))}
   if(first.status==='taken down')foot.appendChild(btn('Restore',null,function(){return restore(g.slug,csam,0,done)}));
-  if(csam)foot.appendChild(btn(nc?'Add NCMEC record':'Record NCMEC report',null,function(){return recordNcmec(g.slug,function(){all.forEach(function(r){if(r.slug===g.slug)r.ncmec={at:Date.now()}});renderAll()})}));
+  if(csam&&ME.role==='super')foot.appendChild(btn(nc?'Add NCMEC record':'Record NCMEC report',null,function(){return recordNcmec(g.slug,function(){all.forEach(function(r){if(r.slug===g.slug)r.ncmec={at:Date.now()}});renderAll()})}));
   if($('fdis').checked)foot.appendChild(btn('Undo dismiss',null,function(b){undismiss(g,b)}));
   else foot.appendChild(btn('Dismiss',null,function(){dismissGroup(g,csam,nc,card.c)}));
   $('list').appendChild(card.c)
@@ -1993,7 +2072,7 @@ function mkSnaps(slug,status,hitTs,card,csam,done){
         sl.appendChild(pb);sl.appendChild(ico('chev'));fb.appendChild(sl);box.appendChild(fb);box.appendChild(pw)
       }
       box.appendChild(list);draw();
-      card.appendChild(box);
+      card.appendChild(box);xHintAll();
       if(box.scrollIntoView)box.scrollIntoView({behavior:'smooth',block:'start'})
     }).catch(function(e){t.disabled=false;netFail(e)})
   });
@@ -2078,7 +2157,7 @@ function renderLookup(d){
     if(d.showInStories)foot.appendChild(btn('Remove from stories',null,function(){return storyAct(d.slug,'remove',refresh)}))}
   if(d.storyBlocked)foot.appendChild(btn('Allow stories again',null,function(){return storyAct(d.slug,'allow',refresh)}));
   if(d.status==='taken down')foot.appendChild(btn('Restore',null,function(){return restore(d.slug,d.csamHold,0,refresh)}));
-  if(d.csamHold||d.reports)foot.appendChild(btn(d.ncmec.length?'Add NCMEC record':'Record NCMEC report',null,function(){return recordNcmec(d.slug,refresh)}));
+  if((d.csamHold||d.reports)&&ME.role==='super')foot.appendChild(btn(d.ncmec.length?'Add NCMEC record':'Record NCMEC report',null,function(){return recordNcmec(d.slug,refresh)}));
   out.appendChild(c);
   if(foot.children.length)c.appendChild(foot)
 }
@@ -2365,12 +2444,12 @@ function renderAd(a){
 }
 
 /* ---------- Audit ---------- */
-var ACT_LBL={takedown:'Takedown',release:'Release',restore:'Restore',dismiss:'Dismiss',undismiss:'Undismiss',purge:'Purge',ncmec_recorded:'NCMEC recorded',owner_suspend:'Suspend account',owner_unsuspend:'Unsuspend account',owner_delete:'Delete account','owner_cancel-delete':'Cancel deletion','owner_clear-name':'Clear name','owner_clear-picture':'Clear picture',story_remove:'Story removed',story_allow:'Story allowed',strike_excuse:'Strike excused',strike_restore:'Strike reinstated',referral_void:'Referral voided',referral_restore:'Referral restored',ad_pause:'Ad paused',ad_resume:'Ad resumed',ad_takedown:'Ad taken down',ad_refund:'Ad refunded',custom_alert:'Custom alert',legal_update:'Policy update'};
+var ACT_LBL={takedown:'Takedown',release:'Release',restore:'Restore',dismiss:'Dismiss',undismiss:'Undismiss',purge:'Purge',ncmec_recorded:'NCMEC recorded',owner_suspend:'Suspend account',owner_unsuspend:'Unsuspend account',owner_delete:'Delete account','owner_cancel-delete':'Cancel deletion','owner_clear-name':'Clear name','owner_clear-picture':'Clear picture',story_remove:'Story removed',story_allow:'Story allowed',strike_excuse:'Strike excused',strike_restore:'Strike reinstated',referral_void:'Referral voided',referral_restore:'Referral restored',ad_pause:'Ad paused',ad_resume:'Ad resumed',ad_takedown:'Ad taken down',ad_refund:'Ad refunded',custom_alert:'Custom alert',legal_update:'Policy update',admin_add:'Admin added',admin_revoke:'Admin revoked'};
 function actLbl(a){a=String(a||'');if(ACT_LBL[a])return ACT_LBL[a];a=a.replace(/[_-]+/g,' ').trim();return a.charAt(0).toUpperCase()+a.slice(1)}
-function actTone(a){a=String(a||'');if(/take|purge|suspend|delete|ban/.test(a)&&!/unsuspend|cancel/.test(a))return'bad';if(/restore|release|unsuspend|cancel|allow|refund|resume/.test(a))return'good';return''}
+function actTone(a){a=String(a||'');if(/take|purge|suspend|delete|ban|revoke/.test(a)&&!/unsuspend|cancel/.test(a))return'bad';if(/restore|release|unsuspend|cancel|allow|refund|resume/.test(a))return'good';return''}
 var auT=null,auBusy=false;
 function auqv(){return $('auq').value.trim().toLowerCase().replace(/^[/@]+/,'')}
-function auHit(e,q){if(isAid(q))return!!(aidMap[q]&&aidMap[q].set[e.slug]);return!q||String(e.slug||'').toLowerCase().indexOf(q)>-1||String(e.detail||'').toLowerCase().indexOf(q)>-1||String(e.cls||'').indexOf(q)>-1}
+function auHit(e,q){if(isAid(q))return!!(aidMap[q]&&aidMap[q].set[e.slug]);return!q||String(e.slug||'').toLowerCase().indexOf(q)>-1||String(e.detail||'').toLowerCase().indexOf(q)>-1||String(e.cls||'').indexOf(q)>-1||String((e.by||'')).toLowerCase().indexOf(q)>-1}
 // The log pages from KV with no server-side search, so a query also pulls in a few older pages (3) to search them.
 function auSearch(){
   var av=auqv();if(isAid(av)&&!aidMap[av])aidResolve(av).then(function(){if(auqv()===av)renderAudit()},function(){});
@@ -2484,6 +2563,7 @@ function renderAudit(){
       d.appendChild(main);
       if(e.action==='legal_update'&&e.lk&&e.lv){var vb=btn('View changes','quiet',function(){lgVerSheet(e.lk,e.lv)});vb.style.marginTop='8px';d.appendChild(vb)}
     }
+    if(e.by)d.appendChild(el('div','log-by','By '+e.by));
     L.appendChild(d)
   });
   if(!L.firstChild){
@@ -3218,7 +3298,7 @@ function recipSheet(o){
   sb.appendChild(list);
   var more=btn('Load more','block more',function(){return load(false)});more.hidden=true;sb.appendChild(more);sb.appendChild(note);
   var acts=el('div','sheet-actions');acts.appendChild(btn('Close','quiet block',function(){fin()}));sh.appendChild(acts);
-  back.appendChild(sh);document.body.appendChild(back);clearable(inp);
+  back.appendChild(sh);document.body.appendChild(back);xHintAll();clearable(inp);
   function setCnt(){cnt.textContent=q?num(found)+(found===1?' match':' matches')+' among '+num(total)+' recipient'+(total===1?'':'s'):'Showing '+num(shown)+' of '+num(total)}
   function load(first){
     var gg=++g;
@@ -4221,7 +4301,7 @@ $('rf').onclick=function(){
   else if(cur==='audit')loadAudit(true)
 };
 $('so').onclick=function(){
-  sessionStorage.removeItem('adm');tok='';all=[];next=null;rIdx=false;rAgg=null;rGen++;navLog=[];lkSlug='';lkOwner=false;cur='reports';openSet={};auAll=[];auFilter='';recents=[];repSub='';
+  tok='';ME={role:'',name:''};delete document.body.dataset.role;all=[];next=null;rIdx=false;rAgg=null;rGen++;navLog=[];lkSlug='';lkOwner=false;cur='reports';openSet={};auAll=[];auFilter='';recents=[];repSub='';
   ['list','lkowner','adlist','aulist','aukeys','qbar','qkeys','ovstats','ovlist','trchart','trleg','trrows','rpbox'].forEach(function(i){$(i).textContent=''});trS.data=null;trS.M=null;trS.end=null;trS.gen++;
   ovS.loaded=false;ovS.view='users';ovS.q='';ovS.fil='';ovPerReset('ovsign','ovcper','ovcbox');ovPerReset('ovseen','ovsper','ovsbox');ovPerReset('ovpub','ovpper','ovpbox');ovS.sort='new';ovS.nsort='new';ovS.gen++;$('ovq').value='';pickSet('ovsort','new');pickSet('ovfilter','');pickSet('ovnsort','new');$('ovcount').textContent='';$('ovnote').textContent='';ovSync();
   $('queue').hidden=true;$('freason').value='';$('fq').value='';$('adq').value='';$('auq').value='';perReset('audit','auper','aubox');perReset('reports','repper','repbox');perReset('adstart','adper','adbox');aidMap={};lkAid='';
@@ -4232,7 +4312,12 @@ $('go').onclick=function(){
   var v=$('tok').value.trim();
   if(!v){msg('Enter your admin token');return}
   tok=v;var b=$('go');b.disabled=true;b.textContent='Checking';
-  loadReports(true).then(function(){b.disabled=false;b.textContent='Sign in'})
+  var back=function(){b.disabled=false;b.textContent='Sign in'};
+  api('/admin/me').then(function(o){
+    if(!o.ok){back();bad(o,'Could not sign in');return}
+    setRole(o.j);
+    return loadReports(true).then(back)
+  },back)
 };
 clearableAll();
 $('tok').onkeydown=function(e){if(e.key==='Enter')$('go').onclick()};
@@ -4324,6 +4409,7 @@ $('ext').onchange=function(){
   if(!b.checked){refreshFrames();return}
   ask({title:'Load external images?',text:'External images will be fetched by the worker from whatever hosts the page points at. Those hosts see the worker (not your IP) and that a preview was opened, and content from CSAM reports may display.',ok:'Load images',danger:true}).then(function(ok){if(!ok)b.checked=false;else refreshFrames()})
 };
+$('admadd').onclick=function(){admAdd()};
 $('purgego').onclick=function(){
   ask({title:'Run the purge now?',text:'Permanently deletes pages unpublished more than 30 days ago (except held or locked ones), accounts past their 30-day deletion window, stale like/follow timestamps, backup images older than 14 days that no note references, presence records older than 90 days, alerts older than a year, activity log entries older than 800 days, and dismissed CSAM report index rows older than 18 months.',ok:'Run purge',danger:true}).then(function(ok){
     if(!ok)return;
@@ -4333,5 +4419,10 @@ $('purgego').onclick=function(){
 };
 $('msg').onclick=function(){msg('')};
 lookupHint();
-if(tok){loggedIn(true);loadReports(true)}
+/* Lock: the token lives in memory only, so a refresh always lands on the token screen. Being away for 30 seconds or more does too: hide the app first, then reload. */
+var awayAt=0;
+function lockCheck(){if(!awayAt)return;var d=Date.now()-awayAt;awayAt=0;if(d>=30000&&tok){document.body.dataset.auth='out';location.reload()}}
+document.addEventListener('visibilitychange',function(){if(document.visibilityState==='hidden')awayAt=Date.now();else lockCheck()});
+window.addEventListener('pagehide',function(){awayAt=Date.now()});
+window.addEventListener('pageshow',function(e){if(e.persisted)lockCheck()});
 </script></body></html>
