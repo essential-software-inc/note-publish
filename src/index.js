@@ -1513,7 +1513,7 @@ async function handleUnpublish(env, request, slug) {
   meta.deletedAt = now;
   if (isAdminTakedown) meta.adminLocked = true;
   await putMeta(env, slug, meta);
-  if (isAdminTakedown || isAdminRelease) await audit(env, isAdminRelease ? 'release' : 'takedown', slug, isAdminTakedown ? adminReasonOf(body) : null);
+  if (isAdminTakedown || isAdminRelease) await auditBy(env, request, isAdminRelease ? 'release' : 'takedown', slug, isAdminTakedown ? adminReasonOf(body) : null);
   if (isAdminTakedown) await createAlert(env, meta.ownerSub, 'takedown', 'Your note ' + alertNoteName(meta, slug) + ' was taken down. ' + alertReason(adminReasonOf(body)) + ' Its address can\u2019t be reused. ' + ALERT_REPEAT_NOTE);
   // Drop this slug out of its owner's GET /my/pages listing either way —
   // an admin takedown shouldn't keep showing up in the owner's own page
@@ -1560,7 +1560,7 @@ async function handleUnpublish(env, request, slug) {
     if (adStopped) {
       try { refunded = await refundAdViews(env, slug, relAd); }
       catch (e) { console.log('release refund failed: ' + (e && e.message)); }
-      if (refunded) await audit(env, 'ad_refund', slug, 'refunded ' + refunded + ' (release)');
+      if (refunded) await auditBy(env, request, 'ad_refund', slug, 'refunded ' + refunded + ' (release)');
     }
     // Not a strike: the kind is "release" and the text avoids the "was paused" / "was taken down" wording that marks ad strikes.
     await createAlert(env, meta.ownerSub, 'release', 'Your note ' + alertNoteName(meta, slug) + ' was unpublished by an admin. Its address is free, so you can publish it again. Its likes' + (meta.showInStories ? ' and story' : '') + ' were removed' + (adStopped ? ', and its ad was stopped' : '') + '.' + (refunded ? ' ' + refunded + ' unused ad views were refunded to your balance.' : ''));
@@ -3358,6 +3358,20 @@ const REFERRAL_BONUS_MAX_INVITES = 5;           // ...for up to this many invite
 const REFERRAL_GIFT_VIEWS = 100;                // free views added to the inviter's balance for each qualified invite
 const REFERRAL_GIFT_MAX_INVITES = 5;            // ...for up to this many invites (the same five that count toward packages)
 const REFERRAL_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
+const REFERRAL_CODE_LEN = 8;                    // 31^8 is about 853 billion codes
+const REFERRAL_CODE_TRIES = 10;                 // a taken code is simply redrawn; this only runs out when the space is nearly full
+const REFERRAL_CODE_RE = new RegExp('^[' + REFERRAL_ALPHABET + ']{' + REFERRAL_CODE_LEN + '}$');
+// Every character equally likely: bytes from the last partial block of the alphabet are thrown away, not wrapped round with %.
+function newReferralCode() {
+  const n = REFERRAL_ALPHABET.length, limit = 256 - (256 % n);
+  let out = '';
+  while (out.length < REFERRAL_CODE_LEN) {
+    for (const b of crypto.getRandomValues(new Uint8Array(REFERRAL_CODE_LEN * 2))) {
+      if (b < limit && out.length < REFERRAL_CODE_LEN) out += REFERRAL_ALPHABET[b % n];
+    }
+  }
+  return out;
+}
 const REQ_WORDS = {
   subs: ['subscriber', 'subscribers'], notes: ['published note', 'published notes'],
   likesReceived: ['like received', 'likes received'], likesGiven: ['like given to other notes', 'likes given to other notes'],
@@ -3616,13 +3630,13 @@ async function referralCodeFor(env, sub) {
   await ensureAdStanding(env);
   const have = await env.ADS_DB.prepare('SELECT code FROM referral_codes WHERE sub = ?').bind(sub).first();
   if (have) return have.code;
-  for (let i = 0; i < 5; i++) {
-    const bytes = crypto.getRandomValues(new Uint8Array(8));
-    const code = [...bytes].map((b) => REFERRAL_ALPHABET[b % REFERRAL_ALPHABET.length]).join('');
+  for (let i = 0; i < REFERRAL_CODE_TRIES; i++) {
+    const code = newReferralCode();
     await env.ADS_DB.prepare('INSERT OR IGNORE INTO referral_codes (code, sub) VALUES (?, ?)').bind(code, sub).run();
     const row = await env.ADS_DB.prepare('SELECT code FROM referral_codes WHERE sub = ?').bind(sub).first();
     if (row) return row.code;
   }
+  console.log('referral code: no free code after ' + REFERRAL_CODE_TRIES + ' tries');
   return null;
 }
 
@@ -3657,7 +3671,7 @@ async function handleReferralRedeem(env, request) {
   let body;
   try { body = await request.json(); } catch (e) { return textError(400, 'invalid JSON body'); }
   const code = String((body && body.code) || '').trim().toUpperCase().replace(/[\s-]/g, '');
-  if (!/^[A-Z2-9]{8}$/.test(code)) return textError(400, 'That invite code does not look right.');
+  if (!REFERRAL_CODE_RE.test(code)) return textError(400, 'That invite code does not look right.');
   const user = await getUser(env, sub);
   if (!user) return textError(401, 'sign-in required');
   if (Date.now() - (user.createdAt || 0) > REFERRAL_WINDOW_MS) return textError(409, 'Invite codes can only be added in an account\u2019s first 14 days.');
@@ -4116,13 +4130,45 @@ async function handleAlertDelete(env, request, id) {
 // sessionStorage only (cleared when the tab closes).
 const ADMIN_PAGE_SIZE = 30; // keeps GETs per request well under the free-plan subrequest cap
 
+// Who is calling. The ADMIN_TOKEN secret is the Super Admin. Every other admin has a token of their own, kept only as a hash in
+// the admins table (the Super Admin creates and revokes them on the Tools tab). adminWho remembers the caller per request, so
+// super-admin-only handlers and the audit log can tell who did what.
+const ADMIN_MAX = 20;
+const adminWho = new WeakMap();
+let adminsReady = null;
+function ensureAdmins(env) {
+  if (!adminsReady) {
+    adminsReady = env.ADS_DB.batch([
+      env.ADS_DB.prepare('CREATE TABLE IF NOT EXISTS admins (id TEXT PRIMARY KEY, name TEXT NOT NULL, token_hash TEXT NOT NULL UNIQUE, created_at INTEGER NOT NULL, created_by TEXT, revoked_at INTEGER, last_active INTEGER)')
+    ]).catch((e) => { adminsReady = null; throw e; });
+  }
+  return adminsReady;
+}
+function actorOf(request) { const w = adminWho.get(request); return w ? w.name : null; }
+function isSuperAdmin(request) { const w = adminWho.get(request); return !!w && w.role === 'super'; }
+
 async function adminAuthOk(env, request, providedOverride) {
   const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
   const rlKey = 'ratelimit:adminfail:' + ip;
   const fails = parseInt((await env.REPORTS.get(rlKey)) || '0', 10) || 0;
   if (fails >= 10) return 'limited';
   const provided = providedOverride || request.headers.get('X-Admin-Token') || '';
-  if (env.ADMIN_TOKEN && provided && timingSafeEqual(provided, env.ADMIN_TOKEN)) return 'ok';
+  if (env.ADMIN_TOKEN && provided && timingSafeEqual(provided, env.ADMIN_TOKEN)) {
+    adminWho.set(request, { role: 'super', name: 'Super Admin', id: null });
+    return 'ok';
+  }
+  if (provided && provided.length <= 200) {
+    try {
+      await ensureAdmins(env);
+      const row = await env.ADS_DB.prepare('SELECT id, name, last_active FROM admins WHERE token_hash = ? AND revoked_at IS NULL').bind(await sha256Hex(provided)).first();
+      if (row) {
+        const now = Date.now();
+        if (!row.last_active || now - row.last_active > 300000) await env.ADS_DB.prepare('UPDATE admins SET last_active = ? WHERE id = ?').bind(now, row.id).run();
+        adminWho.set(request, { role: 'admin', name: row.name, id: row.id });
+        return 'ok';
+      }
+    } catch (e) { console.log('admin lookup failed: ' + (e && e.message)); }
+  }
   await env.REPORTS.put(rlKey, String(fails + 1), { expirationTtl: 300 });
   return 'denied';
 }
@@ -4380,7 +4426,7 @@ async function handleAdminDismiss(env, request) {
     await unmirrorReport(env, key);
   }
   const km = key.match(REPORT_KEY_RE);
-  await audit(env, 'dismiss', km ? km[2] : ((key.match(REPORT_LEGACY_KEY_RE) || [])[1] || null));
+  await auditBy(env, request, 'dismiss', km ? km[2] : ((key.match(REPORT_LEGACY_KEY_RE) || [])[1] || null));
   return json({ ok: true });
 }
 
@@ -4481,7 +4527,7 @@ async function handleAdminRestore(env, request, slug) {
     await env.ADS_DB.prepare('INSERT OR REPLACE INTO published_notes (slug, author_sub, created_at) VALUES (?, ?, ?)')
       .bind(slug, meta.ownerSub, meta.createdAt || Date.now()).run();
   }
-  await audit(env, 'restore', slug, tsParam ? 'snapshot ' + tsParam : null);
+  await auditBy(env, request, 'restore', slug, tsParam ? 'snapshot ' + tsParam : null);
   return json({ ok: true });
 }
 
@@ -4707,11 +4753,59 @@ async function audit(env, action, slug, detail, extra) {
   } catch (e) { console.log('audit failed: ' + (e && e.message)); }
 }
 
-async function adminGate(env, request) {
+// Same as audit(), plus the admin who did it (shown in the Audit list).
+async function auditBy(env, request, action, slug, detail, extra) {
+  const by = actorOf(request);
+  return audit(env, action, slug, detail, by ? Object.assign({}, extra || {}, { by }) : extra);
+}
+
+async function adminGate(env, request, superOnly) {
   const auth = await adminAuthOk(env, request);
   if (auth === 'limited') return textError(429, 'too many failed attempts, try again in 5 minutes');
   if (auth !== 'ok') return textError(403, 'invalid admin token');
+  if (superOnly && !isSuperAdmin(request)) return textError(403, 'super admin only');
   return null;
+}
+
+// GET /admin/me: who the token belongs to (role and name), so the page can hide what an admin cannot do.
+async function handleAdminMe(env, request) {
+  const g = await adminGate(env, request); if (g) return g;
+  const w = adminWho.get(request);
+  return json({ ok: true, role: w.role, name: w.name });
+}
+
+// Super Admin only. GET lists the admins. POST {action: 'add', name} creates one and returns its token once (only a hash is kept);
+// POST {action: 'revoke', id} switches one off at once.
+async function handleAdminAdmins(env, request) {
+  const g = await adminGate(env, request, true); if (g) return g;
+  await ensureAdmins(env);
+  if (request.method === 'GET') {
+    const res = await env.ADS_DB.prepare('SELECT id, name, created_at, revoked_at, last_active FROM admins ORDER BY (revoked_at IS NOT NULL), created_at DESC').all();
+    return json({ ok: true, max: ADMIN_MAX, admins: (res.results || []).map((r) => ({ id: r.id, name: r.name, createdAt: r.created_at, revokedAt: r.revoked_at, lastActive: r.last_active })) });
+  }
+  const body = await adminBody(request);
+  if (body.action === 'add') {
+    const name = typeof body.name === 'string' ? body.name.trim().replace(/\s+/g, ' ') : '';
+    if (name.length < 1 || name.length > 30) return textError(400, 'name must be 1 to 30 characters');
+    if (name.toLowerCase() === 'super admin') return textError(400, 'that name is reserved');
+    const c = await env.ADS_DB.prepare('SELECT COUNT(*) AS n, SUM(lower(name) = ?) AS dup FROM admins WHERE revoked_at IS NULL').bind(name.toLowerCase()).first();
+    if (c && c.dup) return textError(400, 'an admin with that name already exists');
+    if (c && c.n >= ADMIN_MAX) return textError(400, 'admin limit reached');
+    const token = 'bba_' + newToken();
+    const id = crypto.randomUUID();
+    await env.ADS_DB.prepare('INSERT INTO admins (id, name, token_hash, created_at, created_by) VALUES (?, ?, ?, ?, ?)').bind(id, name, await sha256Hex(token), Date.now(), actorOf(request)).run();
+    await auditBy(env, request, 'admin_add', null, name);
+    return json({ ok: true, id, name, token });
+  }
+  if (body.action === 'revoke') {
+    const id = typeof body.id === 'string' ? body.id : '';
+    const row = await env.ADS_DB.prepare('SELECT name FROM admins WHERE id = ? AND revoked_at IS NULL').bind(id).first();
+    if (!row) return textError(404, 'not found');
+    await env.ADS_DB.prepare('UPDATE admins SET revoked_at = ? WHERE id = ?').bind(Date.now(), id).run();
+    await auditBy(env, request, 'admin_revoke', null, row.name);
+    return json({ ok: true });
+  }
+  return textError(400, 'unknown action');
 }
 // Author IDs are the public handle for an account, so admin searches accept them wherever a slug works.
 // adminAidQ: the lowercased ID if the text is one, else null. adminSubFromAid: its account sub, or null.
@@ -5060,7 +5154,7 @@ async function handleAdminOwnerAction(env, request) {
   if (action === 'suspend' || action === 'delete') await revokeAllSessions(env, sub);
   if (action === 'suspend' || action === 'delete') await syncReferralAccountState(env, sub, true);
   else if (action === 'unsuspend' || action === 'cancel-delete') await syncReferralAccountState(env, sub, !!(user.suspended || user.pendingDeletionAt));
-  await audit(env, 'owner_' + action, slug, reason || null);
+  await auditBy(env, request, 'owner_' + action, slug, reason || null);
   const ownerAlert = {
     'clear-picture': ['profile_picture', 'Your profile picture was removed. ' + alertReason(reason) + ' You can upload a new one. ' + ALERT_REPEAT_NOTE],
     'clear-name': ['profile_name', 'Your display name was removed. ' + alertReason(reason) + ' You can set a new one. ' + ALERT_REPEAT_NOTE],
@@ -5095,7 +5189,7 @@ async function handleAdminStrike(env, request) {
   if (action === 'excuse' && row.excused_at) return textError(409, 'already excused');
   if (action === 'restore' && !row.excused_at) return textError(409, 'not excused');
   await env.ADS_DB.prepare('UPDATE alerts SET excused_at = ? WHERE id = ? AND sub = ?').bind(action === 'excuse' ? Date.now() : null, id, sub).run();
-  await audit(env, 'strike_' + action, slug, (reason || '') + ' [' + id.slice(0, 8) + ']');
+  await auditBy(env, request, 'strike_' + action, slug, (reason || '') + ' [' + id.slice(0, 8) + ']');
   if (action === 'excuse') await createAlert(env, sub, 'excused', 'A strike on your account was excused and no longer counts against your ad access. ' + alertReason(reason));
   else await createAlert(env, sub, 'excused', 'A strike that had been excused was reinstated, so it counts toward your ad access again until it is 60 days old.');
   await maybeNotifyAdUnlock(env, sub, 0);
@@ -5131,7 +5225,7 @@ async function handleAdminReferral(env, request) {
     await env.ADS_DB.prepare('UPDATE referrals SET voided_at = NULL, void_reason = NULL WHERE referred_sub = ?').bind(referred).run();
   }
   const moved = await adjustReferralGift(env, row.referrer_sub, referred, action);
-  await audit(env, 'referral_' + action, slug, (reason || '') + (aid ? ' [' + aid.slice(0, 10) + ']' : '') + (moved ? ' (' + (action === 'void' ? '-' : '+') + moved + ' gift views)' : ''));
+  await auditBy(env, request, 'referral_' + action, slug, (reason || '') + (aid ? ' [' + aid.slice(0, 10) + ']' : '') + (moved ? ' (' + (action === 'void' ? '-' : '+') + moved + ' gift views)' : ''));
   await createAlert(env, row.referrer_sub, 'referral', action === 'void'
     ? 'A friend\u2019s invite no longer counts toward your ad access. ' + (moved ? 'The ' + fmtN(moved) + ' free views it gave you were taken back. ' : '') + alertReason(reason)
     : 'A friend\u2019s invite counts toward your ad access again.' + (moved ? ' Its ' + fmtN(moved) + ' free views are back in your balance.' : ''));
@@ -5167,7 +5261,7 @@ async function handleAdminStory(env, request) {
     delete meta.storyBlocked;
   } else return textError(400, 'invalid action');
   await putMeta(env, slug, meta);
-  await audit(env, 'story_' + body.action, slug, reason || null);
+  await auditBy(env, request, 'story_' + body.action, slug, reason || null);
   await createAlert(env, meta.ownerSub, 'story', body.action === 'remove'
     ? 'Your note ' + alertNoteName(meta, slug) + ' was removed from stories. ' + alertReason(reason) + ' Your note is still published. ' + ALERT_REPEAT_NOTE
     : 'Your note ' + alertNoteName(meta, slug) + ' can be shown in stories again.');
@@ -5285,7 +5379,7 @@ async function handleAdminAd(env, request) {
     console.log('admin ad action failed: ' + (e && e.message));
     return textError(500, 'ad action failed');
   }
-  await audit(env, 'ad_' + body.action, slug, [reason, refunded ? 'refunded ' + refunded : ''].filter(Boolean).join(' \u00b7 ') || null);
+  await auditBy(env, request, 'ad_' + body.action, slug, [reason, refunded ? 'refunded ' + refunded : ''].filter(Boolean).join(' \u00b7 ') || null);
   const adRefund = refunded ? ' ' + refunded + ' unused views were refunded to your balance.' : '';
   const adAlert = {
     pause: 'Your ad on /' + slug + ' was paused. ' + alertReason(reason) + ' ' + ALERT_REPEAT_NOTE,
@@ -5300,7 +5394,7 @@ async function handleAdminAd(env, request) {
 // POST /admin/ncmec {slug, reportId, note}: records that the page was reported to NCMEC.
 // Kept for the CSAM retention window, independently of the slug's own metadata.
 async function handleAdminNcmec(env, request) {
-  const g = await adminGate(env, request); if (g) return g;
+  const g = await adminGate(env, request, true); if (g) return g;
   const body = await adminBody(request);
   const slug = typeof body.slug === 'string' ? body.slug.toLowerCase() : '';
   if (!SLUG_RE.test(slug)) return textError(400, 'invalid slug');
@@ -5310,7 +5404,7 @@ async function handleAdminNcmec(env, request) {
   const list = (await getNcmec(env, slug)).slice(-19);
   list.push({ at: Date.now(), reportId: reportId || null, note: note || null });
   await env.SLUGS.put(NCMEC_PREFIX + slug, JSON.stringify(list), { expirationTtl: REPORT_DISMISSED_CSAM_TTL_S });
-  await audit(env, 'ncmec_recorded', slug);
+  await auditBy(env, request, 'ncmec_recorded', slug);
   return json({ ok: true, ncmec: list });
 }
 
@@ -5329,7 +5423,7 @@ async function handleAdminUndismiss(env, request) {
   delete rec.dismissedAt;
   await env.REPORTS.put(key, JSON.stringify(rec));
   await mirrorReport(env, key, rec);
-  await audit(env, 'undismiss', rec.slug || null);
+  await auditBy(env, request, 'undismiss', rec.slug || null);
   return json({ ok: true });
 }
 
@@ -5527,6 +5621,7 @@ async function handleAdminCustomAlert(env, request) {
   const count = row ? row.n : 0;
   if (body.preview === true && body.list === true) return json(await caRecipientPage(env, a.sql, a.bind, count, body));
   if (body.preview === true) return json({ ok: true, count, unknown: a.unknown || [] });
+  if (!isSuperAdmin(request)) return textError(403, 'super admin only');
   const message = typeof body.message === 'string' ? normalizeAlertMessage(body.message) : '';
   const cls = typeof body.classification === 'string' ? body.classification : '';
   if (!message) return textError(400, 'message required');
@@ -5542,7 +5637,7 @@ async function handleAdminCustomAlert(env, request) {
     'INSERT INTO alerts (id, sub, kind, message, ref, created_at) SELECT ' + ALERT_ID_SQL + ', s, ?, ?, ?, ? FROM (' + a.sql + ')'
   ).bind(CUSTOM_ALERT_KIND, message, 'custom:' + cls, ts, ...a.bind).run();
   const sent = (r && r.meta && r.meta.changes) || count;
-  await audit(env, 'custom_alert', null, message, { cls, aud: a.code, n: sent, ts });
+  await auditBy(env, request, 'custom_alert', null, message, { cls, aud: a.code, n: sent, ts });
   return json({ ok: true, sent });
 }
 
@@ -5635,7 +5730,7 @@ function legalEffectiveIso(html) {
 // POST /admin/legal {kind, resend: true, version}: send the alert for the live version when publishing it saved the text but the
 // alert insert failed (its history row has a message and no sent count). Accounts that already have this alert are skipped, so a
 // retry after a half-finished send never doubles up. New rows are stamped now, not backdated, so they count as unread.
-async function legalResend(env, kind, body, read) {
+async function legalResend(env, request, kind, body, read) {
   const version = body.version;
   if (!Number.isInteger(version) || version < 1) return textError(400, 'version required');
   const cur = await read(kind);
@@ -5657,8 +5752,8 @@ async function legalResend(env, kind, body, read) {
     sent = t ? t.n : added;
     await env.ADS_DB.prepare('UPDATE legal_history SET sent = ? WHERE kind = ? AND version = ? AND sent IS NULL').bind(sent, kind, version).run();
   } catch (e) { alertFailed = true; console.log('policy alert retry failed: ' + (e && e.message)); }
-  await audit(env, 'legal_update', null, LEGAL_KINDS[kind] + ' v' + version + (alertFailed ? ', alert failed again' : ', alert sent to ' + sent + ' (retry)'), { lk: kind, lv: version });
-  if (!alertFailed && added) await audit(env, 'custom_alert', null, h.message, { cls: 'policy', aud: 'all', n: added, ts: now });
+  await auditBy(env, request, 'legal_update', null, LEGAL_KINDS[kind] + ' v' + version + (alertFailed ? ', alert failed again' : ', alert sent to ' + sent + ' (retry)'), { lk: kind, lv: version });
+  if (!alertFailed && added) await auditBy(env, request, 'custom_alert', null, h.message, { cls: 'policy', aud: 'all', n: added, ts: now });
   return json({ ok: true, kind, version, sent, alertFailed });
 }
 
@@ -5676,7 +5771,7 @@ async function handleLegalGet(env, kind) {
 // started from; if someone published since, nothing is written (409). With notify, every account gets an alert (class "policy")
 // saying so, and it is listed in Audit like any other sent alert; the app picks the new text up the next time it shows that document.
 async function handleAdminLegal(env, request, url) {
-  const g = await adminGate(env, request); if (g) return g;
+  const g = await adminGate(env, request, request.method !== 'GET'); if (g) return g;
   await ensureLegal(env);
   const read = (kind) => env.ADS_DB.prepare('SELECT html, version, updated_at FROM legal_docs WHERE kind = ?').bind(kind).first();
   if (request.method === 'GET') {
@@ -5706,7 +5801,7 @@ async function handleAdminLegal(env, request, url) {
   const body = await adminBody(request);
   const kind = body && body.kind;
   if (!legalKindOk(kind)) return textError(400, 'unknown document');
-  if (body.resend === true) return legalResend(env, kind, body, read);
+  if (body.resend === true) return legalResend(env, request, kind, body, read);
   const input = typeof body.html === 'string' ? body.html.trim() : '';
   if (!input || !legalBody(input)) return textError(400, 'text required');
   const now = Date.now();
@@ -5757,9 +5852,9 @@ async function handleAdminLegal(env, request, url) {
     } catch (e) { alertFailed = true; console.log('policy alert failed: ' + (e && e.message)); }
   }
   try { await env.ADS_DB.prepare('DELETE FROM legal_history WHERE kind = ? AND version <= ?').bind(kind, version - LEGAL_HISTORY_KEEP).run(); } catch (e) {}
-  await audit(env, 'legal_update', null, LEGAL_KINDS[kind] + ' v' + version + (fromVersion != null ? ' (restored from v' + fromVersion + ')' : '') + (!message ? ', no alert' : alertFailed ? ', alert failed' : ', alert sent to ' + sent), { lk: kind, lv: version });
+  await auditBy(env, request, 'legal_update', null, LEGAL_KINDS[kind] + ' v' + version + (fromVersion != null ? ' (restored from v' + fromVersion + ')' : '') + (!message ? ', no alert' : alertFailed ? ', alert failed' : ', alert sent to ' + sent), { lk: kind, lv: version });
   // The alert itself is listed under Sent alerts (with its text and recipients), the same as one written on the Alerts screen.
-  if (message && !alertFailed) await audit(env, 'custom_alert', null, message, { cls: 'policy', aud: 'all', n: sent, ts: now });
+  if (message && !alertFailed) await auditBy(env, request, 'custom_alert', null, message, { cls: 'policy', aud: 'all', n: sent, ts: now });
   return json({ ok: true, kind, version, updatedAt: now, sent, alertFailed });
 }
 
@@ -6260,7 +6355,8 @@ const ADMIN_PAGE_HTML = `<!doctype html><html lang="en"><head><meta charset="utf
 html{color-scheme:dark}
 body{margin:0;background:var(--bg);color:var(--text);font:15px/1.45 var(--font);-webkit-font-smoothing:antialiased;overflow-x:hidden}
 body[data-alert=csam]{--glow:rgba(255,77,109,.26)}
-body[data-auth=out] #app{display:none}
+body[data-auth=out] #app,body[data-auth=out] .sheet-back{display:none}
+body[data-role=admin] .fo{display:none}
 body[data-auth=in] #login{display:none}
 button,input,select{font:inherit;color:inherit}
 button{cursor:pointer}
@@ -6531,6 +6627,7 @@ main{position:relative;z-index:1;max-width:720px;margin:0 auto;padding:2px 16px 
 @supports (text-box:trim-both cap alphabetic){.pgrow .lk .n{text-box:trim-both cap alphabetic}}
 
 .snaps{margin-top:14px;padding:2px 14px;border-radius:14px;background:var(--well)}
+.snaps .filters{margin:0 -14px 10px;padding:4px 14px 6px}
 .snap-row{padding:12px 0;border-top:1px solid var(--line)}
 .snap-row:first-child{border-top:0}
 .snap-line{display:flex;flex-wrap:wrap;align-items:center;gap:8px}
@@ -6558,7 +6655,7 @@ main{position:relative;z-index:1;max-width:720px;margin:0 auto;padding:2px 16px 
 .log-main{display:flex;flex-direction:column;align-items:flex-start;gap:4px;margin-top:10px}
 .log-main .det{color:var(--muted);font-size:14px;word-break:break-word;white-space:pre-wrap}
 .log-meta{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}
-.log-when{margin-top:8px;font-size:12.5px;color:var(--faint)}
+.log-when,.log-by{margin-top:8px;font-size:12.5px;color:var(--faint)}
 .fab{position:fixed;z-index:25;right:max(16px,calc((100vw - 720px)/2 + 16px));bottom:calc(92px + env(safe-area-inset-bottom,0px));width:56px;height:56px;padding:0;border:0;border-radius:20px;background:linear-gradient(180deg,#A0AEFF,#7F90FF);color:var(--accent-ink);box-shadow:0 12px 28px -6px rgba(127,144,255,.55),0 2px 8px rgba(2,3,18,.5);transition:transform .15s,filter .15s}
 .fab:not([hidden]){display:grid;place-items:center;animation:fade .22s ease both}
 .fab:active{transform:scale(.94);filter:brightness(1.1)}
@@ -6674,7 +6771,7 @@ select.field::-ms-expand{display:none}
 .sheet-top{flex:none;margin:0 0 6px;padding:0 0 12px;border-bottom:1px solid var(--line)}
 .sheet-top .ptitle{margin:0 0 4px}
 .sheet-top .search{margin:10px 0 0}
-.sheet-top .filters{margin:8px 0 0;padding:0 0 2px}
+.sheet-top .filters{margin:8px -22px 0;padding:0 22px 2px}
 .rsub,.rcnt{font-size:13px;color:var(--muted)}
 .rsub:empty,.rcnt:empty,.rchk:empty{display:none}
 .rsub{margin:0 0 2px}
@@ -6723,11 +6820,18 @@ body[data-auth=out] #msg{bottom:calc(24px + env(safe-area-inset-bottom,0px))}
 /* sheets */
 .sheet-back{--o:0;--y:36px;position:fixed;inset:0;z-index:60;display:flex;align-items:flex-end;justify-content:center;padding:0 8px calc(8px + env(safe-area-inset-bottom,0px));background:rgba(4,5,20,.64);-webkit-backdrop-filter:blur(6px);backdrop-filter:blur(6px);opacity:var(--o);transition:opacity .22s}
 .sheet-back.open{--o:1;--y:0px}
+html:has(.sheet-back){overflow:hidden}
 .sheet{display:flex;flex-direction:column;width:100%;max-width:520px;max-height:88vh;max-height:88dvh;padding:10px 22px 22px;border-radius:30px;border:1px solid var(--line2);background:linear-gradient(180deg,rgba(255,255,255,.06),rgba(255,255,255,.02)),var(--s1);box-shadow:0 30px 70px -10px rgba(2,3,18,.9);transform:translateY(var(--y));transition:transform .3s cubic-bezier(.2,.9,.25,1)}
 .grab{flex:none;width:38px;height:5px;border-radius:3px;background:var(--s3);margin:0 auto 18px}
 .sheet .tile{margin-bottom:14px}
 .sheet h2{margin:0;font-size:24px;line-height:1.15;font-weight:750;letter-spacing:-.025em;word-break:break-word}
-.sheet-text{margin:8px 0 20px;color:var(--muted);white-space:pre-wrap;font-size:15px}
+.sheet-text{margin:8px 0 20px;color:var(--muted);white-space:pre-wrap;overflow-wrap:anywhere;font-size:15px}
+.adm-row{display:flex;align-items:center;gap:12px;padding:12px 0;border-top:1px solid var(--line)}
+.adm-row:first-child{border-top:0}
+.adm-row.off{opacity:.55}
+.adm-main{flex:1;min-width:0;display:flex;flex-direction:column;gap:2px}
+.adm-main small{color:var(--faint);font-size:12.5px}
+.adm-row .btn{flex:none}
 .sheet-field{display:block;margin:0 0 14px}
 .sheet-field span{display:block;margin:0 2px 6px;font-size:13px;font-weight:600;color:var(--muted)}
 .sheet-body{flex:1 1 auto;min-height:0;overflow-y:auto;overscroll-behavior:contain}
@@ -6752,7 +6856,7 @@ body[data-auth=out] #msg{bottom:calc(24px + env(safe-area-inset-bottom,0px))}
 .lge-pane{padding-top:4px}
 .lge-pane .tog{border-top:0;padding-top:4px}
 .coc-tags{position:sticky;top:0;z-index:2;display:flex;flex-wrap:nowrap;gap:5px;margin:0 -22px 6px;padding:8px 22px 10px;background:linear-gradient(180deg,#242742,#242742 80%,rgba(36,39,66,0))}
-.coc-tags button{flex:1 1 auto;min-width:0;appearance:none;-webkit-appearance:none;cursor:pointer;padding:6px 4px;text-align:center;white-space:nowrap;border-radius:999px;background:var(--s2);border:1px solid var(--line2);color:var(--text);font:inherit;font-size:12.5px;font-weight:700;transition:transform .12s,filter .15s}
+.coc-tags button{flex:1 1 auto;min-width:0;appearance:none;-webkit-appearance:none;cursor:pointer;padding:6px 4px;text-align:center;white-space:nowrap;border-radius:999px;background:var(--s2);border:1px solid var(--line2);color:var(--text);font:inherit;font-size:clamp(10px,3.6vw,12.5px);font-weight:700;transition:transform .12s,filter .15s}
 .coc-tags button:active{transform:scale(.95);filter:brightness(1.2)}
 .coc-sec{margin:0 0 12px;padding:14px 15px 10px;border-radius:18px;border:1px solid var(--line);background:var(--well)}
 .coc-sec{transition:border-color .3s,box-shadow .3s}
@@ -6780,7 +6884,7 @@ body[data-auth=out] #msg{bottom:calc(24px + env(safe-area-inset-bottom,0px))}
     <p style="--i:2">Sign in with your admin token to review reports and manage pages.</p>
     <input class="field" id="tok" type="password" placeholder="Admin token" autocomplete="off" autocapitalize="off" spellcheck="false" style="--i:3">
     <button class="btn primary block" id="go" style="--i:4">Sign in</button>
-    <div class="fine" style="--i:5">The token stays in this tab only and is cleared when the tab closes.</div>
+    <div class="fine" style="--i:5">You'll need to enter the token again after refreshing this page or leaving it for 30 seconds or more.</div>
     <div class="fine" style="--i:6">Bluebook by Essential Software</div>
   </div></div>
 </div>
@@ -6936,7 +7040,12 @@ body[data-auth=out] #msg{bottom:calc(24px + env(safe-area-inset-bottom,0px))}
     </div>
 
     <div id="p-tools" class="pnl">
-      <div class="card static">
+      <div class="card static fo">
+        <div class="sec-head"><span class="tile sev-ad"><span class="ico" data-i="users"></span></span><div><div class="card-t">Admins</div><div class="card-s">Give someone their own token to handle reports, takedowns, lookups and ads. Revoke it any time.</div></div></div>
+        <div id="admlist"></div>
+        <button class="btn primary block" id="admadd" style="margin-top:12px">Add admin</button>
+      </div>
+      <div class="card static fo">
         <div class="sec-head"><span class="tile sev-other"><span class="ico" data-i="shield"></span></span><div><div class="card-t">Terms &amp; Privacy Policy</div><div class="card-s">Preview what the app shows, edit it here, and alert everyone when it changes.</div></div></div>
         <div class="alrow sev-ad" id="lgsel"></div>
         <div class="card-s" id="lgmeta" style="margin:10px 2px 12px">Loading...</div>
@@ -6961,16 +7070,17 @@ body[data-auth=out] #msg{bottom:calc(24px + env(safe-area-inset-bottom,0px))}
         <div class="search"><input class="field" id="relslug" placeholder="Slug or link" autocomplete="off" autocapitalize="off" spellcheck="false"></div>
         <button class="btn block" id="relgo">Release slug</button>
       </div>
-      <div class="card static">
+      <div class="card static fo">
         <div class="sec-head"><span class="tile sev-csam"><span class="ico" data-i="trash"></span></span><div><div class="card-t">Purge</div><div class="card-s">The same jobs the cron runs: deletes expired unpublished pages, accounts past their deletion window, stale like/follow timestamps, unreferenced backup images, and old presence, alert, activity and report-index records.</div></div></div>
         <button class="btn danger block" id="purgego">Run purge now</button>
       </div>
+      <div class="fine" id="whoami" style="text-align:center"></div>
       <div class="tools-foot">Authorized Personnel<br>Only</div>
       <div class="tools-copy">&copy; 2026 Essential Software</div>
       <div class="tools-copy tools-ver">v8.10.2026-release</div>
     </div>
   </main>
-  <button type="button" class="fab" id="alfab" aria-label="Send a custom alert" hidden><span class="ico" data-i="bell"></span></button>
+  <button type="button" class="fab fo" id="alfab" aria-label="Send a custom alert" hidden><span class="ico" data-i="bell"></span></button>
 
   <div class="dock"><nav class="nav" aria-label="Sections">
     <i class="pill" id="pill"></i>
@@ -7074,8 +7184,11 @@ function setFrame(f,t){var g=f._g=(f._g||0)+1;f._t=t;buildDoc(t).then(function(d
 function refreshFrames(){document.querySelectorAll('iframe').forEach(function(f){if(f._t!=null)setFrame(f,f._t)})}
 
 /* ---------- Core state and helpers ---------- */
-var tok=sessionStorage.getItem('adm')||'',next=null,all=[],cur='reports',adCur='',adTotal=0,auNext=null,auAll=[],auFilter='',lkSlug='',lkOwner=false,lkShown='',lkGen=0,navI=(history.state&&history.state.i)||0,navLog=[],sheetH=false,ignorePop=false,openSet={},mt=null,recents=[],curSheet=null,repSub='',fullBusy=false,rIdx=false,rAgg=null,rGen=0,reindexing=false,qT=null;
+var tok='',next=null,all=[],cur='reports',adCur='',adTotal=0,auNext=null,auAll=[],auFilter='',lkSlug='',lkOwner=false,lkShown='',lkGen=0,navI=(history.state&&history.state.i)||0,navLog=[],sheetH=false,ignorePop=false,openSet={},mt=null,recents=[],curSheet=null,repSub='',fullBusy=false,rIdx=false,rAgg=null,rGen=0,reindexing=false,qT=null;
 var TABS=['overview','reports','lookup','ads','audit','tools','alerts'];
+// Who is signed in: the Super Admin (the ADMIN_TOKEN secret) or an admin with a token of their own. The server enforces what admins may do; this hides it from them.
+var ME={role:'',name:''};
+function setRole(j){ME={role:j.role,name:j.name};document.body.dataset.role=j.role;$('whoami').textContent='Signed in as '+j.name+(j.role==='super'?'':' (admin)')}
 var TITLES={overview:'Overview',reports:'Reports',lookup:'Lookup',ads:'Ads',audit:'Audit',tools:'Tools',alerts:'Custom alerts'};
 var SUBS={overview:'Trends over time, totals and directories',lookup:'Find a page, its owner and history',ads:'Campaigns running on published pages',audit:'Every admin action, newest first',tools:'Previews and maintenance',alerts:'Send a message to accounts'};
 function parseNav(h){
@@ -7133,7 +7246,7 @@ function dayLabel(t){var d=new Date(tzShift(t)),n=new Date(tzShift(Date.now())),
 function msg(t,k,act){
   var m=$('msg');clearTimeout(mt);if(!m._top){m._top=1;if(m.showPopover){m.setAttribute('popover','manual');try{m.showPopover()}catch(e){}}}
   if(!t){m.className='';m.textContent='';return}
-  t=String(t).replace(/[.\\s]+$/,'');t=t.charAt(0).toUpperCase()+t.slice(1);
+  t=String(t).replace(/[.\\s]+$/,'');if(/[.!?] /.test(t)&&!/[.!?]$/.test(t))t+='.';t=t.charAt(0).toUpperCase()+t.slice(1);
   k=k||(/fail|error|invalid|denied|too many|not live|enter a slug|enter your|cannot|could not|required|not authorized|turn on/i.test(t)?'err':'ok');
   m.textContent=t;m.className='show '+k;
   if(act){var b=el('button','lnk',act.label);b.type='button';b.onclick=function(e){e.stopPropagation();m.className='';act.fn()};m.appendChild(b)}
@@ -7386,6 +7499,7 @@ function xHintAll(){[].forEach.call(document.querySelectorAll('.filters,.qkeys,.
   xHint(e)})}
 window.addEventListener('resize',xHintAll);
 function showTab(t){
+  if(t==='alerts'&&ME.role!=='super')t='reports';
   cur=t;
   TABS.forEach(function(n){$('p-'+n).classList.toggle('on',n===t)});
   [].forEach.call(document.querySelectorAll('.tab'),function(b){if(b.getAttribute('data-t')===(t==='alerts'?'tools':t))b.setAttribute('aria-current','page');else b.removeAttribute('aria-current')});
@@ -7398,7 +7512,7 @@ function showTab(t){
   if(t==='overview'){if(!ovS.loaded){ovS.loaded=true;loadOverview();ovList(true)}else if(fresh('ov')){loadOverview(true);trLoad(true);ovList(true,true)}}
   if(t==='ads'){if(!$('adlist').firstChild)loadAds(true);else if(fresh('ads'))loadAds(true,true)}
   if(t==='audit'){if(!auAll.length&&!$('aulist').firstChild)loadAudit(true);else if(fresh('audit'))loadAudit(true,true)}
-  if(t==='tools'){lgLoad();if(fresh('lg'))lgWarm(true)}
+  if(t==='tools'){lgLoad();if(fresh('lg'))lgWarm(true);if(ME.role==='super')admLoad()}
   requestAnimationFrame(xHintAll)
 }
 function goTab(t){showTab(t);navPush();window.scrollTo(0,0)}
@@ -7440,6 +7554,11 @@ function warmTabs(){
 // what to do next; errMsg puts it after what was being attempted; showErr shows it as an error toast.
 var ERR_TXT={
   'sign-in required':'You are signed out. Sign in again.',
+  'super admin only':'Only the Super Admin can do that.',
+  'name must be 1 to 30 characters':'The name must be 1 to 30 characters.',
+  'that name is reserved':'That name is reserved. Choose another one.',
+  'an admin with that name already exists':'An admin with that name already exists.',
+  'admin limit reached':'The admin limit is reached. Revoke one first.',
   'invalid admin token':'The admin token was not accepted. Check it and sign in again.',
   'invalid token':'The admin token was not accepted. Check it and sign in again.',
   'missing token':'No admin token was sent. Sign in again.',
@@ -7514,7 +7633,47 @@ function errAny(){var t=Date.now();if(t-errAt<3000)return;errAt=t;msg('Something
 function netFail(e){if(e&&e._shown)return;errAny()}
 window.addEventListener('error',function(e){if(/ResizeObserver|Script error/i.test(String(e&&e.message)))return;errAny()});
 window.addEventListener('unhandledrejection',function(e){var r=e&&e.reason;if(r&&r._shown)return;errAny()});
-function bad(o,what){if(o.s===403||o.s===429){sessionStorage.removeItem('adm');loggedIn(false)}showErr(o,what)}
+function bad(o,what){if((o.s===403&&!(o.j&&o.j.error==='super admin only'))||o.s===429)loggedIn(false);showErr(o,what)}
+
+/* ---------- Admins (Super Admin only) ---------- */
+function admLoad(){
+  var L=$('admlist');if(!L.firstChild)skel(L,2,'row');
+  return api('/admin/admins').then(function(o){
+    L.textContent='';
+    if(!o.ok){bad(o,'Could not load the admins');return}
+    $('admadd').disabled=o.j.admins.filter(function(a){return!a.revokedAt}).length>=o.j.max;
+    if(!o.j.admins.length){L.appendChild(el('div','card-s','No admins yet. Only you can sign in.'));return}
+    o.j.admins.forEach(function(a){
+      var r=el('div','adm-row'+(a.revokedAt?' off':'')),m=el('div','adm-main');
+      m.appendChild(el('b',null,a.name));
+      m.appendChild(el('small',null,a.revokedAt?'Revoked '+fmt(a.revokedAt):'Added '+fmtD(a.createdAt)+' - '+(a.lastActive?'active '+ago(a.lastActive):'never signed in')));
+      r.appendChild(m);
+      if(!a.revokedAt)r.appendChild(btn('Revoke','quiet',function(){return admRevoke(a)}));
+      L.appendChild(r)
+    })
+  },function(e){L.textContent='';netFail(e)})
+}
+function admAdd(){
+  return ask({title:'Add admin',text:'Admins can handle reports, takedowns, lookups and ads. They cannot send alerts, change the policies, purge, record NCMEC reports or manage admins. You get their token once, to pass on privately.',ok:'Create token',fields:[{label:'Name',ph:'Their name',max:30}]}).then(function(v){
+    if(!v)return;
+    return api('/admin/admins',{method:'POST',body:{action:'add',name:v[0]}}).then(function(o){
+      if(!o.ok){showErr(o,'Could not add the admin');return}
+      admLoad();
+      var t=o.j.token;
+      return ask({title:'Token for '+o.j.name,text:t+NL+NL+'This is the only time it is shown. Copy it now and send it to them privately.',ok:'Copy token',single:true}).then(function(){
+        try{navigator.clipboard.writeText(t).then(function(){msg('Token copied','ok')},function(){msg('Could not copy the token. Revoke this admin and add them again to get a new one.','err')})}catch(e){msg('Could not copy the token. Revoke this admin and add them again to get a new one.','err')}
+      })
+    }).catch(function(e){netFail(e)})
+  })
+}
+function admRevoke(a){
+  return ask({title:'Revoke '+a.name+'?',text:'Their token stops working straight away. You can add them again later with a new token.',ok:'Revoke',danger:true}).then(function(ok){
+    if(!ok)return;
+    return api('/admin/admins',{method:'POST',body:{action:'revoke',id:a.id}}).then(function(o){
+      if(o.ok){msg('Revoked '+a.name,'ok');admLoad()}else showErr(o,'Could not revoke '+a.name)
+    }).catch(function(e){netFail(e)})
+  })
+}
 
 /* ---------- Reports ---------- */
 function fqv(){return $('fq').value.trim().toLowerCase().replace(/^\\/?@?/,'')}
@@ -7552,7 +7711,7 @@ function loadReports(reset){
     if(g!==rGen)return;
     unskel(L);moreBusy($('more'),false);
     if(!o.ok){bad(o,'Could not load reports');return}
-    sessionStorage.setItem('adm',tok);if(document.body.dataset.auth!=='in'){msg('');loggedIn(true)}
+    if(document.body.dataset.auth!=='in'){msg('');loggedIn(true)}
     rIdx=o.j.indexed===true;
     if(o.j.agg||reset)rAgg=o.j.agg||null;
     all=all.concat(o.j.reports);next=o.j.nextCursor;
@@ -7685,7 +7844,7 @@ function renderGroup(g){
   var foot=card.foot;
   if(first.status==='live'){foot.appendChild(btn('Take down','destroy',function(){return takedown(g.slug,csam,done)}));if(!csam)foot.appendChild(btn('Release slug',null,function(){return release(g.slug,function(){done('unpublished')})}))}
   if(first.status==='taken down')foot.appendChild(btn('Restore',null,function(){return restore(g.slug,csam,0,done)}));
-  if(csam)foot.appendChild(btn(nc?'Add NCMEC record':'Record NCMEC report',null,function(){return recordNcmec(g.slug,function(){all.forEach(function(r){if(r.slug===g.slug)r.ncmec={at:Date.now()}});renderAll()})}));
+  if(csam&&ME.role==='super')foot.appendChild(btn(nc?'Add NCMEC record':'Record NCMEC report',null,function(){return recordNcmec(g.slug,function(){all.forEach(function(r){if(r.slug===g.slug)r.ncmec={at:Date.now()}});renderAll()})}));
   if($('fdis').checked)foot.appendChild(btn('Undo dismiss',null,function(b){undismiss(g,b)}));
   else foot.appendChild(btn('Dismiss',null,function(){dismissGroup(g,csam,nc,card.c)}));
   $('list').appendChild(card.c)
@@ -7814,7 +7973,7 @@ function mkSnaps(slug,status,hitTs,card,csam,done){
         sl.appendChild(pb);sl.appendChild(ico('chev'));fb.appendChild(sl);box.appendChild(fb);box.appendChild(pw)
       }
       box.appendChild(list);draw();
-      card.appendChild(box);
+      card.appendChild(box);xHintAll();
       if(box.scrollIntoView)box.scrollIntoView({behavior:'smooth',block:'start'})
     }).catch(function(e){t.disabled=false;netFail(e)})
   });
@@ -7899,7 +8058,7 @@ function renderLookup(d){
     if(d.showInStories)foot.appendChild(btn('Remove from stories',null,function(){return storyAct(d.slug,'remove',refresh)}))}
   if(d.storyBlocked)foot.appendChild(btn('Allow stories again',null,function(){return storyAct(d.slug,'allow',refresh)}));
   if(d.status==='taken down')foot.appendChild(btn('Restore',null,function(){return restore(d.slug,d.csamHold,0,refresh)}));
-  if(d.csamHold||d.reports)foot.appendChild(btn(d.ncmec.length?'Add NCMEC record':'Record NCMEC report',null,function(){return recordNcmec(d.slug,refresh)}));
+  if((d.csamHold||d.reports)&&ME.role==='super')foot.appendChild(btn(d.ncmec.length?'Add NCMEC record':'Record NCMEC report',null,function(){return recordNcmec(d.slug,refresh)}));
   out.appendChild(c);
   if(foot.children.length)c.appendChild(foot)
 }
@@ -8186,12 +8345,12 @@ function renderAd(a){
 }
 
 /* ---------- Audit ---------- */
-var ACT_LBL={takedown:'Takedown',release:'Release',restore:'Restore',dismiss:'Dismiss',undismiss:'Undismiss',purge:'Purge',ncmec_recorded:'NCMEC recorded',owner_suspend:'Suspend account',owner_unsuspend:'Unsuspend account',owner_delete:'Delete account','owner_cancel-delete':'Cancel deletion','owner_clear-name':'Clear name','owner_clear-picture':'Clear picture',story_remove:'Story removed',story_allow:'Story allowed',strike_excuse:'Strike excused',strike_restore:'Strike reinstated',referral_void:'Referral voided',referral_restore:'Referral restored',ad_pause:'Ad paused',ad_resume:'Ad resumed',ad_takedown:'Ad taken down',ad_refund:'Ad refunded',custom_alert:'Custom alert',legal_update:'Policy update'};
+var ACT_LBL={takedown:'Takedown',release:'Release',restore:'Restore',dismiss:'Dismiss',undismiss:'Undismiss',purge:'Purge',ncmec_recorded:'NCMEC recorded',owner_suspend:'Suspend account',owner_unsuspend:'Unsuspend account',owner_delete:'Delete account','owner_cancel-delete':'Cancel deletion','owner_clear-name':'Clear name','owner_clear-picture':'Clear picture',story_remove:'Story removed',story_allow:'Story allowed',strike_excuse:'Strike excused',strike_restore:'Strike reinstated',referral_void:'Referral voided',referral_restore:'Referral restored',ad_pause:'Ad paused',ad_resume:'Ad resumed',ad_takedown:'Ad taken down',ad_refund:'Ad refunded',custom_alert:'Custom alert',legal_update:'Policy update',admin_add:'Admin added',admin_revoke:'Admin revoked'};
 function actLbl(a){a=String(a||'');if(ACT_LBL[a])return ACT_LBL[a];a=a.replace(/[_-]+/g,' ').trim();return a.charAt(0).toUpperCase()+a.slice(1)}
-function actTone(a){a=String(a||'');if(/take|purge|suspend|delete|ban/.test(a)&&!/unsuspend|cancel/.test(a))return'bad';if(/restore|release|unsuspend|cancel|allow|refund|resume/.test(a))return'good';return''}
+function actTone(a){a=String(a||'');if(/take|purge|suspend|delete|ban|revoke/.test(a)&&!/unsuspend|cancel/.test(a))return'bad';if(/restore|release|unsuspend|cancel|allow|refund|resume/.test(a))return'good';return''}
 var auT=null,auBusy=false;
 function auqv(){return $('auq').value.trim().toLowerCase().replace(/^[/@]+/,'')}
-function auHit(e,q){if(isAid(q))return!!(aidMap[q]&&aidMap[q].set[e.slug]);return!q||String(e.slug||'').toLowerCase().indexOf(q)>-1||String(e.detail||'').toLowerCase().indexOf(q)>-1||String(e.cls||'').indexOf(q)>-1}
+function auHit(e,q){if(isAid(q))return!!(aidMap[q]&&aidMap[q].set[e.slug]);return!q||String(e.slug||'').toLowerCase().indexOf(q)>-1||String(e.detail||'').toLowerCase().indexOf(q)>-1||String(e.cls||'').indexOf(q)>-1||String((e.by||'')).toLowerCase().indexOf(q)>-1}
 // The log pages from KV with no server-side search, so a query also pulls in a few older pages (3) to search them.
 function auSearch(){
   var av=auqv();if(isAid(av)&&!aidMap[av])aidResolve(av).then(function(){if(auqv()===av)renderAudit()},function(){});
@@ -8305,6 +8464,7 @@ function renderAudit(){
       d.appendChild(main);
       if(e.action==='legal_update'&&e.lk&&e.lv){var vb=btn('View changes','quiet',function(){lgVerSheet(e.lk,e.lv)});vb.style.marginTop='8px';d.appendChild(vb)}
     }
+    if(e.by)d.appendChild(el('div','log-by','By '+e.by));
     L.appendChild(d)
   });
   if(!L.firstChild){
@@ -9039,7 +9199,7 @@ function recipSheet(o){
   sb.appendChild(list);
   var more=btn('Load more','block more',function(){return load(false)});more.hidden=true;sb.appendChild(more);sb.appendChild(note);
   var acts=el('div','sheet-actions');acts.appendChild(btn('Close','quiet block',function(){fin()}));sh.appendChild(acts);
-  back.appendChild(sh);document.body.appendChild(back);clearable(inp);
+  back.appendChild(sh);document.body.appendChild(back);xHintAll();clearable(inp);
   function setCnt(){cnt.textContent=q?num(found)+(found===1?' match':' matches')+' among '+num(total)+' recipient'+(total===1?'':'s'):'Showing '+num(shown)+' of '+num(total)}
   function load(first){
     var gg=++g;
@@ -10042,7 +10202,7 @@ $('rf').onclick=function(){
   else if(cur==='audit')loadAudit(true)
 };
 $('so').onclick=function(){
-  sessionStorage.removeItem('adm');tok='';all=[];next=null;rIdx=false;rAgg=null;rGen++;navLog=[];lkSlug='';lkOwner=false;cur='reports';openSet={};auAll=[];auFilter='';recents=[];repSub='';
+  tok='';ME={role:'',name:''};delete document.body.dataset.role;all=[];next=null;rIdx=false;rAgg=null;rGen++;navLog=[];lkSlug='';lkOwner=false;cur='reports';openSet={};auAll=[];auFilter='';recents=[];repSub='';
   ['list','lkowner','adlist','aulist','aukeys','qbar','qkeys','ovstats','ovlist','trchart','trleg','trrows','rpbox'].forEach(function(i){$(i).textContent=''});trS.data=null;trS.M=null;trS.end=null;trS.gen++;
   ovS.loaded=false;ovS.view='users';ovS.q='';ovS.fil='';ovPerReset('ovsign','ovcper','ovcbox');ovPerReset('ovseen','ovsper','ovsbox');ovPerReset('ovpub','ovpper','ovpbox');ovS.sort='new';ovS.nsort='new';ovS.gen++;$('ovq').value='';pickSet('ovsort','new');pickSet('ovfilter','');pickSet('ovnsort','new');$('ovcount').textContent='';$('ovnote').textContent='';ovSync();
   $('queue').hidden=true;$('freason').value='';$('fq').value='';$('adq').value='';$('auq').value='';perReset('audit','auper','aubox');perReset('reports','repper','repbox');perReset('adstart','adper','adbox');aidMap={};lkAid='';
@@ -10053,7 +10213,12 @@ $('go').onclick=function(){
   var v=$('tok').value.trim();
   if(!v){msg('Enter your admin token');return}
   tok=v;var b=$('go');b.disabled=true;b.textContent='Checking';
-  loadReports(true).then(function(){b.disabled=false;b.textContent='Sign in'})
+  var back=function(){b.disabled=false;b.textContent='Sign in'};
+  api('/admin/me').then(function(o){
+    if(!o.ok){back();bad(o,'Could not sign in');return}
+    setRole(o.j);
+    return loadReports(true).then(back)
+  },back)
 };
 clearableAll();
 $('tok').onkeydown=function(e){if(e.key==='Enter')$('go').onclick()};
@@ -10145,6 +10310,7 @@ $('ext').onchange=function(){
   if(!b.checked){refreshFrames();return}
   ask({title:'Load external images?',text:'External images will be fetched by the worker from whatever hosts the page points at. Those hosts see the worker (not your IP) and that a preview was opened, and content from CSAM reports may display.',ok:'Load images',danger:true}).then(function(ok){if(!ok)b.checked=false;else refreshFrames()})
 };
+$('admadd').onclick=function(){admAdd()};
 $('purgego').onclick=function(){
   ask({title:'Run the purge now?',text:'Permanently deletes pages unpublished more than 30 days ago (except held or locked ones), accounts past their 30-day deletion window, stale like/follow timestamps, backup images older than 14 days that no note references, presence records older than 90 days, alerts older than a year, activity log entries older than 800 days, and dismissed CSAM report index rows older than 18 months.',ok:'Run purge',danger:true}).then(function(ok){
     if(!ok)return;
@@ -10154,7 +10320,12 @@ $('purgego').onclick=function(){
 };
 $('msg').onclick=function(){msg('')};
 lookupHint();
-if(tok){loggedIn(true);loadReports(true)}
+/* Lock: the token lives in memory only, so a refresh always lands on the token screen. Being away for 30 seconds or more does too: hide the app first, then reload. */
+var awayAt=0;
+function lockCheck(){if(!awayAt)return;var d=Date.now()-awayAt;awayAt=0;if(d>=30000&&tok){document.body.dataset.auth='out';location.reload()}}
+document.addEventListener('visibilitychange',function(){if(document.visibilityState==='hidden')awayAt=Date.now();else lockCheck()});
+window.addEventListener('pagehide',function(){awayAt=Date.now()});
+window.addEventListener('pageshow',function(e){if(e.persisted)lockCheck()});
 </script></body></html>`;
 
 /* ---------------- Router ---------------- */
@@ -10353,12 +10524,15 @@ export default {
         const auth = await adminAuthOk(env, request);
         if (auth === 'limited') return textError(429, 'too many failed attempts, try again in 5 minutes');
         if (auth !== 'ok') return textError(403, 'invalid admin token');
+        if (!isSuperAdmin(request)) return textError(403, 'super admin only');
         const purged = (await handlePurge(env)) + (await pruneAll(env));
         await backfillReferralCodes(env);
-        await audit(env, 'purge', null, purged + ' removed');
+        await auditBy(env, request, 'purge', null, purged + ' removed');
         return json({ ok: true, purged });
       }
       if (method === 'GET' && pathname === '/admin') return handleAdminPage();
+      if (method === 'GET' && pathname === '/admin/me') return handleAdminMe(env, request);
+      if ((method === 'GET' || method === 'POST') && pathname === '/admin/admins') return handleAdminAdmins(env, request);
       if (method === 'GET' && pathname === '/admin/reports') return handleAdminReports(env, request, url);
       if (method === 'POST' && pathname === '/admin/reports/reindex') return handleAdminReportsReindex(env, request);
       if (method === 'GET' && pathname === '/admin/img') return handleAdminImage(env, request, url);
