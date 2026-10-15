@@ -1919,9 +1919,9 @@ async function handleServeStoryImage(env, slug) {
 // come first (not counted in the 12); the rest of it is a
 // *discovery* surface, not a feed of people you already follow: a story
 // only qualifies for STORIES_LOOKBACK_MS (24h) after it's posted, and
-// any author the signed-in caller already subscribes to is excluded
-// (those show as note cards in the Subscribed category instead — see
-// handleSubscriptionsFeed).
+// any story an author the signed-in caller subscribes to posted after the subscription
+// is excluded (those show as note cards in the Subscribed category instead — see
+// handleSubscriptionsFeed); stories posted before subscribing stay until they expire.
 //
 // Signed-in viewers get a mix of shared and personal picks from a wide pool (the newest
 // STORIES_STRIP_CANDIDATE_LIMIT stories, at most STORIES_STRIP_PER_AUTHOR per author):
@@ -1936,17 +1936,17 @@ async function handleStoriesStrip(env, request) {
   const now = Date.now();
   const cutoff = now - STORIES_LOOKBACK_MS;
 
-  let followedAuthors = [];
+  let followedSince = new Map(); // author_sub -> when the viewer subscribed
   let ownStories = [];
   if (sub) {
     // Follows and the viewer's own live stories are independent lookups: run them together.
     const [followRows, ownRows] = await Promise.all([
-      env.ADS_DB.prepare('SELECT author_sub FROM subscriptions WHERE subscriber_sub = ?').bind(sub).all(),
+      env.ADS_DB.prepare('SELECT author_sub, created_at FROM subscriptions WHERE subscriber_sub = ?').bind(sub).all(),
       env.ADS_DB.prepare(
         'SELECT slug, author_sub, title, created_at, image_url FROM stories WHERE author_sub = ? AND created_at >= ? ORDER BY created_at DESC LIMIT ?'
       ).bind(sub, cutoff, STORIES_STRIP_OWN_LIMIT).all()
     ]);
-    followedAuthors = followRows.results.map(r => r.author_sub);
+    followedSince = new Map(followRows.results.map(r => [r.author_sub, r.created_at]));
     ownStories = ownRows.results;
   }
 
@@ -1962,10 +1962,11 @@ async function handleStoriesStrip(env, request) {
     if (pool.length >= STORIES_STRIP_CANDIDATE_LIMIT) break;
   }
 
-  // Own stories lead the strip; followed authors show in Subscribed instead.
-  const skipAuthors = new Set(followedAuthors);
-  if (sub) skipAuthors.add(sub);
-  const eligible = pool.filter(r => !skipAuthors.has(r.author_sub));
+  // Own stories lead the strip; a followed author's stories posted after you subscribed show in Subscribed instead. Stories
+  // they posted before you subscribed keep showing here until they expire, so following someone doesn't make them vanish.
+  const hidden = r => (sub && r.author_sub === sub) ||
+    (followedSince.has(r.author_sub) && r.created_at >= followedSince.get(r.author_sub));
+  const eligible = pool.filter(r => !hidden(r));
 
   let seenSlugs = new Set();
   if (sub) {
@@ -1988,7 +1989,7 @@ async function handleStoriesStrip(env, request) {
     const bucket = Math.floor(now / STORIES_STRIP_ROTATE_MS);
     // Shared picks: same shuffle for everyone, first eligible ones win.
     const shared = _storiesSeededOrder(pool, 'shared:' + bucket)
-      .filter(r => !skipAuthors.has(r.author_sub))
+      .filter(r => !hidden(r))
       .slice(0, STORIES_STRIP_SHARED);
     const sharedSlugs = new Set(shared.map(r => r.slug));
     // Personal picks: unseen first, each group shuffled per viewer.
