@@ -1973,8 +1973,11 @@ async function handleStoriesStrip(env, request) {
     for (let i = 0; i < slugs.length; i += 80) { // D1 caps bound parameters per query
       const chunk = slugs.slice(i, i + 80);
       const { results: seenRows } = await env.ADS_DB.prepare(
-        `SELECT slug FROM story_seen WHERE subscriber_sub = ? AND slug IN (${chunk.map(() => '?').join(',')})`
-      ).bind(sub, ...chunk).all();
+        // A mark only counts if it was made after the note was shown in stories (not before, e.g. from opening its link), and
+        // never on your own story.
+        `SELECT ss.slug FROM story_seen ss JOIN stories s ON s.slug = ss.slug
+          WHERE ss.subscriber_sub = ? AND ss.seen_at >= s.created_at AND s.author_sub != ? AND ss.slug IN (${chunk.map(() => '?').join(',')})`
+      ).bind(sub, sub, ...chunk).all();
       seenRows.forEach(r => seenSlugs.add(r.slug));
     }
   }
@@ -2046,10 +2049,12 @@ async function handleMarkStorySeen(env, request, slug) {
   if (!validSlug(slug)) return textError(400, 'invalid slug');
   // Only a note that is a live story right now can be marked seen. Opening any other note (a pasted link, search, the note
   // viewer) must leave nothing behind, or it would show up already greyed the day the note is shown in stories.
-  await env.ADS_DB.prepare(
-    'INSERT OR REPLACE INTO story_seen (subscriber_sub, slug, seen_at) SELECT ?, ?, ? WHERE EXISTS (SELECT 1 FROM stories WHERE slug = ?)'
-  ).bind(sub, slug, Date.now(), slug).run();
-  return json({ ok: true });
+  // Your own story is never "seen" by you either: posting or opening your own note must not grey your ring.
+  const r = await env.ADS_DB.prepare(
+    'INSERT OR REPLACE INTO story_seen (subscriber_sub, slug, seen_at) SELECT ?, ?, ? WHERE EXISTS (SELECT 1 FROM stories WHERE slug = ? AND author_sub != ?)'
+  ).bind(sub, slug, Date.now(), slug, sub).run();
+  const recorded = r && r.meta && typeof r.meta.changes === 'number' ? r.meta.changes > 0 : true;
+  return json({ ok: true, recorded });
 }
 
 // Latest-tap-wins. The app sends X-Action-Time (when the person actually
@@ -2530,7 +2535,7 @@ async function subscriptionsFeedCounts(env, sub) {
       `SELECT COUNT(*) AS c, COALESCE(SUM(CASE WHEN seen.slug IS NULL THEN 1 ELSE 0 END), 0) AS u
          FROM stories s
          JOIN subscriptions sub ON sub.author_sub = s.author_sub AND sub.subscriber_sub = ? AND s.created_at >= sub.created_at AND s.created_at >= ?
-         LEFT JOIN story_seen seen ON seen.slug = s.slug AND seen.subscriber_sub = ?`
+         LEFT JOIN story_seen seen ON seen.slug = s.slug AND seen.subscriber_sub = ? AND seen.seen_at >= s.created_at`
     ).bind(sub, Date.now() - SUBSCRIPTIONS_FEED_MAX_AGE_MS, sub).first();
     const total = row && Number(row.c), unread = row && Number(row.u);
     return Number.isFinite(total) && Number.isFinite(unread) ? { total, unread } : null;
@@ -2604,7 +2609,7 @@ async function handleSubscriptionsFeed(env, request) {
   let query = `SELECT s.slug, s.author_sub, s.title, s.created_at, s.image_urls, s.description, s.tags, s.note_created_at, seen.slug IS NOT NULL AS seen
      FROM stories s
      JOIN subscriptions sub ON sub.author_sub = s.author_sub AND sub.subscriber_sub = ? AND s.created_at >= sub.created_at AND s.created_at >= ?
-     LEFT JOIN story_seen seen ON seen.slug = s.slug AND seen.subscriber_sub = ?`;
+     LEFT JOIN story_seen seen ON seen.slug = s.slug AND seen.subscriber_sub = ? AND seen.seen_at >= s.created_at`;
   const feedCutoff = Date.now() - SUBSCRIPTIONS_FEED_MAX_AGE_MS;
   const params = [sub, feedCutoff, sub];
   if (cursorCreatedAt !== null) {
