@@ -1186,7 +1186,9 @@ function cleanNoteCreatedAt(v) {
 // only to the signed-in owner through GET /account/published-notes, so a restored note can get it back.
 const NOTE_CATEGORY_MAX = 60;
 function cleanNoteCategory(v) { return typeof v === 'string' ? v.trim().slice(0, NOTE_CATEGORY_MAX) : null; }
+// A page's tags are kept as a JSON string (see cleanStoryTags), in its meta as well as in the stories row.
 function parseStoryTags(raw) {
+  if (Array.isArray(raw)) return raw.filter(x => typeof x === 'string');
   try { const a = JSON.parse(raw); return Array.isArray(a) ? a.filter(x => typeof x === 'string') : []; }
   catch (e) { return []; }
 }
@@ -1380,7 +1382,9 @@ async function handleRelink(env, request, slug) {
   meta.tokenHash = await sha256Hex(token);
   if (await storyCycleEnded(env, slug, meta)) meta.showInStories = false;
   await putMeta(env, slug, meta);
-  return json({ slug, token, title: meta.title || null, createdAt: meta.createdAt, updatedAt: meta.updatedAt, showInStories: !!meta.showInStories });
+  // The owner has just proven the page is theirs, so the card details a restored note needs come back with the token.
+  return json({ slug, token, title: meta.title || null, createdAt: meta.createdAt, updatedAt: meta.updatedAt, showInStories: !!meta.showInStories,
+    desc: meta.desc || '', tags: parseStoryTags(meta.tags), category: typeof meta.category === 'string' ? meta.category : '', noteCreatedAt: meta.noteCreatedAt || null });
 }
 
 async function handleSetStories(env, request, slug) {
@@ -2415,8 +2419,8 @@ async function handlePublishedNotes(env, request) {
       authorProfileName: (user && user.profileName) || null,
       publishedAt: at,
       noteCreatedAt: (st ? st.note_created_at : meta.noteCreatedAt) || null,
-      desc: (st ? st.description : meta.desc) || '',
-      tags: st ? parseStoryTags(st.tags) : (Array.isArray(meta.tags) ? meta.tags.filter(x => typeof x === 'string') : []),
+      desc: ((st && st.description) || meta.desc) || '',
+      tags: parseStoryTags(st && st.tags ? st.tags : meta.tags),
       category: typeof meta.category === 'string' ? meta.category : '',
       seen: false,
       images: card.images,
@@ -2674,7 +2678,7 @@ async function handleServe(env, slug) {
     "base-uri 'none'"
   ].join('; ');
 
-  return new Response(obj.body, {
+  const res = new Response(obj.body, {
     headers: {
       'Content-Type': 'text/html; charset=utf-8',
       'Content-Security-Policy': csp,
@@ -2685,6 +2689,25 @@ async function handleServe(env, slug) {
       ...corsHeaders()
     }
   });
+  return typeof HTMLRewriter === 'undefined' ? res : holdUntilLaidOut(res);
+}
+
+// A page's blocks are laid out by a script at the very end of the page, but the browser paints as the page streams in, so
+// a big page (many or large inline images) first shows its blocks stacked on top of each other and only then jumps into place.
+// This keeps the canvas hidden until that script has run and the images are decoded, then shows it once. It is added as the page
+// is served, so it covers every page already published, and nothing stored changes (so no published note looks edited). Without
+// scripts the canvas is never hidden, and a timer shows it anyway if something stalls. The app's viewer also listens for the
+// message to drop its own spinner.
+const HOLD_HEAD = '<style id="nb-hold">html.nb-hold .cv-canvas{visibility:hidden}</style><script>document.documentElement.classList.add("nb-hold")</script>';
+const HOLD_BODY = '<script>(function(){var d=document,done=false;function show(){if(done)return;done=true;d.documentElement.classList.remove("nb-hold");try{if(window.parent!==window)window.parent.postMessage({type:"nb-page-ready"},"*")}catch(e){}}'
+  + 'function settle(){requestAnimationFrame(function(){requestAnimationFrame(show)})}'
+  + 'var w=[].slice.call(d.querySelectorAll(".cv-canvas img")).filter(function(i){return !i.complete}).map(function(i){return new Promise(function(r){i.addEventListener("load",r);i.addEventListener("error",r)})});'
+  + 'if(d.fonts&&d.fonts.ready)w.push(d.fonts.ready);Promise.all(w).then(settle,settle);setTimeout(show,5000)})()</script>';
+function holdUntilLaidOut(res) {
+  return new HTMLRewriter()
+    .on('head', { element(el) { el.append(HOLD_HEAD, { html: true }); } })
+    .on('body', { element(el) { el.append(HOLD_BODY, { html: true }); } })
+    .transform(res);
 }
 
 // Best-effort rate limit for POST /report/:slug. Cloudflare dashboard rate-limit
@@ -4958,8 +4981,8 @@ async function handleAdminLookup(env, request, url) {
     sizeBytes: head ? head.size : (meta.sizeBytes || null),
     hasOwner: !!meta.ownerSub, ownerEmail: user ? user.email : null, ownerAuthorId,
     showInStories: !!meta.showInStories, storyBlocked: !!meta.storyBlocked,
-    desc: (story ? story.description : meta.desc) || '',
-    tags: story ? parseStoryTags(story.tags) : (Array.isArray(meta.tags) ? meta.tags.filter(x => typeof x === 'string') : []),
+    desc: ((story && story.description) || meta.desc) || '',
+    tags: parseStoryTags(story && story.tags ? story.tags : meta.tags),
     noteCreatedAt: meta.noteCreatedAt || null,
     story: story ? { title: story.title, createdAt: story.created_at, images: adminStoryImageSpecs(story) } : null,
     likes: likes ? likes.n : 0,
