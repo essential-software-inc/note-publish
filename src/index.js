@@ -1271,6 +1271,7 @@ async function handlePublish(env, request) {
     await env.ADS_DB.prepare(
       'INSERT OR REPLACE INTO stories (slug, author_sub, title, created_at, image_url, image_urls, description, tags, note_created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
     ).bind(slug, ownerSub, storyTitle, now, imageUrl, imageUrls, cleanStoryDesc(desc), cleanStoryTags(tags), cleanNoteCreatedAt(createdAt)).run();
+    await env.ADS_DB.prepare('DELETE FROM story_seen WHERE slug = ?').bind(slug).run(); // a note starts out unseen, including marks left by older builds
   }
   await afterPublishAdCheck(env, ownerSub);
   return json({ slug, token }, 201);
@@ -1329,6 +1330,7 @@ async function handleUpdate(env, request, slug) {
       await env.ADS_DB.prepare(
         'INSERT OR REPLACE INTO stories (slug, author_sub, title, created_at, image_url, image_urls, description, tags, note_created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
       ).bind(slug, meta.ownerSub, meta.title || 'Untitled note', meta.updatedAt, imageUrl, imageUrls, cleanStoryDesc(desc), cleanStoryTags(tags), cleanNoteCreatedAt(createdAt)).run();
+      await env.ADS_DB.prepare('DELETE FROM story_seen WHERE slug = ?').bind(slug).run(); // a note starts out unseen, including marks left by older builds
     } else if (!wants && was) {
       await Promise.all([
         deleteStoryImage(env, slug),
@@ -1430,6 +1432,7 @@ async function handleSetStories(env, request, slug) {
     await env.ADS_DB.prepare(
       'INSERT OR REPLACE INTO stories (slug, author_sub, title, created_at, image_url, image_urls, description, tags, note_created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
     ).bind(slug, meta.ownerSub, meta.title || 'Untitled note', now, imageUrl, imageUrls, meta.desc ?? null, meta.tags ?? null, meta.noteCreatedAt ?? null).run();
+    await env.ADS_DB.prepare('DELETE FROM story_seen WHERE slug = ?').bind(slug).run(); // a note starts out unseen, including marks left by older builds
   } else if (!wants && was) {
     await Promise.all([
       deleteStoryImage(env, slug),
@@ -2041,9 +2044,11 @@ async function handleMarkStorySeen(env, request, slug) {
   if (!sub) return textError(401, 'sign-in required');
   { const limited = await accountRateLimitResponse(env, sub, 'seen'); if (limited) return limited; }
   if (!validSlug(slug)) return textError(400, 'invalid slug');
+  // Only a note that is a live story right now can be marked seen. Opening any other note (a pasted link, search, the note
+  // viewer) must leave nothing behind, or it would show up already greyed the day the note is shown in stories.
   await env.ADS_DB.prepare(
-    'INSERT OR REPLACE INTO story_seen (subscriber_sub, slug, seen_at) VALUES (?, ?, ?)'
-  ).bind(sub, slug, Date.now()).run();
+    'INSERT OR REPLACE INTO story_seen (subscriber_sub, slug, seen_at) SELECT ?, ?, ? WHERE EXISTS (SELECT 1 FROM stories WHERE slug = ?)'
+  ).bind(sub, slug, Date.now(), slug).run();
   return json({ ok: true });
 }
 
