@@ -1973,11 +1973,10 @@ async function handleStoriesStrip(env, request) {
     for (let i = 0; i < slugs.length; i += 80) { // D1 caps bound parameters per query
       const chunk = slugs.slice(i, i + 80);
       const { results: seenRows } = await env.ADS_DB.prepare(
-        // A mark only counts if it was made after the note was shown in stories (not before, e.g. from opening its link), and
-        // never on your own story.
+        // A mark only counts if it was made after the note was shown in stories (not before, e.g. from opening its link).
         `SELECT ss.slug FROM story_seen ss JOIN stories s ON s.slug = ss.slug
-          WHERE ss.subscriber_sub = ? AND ss.seen_at >= s.created_at AND s.author_sub != ? AND ss.slug IN (${chunk.map(() => '?').join(',')})`
-      ).bind(sub, sub, ...chunk).all();
+          WHERE ss.subscriber_sub = ? AND ss.seen_at >= s.created_at AND ss.slug IN (${chunk.map(() => '?').join(',')})`
+      ).bind(sub, ...chunk).all();
       seenRows.forEach(r => seenSlugs.add(r.slug));
     }
   }
@@ -2049,10 +2048,10 @@ async function handleMarkStorySeen(env, request, slug) {
   if (!validSlug(slug)) return textError(400, 'invalid slug');
   // Only a note that is a live story right now can be marked seen. Opening any other note (a pasted link, search, the note
   // viewer) must leave nothing behind, or it would show up already greyed the day the note is shown in stories.
-  // Your own story is never "seen" by you either: posting or opening your own note must not grey your ring.
+  // Your own story counts like any other: opening it from the strip greys your ring.
   const r = await env.ADS_DB.prepare(
-    'INSERT OR REPLACE INTO story_seen (subscriber_sub, slug, seen_at) SELECT ?, ?, ? WHERE EXISTS (SELECT 1 FROM stories WHERE slug = ? AND author_sub != ?)'
-  ).bind(sub, slug, Date.now(), slug, sub).run();
+    'INSERT OR REPLACE INTO story_seen (subscriber_sub, slug, seen_at) SELECT ?, ?, ? WHERE EXISTS (SELECT 1 FROM stories WHERE slug = ?)'
+  ).bind(sub, slug, Date.now(), slug).run();
   const recorded = r && r.meta && typeof r.meta.changes === 'number' ? r.meta.changes > 0 : true;
   return json({ ok: true, recorded });
 }
