@@ -1578,7 +1578,7 @@ async function handleUnpublish(env, request, slug) {
       if (refunded) await auditBy(env, request, 'ad_refund', slug, 'refunded ' + refunded + ' (release)');
     }
     // Not a strike: the kind is "release" and the text avoids the "was paused" / "was taken down" wording that marks ad strikes.
-    await createAlert(env, meta.ownerSub, 'release', 'Your note ' + alertNoteName(meta, slug) + ' was unpublished by an admin. Its address is free, so you can publish it again. Its likes' + (meta.showInStories ? ' and story' : '') + ' were removed' + (adStopped ? ', and its ad was stopped' : '') + '.' + (refunded ? ' ' + refunded + ' unused ad views were refunded to your balance.' : ''));
+    await createAlert(env, meta.ownerSub, 'release', 'Your note ' + alertNoteName(meta, slug) + ' was unpublished by an admin. Its address is free, so you can publish it again. Its likes' + (meta.showInStories ? ' and story' : '') + ' were removed' + (adStopped ? ', and its ad was stopped' : '') + '.' + (refunded ? ' ' + (refunded === 1 ? '1 unused ad view was' : refunded + ' unused ad views were') + ' refunded to your balance.' : ''));
   }
   return json({ ok: true });
 }
@@ -5269,8 +5269,8 @@ async function handleAdminReferral(env, request) {
   const moved = await adjustReferralGift(env, row.referrer_sub, referred, action);
   await auditBy(env, request, 'referral_' + action, slug, (reason || '') + (aid ? ' [' + aid.slice(0, 10) + ']' : '') + (moved ? ' (' + (action === 'void' ? '-' : '+') + moved + ' gift views)' : ''));
   await createAlert(env, row.referrer_sub, 'referral', action === 'void'
-    ? 'A friend\u2019s invite no longer counts toward your ad access. ' + (moved ? 'The ' + fmtN(moved) + ' free views it gave you were taken back. ' : '') + alertReason(reason)
-    : 'A friend\u2019s invite counts toward your ad access again.' + (moved ? ' Its ' + fmtN(moved) + ' free views are back in your balance.' : ''));
+    ? 'A friend\u2019s invite no longer counts toward your ad access. ' + (moved ? (moved === 1 ? 'The 1 free view it gave you was' : 'The ' + fmtN(moved) + ' free views it gave you were') + ' taken back. ' : '') + alertReason(reason)
+    : 'A friend\u2019s invite counts toward your ad access again.' + (moved ? (moved === 1 ? ' Its 1 free view is' : ' Its ' + fmtN(moved) + ' free views are') + ' back in your balance.' : ''));
   await maybeNotifyAdUnlock(env, row.referrer_sub, 0);
   return json({ ok: true });
 }
@@ -5422,12 +5422,12 @@ async function handleAdminAd(env, request) {
     return textError(500, 'ad action failed');
   }
   await auditBy(env, request, 'ad_' + body.action, slug, [reason, refunded ? 'refunded ' + refunded : ''].filter(Boolean).join(' \u00b7 ') || null);
-  const adRefund = refunded ? ' ' + refunded + ' unused views were refunded to your balance.' : '';
+  const adRefund = refunded ? ' ' + (refunded === 1 ? '1 unused view was' : refunded + ' unused views were') + ' refunded to your balance.' : '';
   const adAlert = {
     pause: 'Your ad on /' + slug + ' was paused. ' + alertReason(reason) + ' ' + ALERT_REPEAT_NOTE,
     resume: 'Your ad on /' + slug + ' is running again.',
     takedown: 'Your ad on /' + slug + ' was taken down. ' + alertReason(reason) + adRefund + ' ' + ALERT_REPEAT_NOTE,
-    refund: adRefund.trim() ? refunded + ' unused views from your ad on /' + slug + ' were refunded to your balance.' : ''
+    refund: adRefund.trim() ? (refunded === 1 ? '1 unused view from your ad on /' + slug + ' was' : refunded + ' unused views from your ad on /' + slug + ' were') + ' refunded to your balance.' : ''
   }[body.action];
   if (adAlert) await createAlert(env, ad.owner_sub, 'ad', adAlert);
   return json({ ok: true, refunded });
@@ -6818,6 +6818,7 @@ select.field::-ms-expand{display:none}
 .rsub:empty,.rcnt:empty,.rchk:empty{display:none}
 .rsub{margin:0 0 2px}
 .sheet-body .rsub{margin:12px 2px 0}
+.sheet>.rnote{flex:none;margin:10px 2px 0}
 .rchk{margin-top:10px;padding:10px 14px;border-radius:14px;background:var(--s2);color:var(--muted);font-size:14px;font-weight:600}
 .rchk.good{color:var(--ok);background:var(--ok-bg)}
 .rchk.bad{color:var(--danger);background:var(--danger-bg)}
@@ -7257,6 +7258,7 @@ function tzAbbr(){try{var r='';new Intl.DateTimeFormat('en-US',{timeZone:tzName(
 function fmt(t){return t?new Date(t).toLocaleString(undefined,{timeZone:tzName()}):'-'}
 function fmtD(t){return new Date(t).toLocaleDateString(undefined,{timeZone:tzName()})}
 function num(n){return Number(n||0).toLocaleString()}
+function pl(n,w){return num(n)+' '+w+(Number(n)===1?'':'s')}
 /* Shrink a big number's font until it fits its box (long totals). */
 function fitNum(e){
   e.style.fontSize='';
@@ -8081,7 +8083,7 @@ function renderLookup(d){
   kv(k,'Stories',(d.showInStories?'showing':'not showing')+(d.storyBlocked?' (blocked by admin)':''));
   if(d.story)kv(k,'Story',(d.story.title||'untitled')+' ('+fmt(d.story.createdAt)+')');
   kv(k,'Likes',num(d.likes));
-  kv(k,'Ad',d.ad?d.ad.status+', '+d.ad.viewsUsed+' of '+d.ad.viewsTotal+' views':'none');
+  kv(k,'Ad',d.ad?d.ad.status+', '+d.ad.viewsUsed+' of '+pl(d.ad.viewsTotal,'view'):'none');
   repKvs(k,d);kv(k,'Snapshots',String(d.snapshots));
   if(d.csamHold)kv(k,'CSAM hold','yes (kept out of purge)');
   if(d.ncmec.length){d.ncmec.forEach(function(n){kv(k,'NCMEC',fmt(n.at)+(n.reportId?' - '+n.reportId:'')+(n.note?' - '+n.note:''))})}
@@ -8154,7 +8156,7 @@ function loadOwner(slug){
     c.appendChild(st);
     var k=el('div','kvs');c.appendChild(k);
     aidRow(k,d.authorId);
-    kv(k,'Signed up',fmt(d.createdAt));kv(k,'Last sign-in',fmt(d.lastSignInAt));kv(k,'Ads',String(d.ads));kv(k,'Ads running',d.adsRunning==null?'-':d.adsRunning+' / '+d.adLimit);kv(k,'Unspent balance',num(d.creditBalance)+' views');
+    kv(k,'Signed up',fmt(d.createdAt));kv(k,'Last sign-in',fmt(d.lastSignInAt));kv(k,'Ads',String(d.ads));kv(k,'Ads running',d.adsRunning==null?'-':d.adsRunning+' / '+d.adLimit);kv(k,'Unspent balance',pl(d.creditBalance,'view'));
     kv(k,'Display name',d.displayName||'-');
     kv(k,'Backup',d.backup?num(d.backup.images)+(d.backup.imagesMore?'+':'')+' images - '+Math.round(d.backup.sizeBytes/1024)+' KB - '+ago(d.backup.updatedAt):'none');
     var rf=d.referral;
@@ -8194,7 +8196,7 @@ function loadOwner(slug){
     if(d.ledger&&d.ledger.length){
       c.appendChild(el('div','sec-t','View ledger'));
       c.appendChild(el('div','fine','Views are bought for a note (straight onto its ad) or added to the balance from Settings ahead of time. Refunds and invite gifts also leave a balance. The owner can put a balance on any of their ads without paying again.'));
-      d.ledger.forEach(function(x){var r=el('div','pgrow'),l=el('div');l.appendChild(el('div','slug',(x.delta>0?'+':'')+num(x.delta)+' views'));l.appendChild(el('small',null,({purchase:'Bought',allocate:'Put on ad',refund:'Returned to balance',gift:'Gift for an invite',gift_reversal:'Gift taken back'}[x.reason]||x.reason)+(x.slug?' - /'+x.slug:'')+' - '+ago(x.at)));r.appendChild(l);c.appendChild(r)})
+      d.ledger.forEach(function(x){var r=el('div','pgrow'),l=el('div');l.appendChild(el('div','slug',(x.delta>0?'+':'')+num(x.delta)+(Math.abs(x.delta)===1?' view':' views')));l.appendChild(el('small',null,({purchase:'Bought',allocate:'Put on ad',refund:'Returned to balance',gift:'Gift for an invite',gift_reversal:'Gift taken back'}[x.reason]||x.reason)+(x.slug?' - /'+x.slug:'')+' - '+ago(x.at)));r.appendChild(l);c.appendChild(r)})
     }
     if(d.alerts&&d.alerts.length){
       c.appendChild(el('div','sec-t','Alerts sent ('+num(d.alertTotal||d.alerts.length)+')'));
@@ -8369,7 +8371,7 @@ function renderAd(a){
   var left=a.viewsTotal-a.viewsUsed;
   var pct=a.viewsTotal?Math.min(100,Math.round(a.viewsUsed/a.viewsTotal*100)):0;
   var m=el('div'),bar=el('div','meter'),i=document.createElement('i');i.style.width=pct+'%';bar.appendChild(i);m.appendChild(bar);
-  var ml=el('div','meter-l');ml.appendChild(el('span',null,num(a.viewsUsed)+' of '+num(a.viewsTotal)+' views'));ml.appendChild(el('span',null,pct+'%'));m.appendChild(ml);
+  var ml=el('div','meter-l');ml.appendChild(el('span',null,num(a.viewsUsed)+' of '+pl(a.viewsTotal,'view')));ml.appendChild(el('span',null,pct+'%'));m.appendChild(ml);
   var card=mkCard({sev:'ad',icon:'ads',slug:a.slug,chips:[stChip(a.status)],sub:(a.ownerEmail||'account missing')+(a.ownerSubs==null?'':' - '+num(a.ownerSubs)+(a.ownerSubs===1?' subscriber':' subscribers')+(a.ownerFollowing==null?'':' - '+num(a.ownerFollowing)+' following')+' - '+num(a.ownerNotes)+(a.ownerNotes===1?' note':' notes')),extra:m,key:'ad:'+a.slug});
   var k=el('div','kvs');
   kv(k,'Type',a.kind==='share'?'Share':'Write');if(a.likes!=null)kv(k,'Likes',num(a.likes));kv(k,'Unique viewers',num(a.uniqueViewers));kv(k,'Views left',num(left));kv(k,'Created',fmt(a.createdAt));
@@ -8379,9 +8381,9 @@ function renderAd(a){
   if(a.status==='active')foot.appendChild(btn('Pause',null,function(){return adAct(a,'pause',0,{title:'Pause /'+a.slug+'?',text:'It stops being served until resumed.',ok:'Pause'})}));
   if(a.status==='paused')foot.appendChild(btn('Resume',null,function(){return adAct(a,'resume',0,{title:'Resume /'+a.slug+'?',ok:'Resume'})}));
   if(a.status==='active'||a.status==='paused'){
-    foot.appendChild(btn('Take down','danger',function(){return adAct(a,'takedown',0,{title:'Take the ad down?',text:'/'+a.slug+' stays online and the '+num(left)+' unused views are forfeited.',ok:'Take down',danger:true})}));
-    if(left>0)foot.appendChild(btn('Take down + refund','danger',function(){return adAct(a,'takedown',1,{title:'Take down and refund?',text:'The ad on /'+a.slug+' comes down and '+num(left)+' unused views are refunded to the owner.',ok:'Take down + refund',danger:true})}))}
-  else if(a.status==='unpublished'&&left>0)foot.appendChild(btn('Refund unused','danger',function(){return adAct(a,'refund',0,{title:'Refund '+num(left)+' unused views?',text:'They go back to the owner of /'+a.slug+'. This can only be done once.',ok:'Refund',danger:true})}));
+    foot.appendChild(btn('Take down','danger',function(){return adAct(a,'takedown',0,{title:'Take the ad down?',text:'/'+a.slug+' stays online and the '+(left===1?'1 unused view is':num(left)+' unused views are')+' forfeited.',ok:'Take down',danger:true})}));
+    if(left>0)foot.appendChild(btn('Take down + refund','danger',function(){return adAct(a,'takedown',1,{title:'Take down and refund?',text:'The ad on /'+a.slug+' comes down and '+(left===1?'1 unused view is':num(left)+' unused views are')+' refunded to the owner.',ok:'Take down + refund',danger:true})}))}
+  else if(a.status==='unpublished'&&left>0)foot.appendChild(btn('Refund unused','danger',function(){return adAct(a,'refund',0,{title:'Refund '+pl(left,'unused view')+'?',text:'They go back to the owner of /'+a.slug+'. This can only be done once.',ok:'Refund',danger:true})}));
   if(a._c&&a._c.parentNode)a._c.replaceWith(card.c);else $('adlist').appendChild(card.c);
   a._c=card.c
 }
@@ -8515,7 +8517,7 @@ function renderAudit(){
   }
   var am=isAid(q)?aidMap[q]:null;
   if(am&&am.next){
-    L.appendChild(el('div','fine','Matching the first '+num(Object.keys(am.set).length)+' pages of this account.'));
+    L.appendChild(el('div','fine',(Object.keys(am.set).length===1?'Matching the first page of this account.':'Matching the first '+num(Object.keys(am.set).length)+' pages of this account.')));
     L.appendChild(btn('Load more pages','block more',function(){return aidMore(q).then(function(){if(auqv()===q)renderAudit()})}))
   }
   if(q&&auNext)L.appendChild(el('div','fine','Showing matches in the entries loaded so far. Load more to search older ones.'))
@@ -9226,7 +9228,7 @@ function alList(){
 function recipSheet(o){
   if(curSheet)curSheet.done(false,true);
   var trig=document.activeElement,back=el('div','sheet-back'),sh=el('div','sheet'),top=el('div','sheet-top'),sb=el('div','sheet-body'),list=el('div'),
-    sub=el('div','rsub',o.sub||''),cnt=el('div','rcnt'),chk=el('div','rchk'),note=el('div','rsub'),inp=el('input','field'),
+    sub=el('div','rsub',o.sub||''),cnt=el('div','rcnt'),chk=el('div','rchk'),note=el('div','rsub rnote'),inp=el('input','field'),
     cur='',shown=0,total=0,found=0,g=0,closed=false,q='',qt=null,sort='';
   sh.setAttribute('role','dialog');sh.setAttribute('aria-modal','true');sh.setAttribute('aria-label','Recipients');
   sh.appendChild(el('div','grab'));
@@ -9239,8 +9241,8 @@ function recipSheet(o){
   top.appendChild(sk);top.appendChild(chk);
   sh.appendChild(top);sh.appendChild(sb);
   sb.appendChild(list);
-  var more=btn('Load more','block more',function(){return load(false)});more.hidden=true;sb.appendChild(more);sb.appendChild(note);
-  var acts=el('div','sheet-actions');acts.appendChild(btn('Close','quiet block',function(){fin()}));sh.appendChild(acts);
+  var more=btn('Load more','block more',function(){return load(false)});more.hidden=true;sb.appendChild(more);
+  var acts=el('div','sheet-actions');acts.appendChild(btn('Close','quiet block',function(){fin()}));sh.appendChild(note);sh.appendChild(acts);
   back.appendChild(sh);document.body.appendChild(back);xHintAll();clearable(inp);
   function setCnt(){cnt.textContent=q?num(found)+(found===1?' match':' matches')+' among '+num(total)+' recipient'+(total===1?'':'s'):'Showing '+num(shown)+' of '+num(total)}
   function load(first){
@@ -9259,7 +9261,7 @@ function recipSheet(o){
         var ck={'in':['good',o.past?'Yes. This account received the alert.':'Yes. This account will receive the alert.'],'out':['bad',o.past?'No. This account did not receive the alert.':'No. This account will not receive the alert.'],'unknown':['warn','No account has this author ID.']}[j.check];
         if(ck){chk.className='rchk '+ck[0];chk.textContent=ck[1]}
       }
-      if(first&&!q&&o.sent!=null&&total<o.sent)note.textContent=num(o.sent-total)+' of '+num(o.sent)+' recipients are not listed, their accounts were deleted since.';
+      if(first&&!q&&o.sent!=null&&total<o.sent)note.textContent=num(o.sent-total)+' of '+pl(o.sent,'recipient')+(o.sent-total===1?" isn't listed because their account has":" aren't listed because their accounts have")+' since been deleted.';
       if(!list.firstChild)list.appendChild(empty(q?'No matches':'No accounts',q?'No recipient has an author ID containing this.':'Nothing matches this audience.',q?'search':'users'))
     },function(e){if(gg!==g||closed)return;unskel(list);netFail(e)})
   }
@@ -9661,7 +9663,7 @@ function lgHistory(kind){
 function lgResend(kind,v){
   return api('/admin/legal',{method:'POST',body:{kind:kind,resend:true,version:v}}).then(function(o){
     if(!o.ok){showErr(o,'Could not send the alert');return lgLoad(true)}
-    if(o.j.alertFailed)msg('The alert could not be sent. Try again.','err');else msg('Alert sent to '+num(o.j.sent)+' signed-in accounts');
+    if(o.j.alertFailed)msg('The alert could not be sent. Try again.','err');else msg('Alert sent to '+pl(o.j.sent,'signed-in account'));
     return lgLoad(true)
   })
 }
@@ -9777,7 +9779,7 @@ function lgEdit(kind,d,keep){
         }
         if(!o.ok){showErr(o,'Could not publish the '+LG_LBL[kind]);return lgEdit(kind,d,st)}
         delete LG.draft[kind];delete LG.base[kind];delete LG.from[kind];LG.data[kind]=null;
-        msg('Published '+LG_LBL[kind]+' version '+o.j.version+(st.notify?(o.j.alertFailed?', but the alert could not be sent':', alert sent to '+num(o.j.sent)+' signed-in accounts'):''));
+        msg('Published '+LG_LBL[kind]+' version '+o.j.version+(st.notify?(o.j.alertFailed?', but the alert could not be sent':', alert sent to '+pl(o.j.sent,'signed-in account')):''));
         if(st.notify&&o.j.alertFailed){return lgLoad(true).then(function(){return ask({title:'Alert not sent',sev:'ad',icon:'bell',text:'The new text is live, but the alert could not be sent. Send it again?',ok:'Send alert'})}).then(function(y){if(y)return lgResend(kind,o.j.version)})}
         return lgLoad(true)
       })
