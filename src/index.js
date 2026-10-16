@@ -1273,6 +1273,14 @@ async function handlePublish(env, request) {
       'INSERT OR REPLACE INTO stories (slug, author_sub, title, created_at, image_url, image_urls, description, tags, note_created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
     ).bind(slug, ownerSub, storyTitle, now, imageUrl, imageUrls, cleanStoryDesc(desc), cleanStoryTags(tags), cleanNoteCreatedAt(createdAt)).run();
     await env.ADS_DB.prepare('DELETE FROM story_seen WHERE slug = ?').bind(slug).run(); // a note starts out unseen, including marks left by older builds
+  } else if (existing) {
+    // The address was used before. Clear any story row the old note left behind (older builds skipped this once its toggle had
+    // turned itself off), or this plain page would show the old title, date, description and tags on its cards.
+    await deleteStoryImage(env, slug);
+    await env.ADS_DB.batch([
+      env.ADS_DB.prepare('DELETE FROM stories WHERE slug = ?').bind(slug),
+      env.ADS_DB.prepare('DELETE FROM story_seen WHERE slug = ?').bind(slug)
+    ]);
   }
   await afterPublishAdCheck(env, ownerSub);
   return json({ slug, token }, 201);
@@ -1544,13 +1552,13 @@ async function handleUnpublish(env, request, slug) {
   // Thumbnails cached for the Liked tab exist even when the note is not a story.
   await deleteStoryCardImages(env, slug);
   await env.SLUGS.delete(cardImagesKey(slug));
-  if (meta.showInStories) {
-    await deleteStoryImage(env, slug);
-    await env.ADS_DB.batch([
-      env.ADS_DB.prepare('DELETE FROM stories WHERE slug = ?').bind(slug),
-      env.ADS_DB.prepare('DELETE FROM story_seen WHERE slug = ?').bind(slug)
-    ]);
-  }
+  // Not gated on meta.showInStories: that flag turns itself off once the 24h strip window ends, while the story row stays
+  // for followers' feeds. Skipping the delete then left the row behind for the next note at this address to inherit.
+  await deleteStoryImage(env, slug);
+  await env.ADS_DB.batch([
+    env.ADS_DB.prepare('DELETE FROM stories WHERE slug = ?').bind(slug),
+    env.ADS_DB.prepare('DELETE FROM story_seen WHERE slug = ?').bind(slug)
+  ]);
   // Likes belong to the note, not to whoever holds the slug next: an unpublished
   // slug is reclaimable immediately, so its likes go now or a new note at the
   // same slug would start life with someone else's likes (and the old author's
@@ -2919,6 +2927,24 @@ async function handlePurge(env) {
     cursor = page.list_complete ? undefined : page.cursor;
   } while (cursor);
 
+  // Self-heal: a story row that outlived its note. A live story row is never older than its page's publish time, so a row older than
+  // that (the address was reused) or with no published page at all belongs to an earlier note and would otherwise show its title,
+  // date, description and tags on the new note's cards. Older builds left these behind once a story's toggle had turned itself off.
+  // Capped per run so a big backlog clears over a few nights.
+  try {
+    const { results: strays } = await env.ADS_DB.prepare(
+      'SELECT s.slug AS slug FROM stories s LEFT JOIN published_notes p ON p.slug = s.slug WHERE p.slug IS NULL OR s.created_at < p.created_at LIMIT 500'
+    ).all();
+    for (const r of (strays || [])) {
+      await deleteStoryImage(env, r.slug);
+      await env.ADS_DB.batch([
+        env.ADS_DB.prepare('DELETE FROM stories WHERE slug = ?').bind(r.slug),
+        env.ADS_DB.prepare('DELETE FROM story_seen WHERE slug = ?').bind(r.slug)
+      ]);
+      purged++; // counted, so Run purge now reports it
+    }
+  } catch (e) { console.error('stray story sweep failed', e); }
+
   let r2Cursor;
   do {
     const page = await env.NOTES_BUCKET.list({ prefix: 'deleted/', cursor: r2Cursor });
@@ -3046,13 +3072,11 @@ async function purgeAccountData(env, sub) {
         ]);
         await deleteStoryCardImages(env, slug);
         await env.SLUGS.delete(cardImagesKey(slug));
-        if (meta.showInStories) {
-          await deleteStoryImage(env, slug);
-          await env.ADS_DB.batch([
-            env.ADS_DB.prepare('DELETE FROM stories WHERE slug = ?').bind(slug),
-            env.ADS_DB.prepare('DELETE FROM story_seen WHERE slug = ?').bind(slug)
-          ]);
-        }
+        await deleteStoryImage(env, slug); // not gated on meta.showInStories, see handleUnpublish
+        await env.ADS_DB.batch([
+          env.ADS_DB.prepare('DELETE FROM stories WHERE slug = ?').bind(slug),
+          env.ADS_DB.prepare('DELETE FROM story_seen WHERE slug = ?').bind(slug)
+        ]);
       }
       await env.SLUGS.delete(key.name);
       await env.ADS_DB.prepare('DELETE FROM published_notes WHERE slug = ?').bind(slug).run();
