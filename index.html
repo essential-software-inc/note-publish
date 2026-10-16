@@ -821,6 +821,8 @@ P('copied-lyrics-post','Lyrics collection','tom.becker@example.com',{age:60,upd:
 P('flagged-demo-page','Flagged demo page','alex.rivera@example.com',{age:2,x:{csamHold:true}});
 pages['retired-draft'].snaps.unshift({ts:pages['retired-draft'].deletedAt,source:'release',size:pages['retired-draft'].sizeBytes});
 pages['copied-lyrics-post'].snaps.unshift({ts:pages['copied-lyrics-post'].deletedAt,source:'takedown',size:pages['copied-lyrics-post'].sizeBytes});
+P('repost-no-credit','Reposted article','tom.becker@example.com',{age:75,upd:45,x:{status:'taken down',deletedAt:N-40*D}});
+pages['repost-no-credit'].snaps.unshift({ts:pages['repost-no-credit'].deletedAt,source:'takedown',size:pages['repost-no-credit'].sizeBytes,missing:true});
 pages['letters-to-lisbon'].story.images.cards.push({url:'https://images.example.com/lisbon-card.jpg'});
 users['omar.haddad@example.com'].alerts.push({at:E_REL,kind:'release',strike:false,dismissedAt:null,message:'Your note \u201cRetired draft\u201d was unpublished by an admin. Its address is free, so you can publish it again. Its likes were removed.'});
 (function(){var m='Your note \u201cOld post\u201d was taken down. '+aRs('spam')+' Its address can\u2019t be reused. '+AR;users['tom.becker@example.com'].alerts.push({at:E_OLD,kind:'takedown',strike:true,dismissedAt:null,message:m});users['tom.becker@example.com'].strikes.unshift({at:E_OLD,kind:'takedown',message:m,dismissedAt:null})})();
@@ -846,7 +848,7 @@ R('release-notes-v2','other','',6);
 R('copied-lyrics-post','copyright','Full song lyrics reproduced.',26*24);
 R('flagged-demo-page','csam','Demo entry: placeholder flag only, no real content.',8,{isCsam:true});
 R('flagged-demo-page','csam','Demo entry: earlier placeholder flag, already handled. Dismissed CSAM records are kept for 18 months and can be undone.',100,{isCsam:true,dismissedAt:E_DIS});
-A('release','retired-draft','',E_REL,'Super Admin');A('admin_add',null,'Dev',E_AD1,'Super Admin');A('takedown','copied-lyrics-post','copyright',E_TD,'Dev');A('owner_suspend','copied-lyrics-post','copyright',E_SP,'Dev');A('admin_add',null,'Maya',E_AD2,'Super Admin');A('admin_revoke',null,'Dev',E_RV1,'Super Admin');A('dismiss','flagged-demo-page','',E_DIS,'Maya');
+A('release','retired-draft','',E_REL,'Super Admin');A('admin_add',null,'Dev',E_AD1,'Super Admin');A('takedown','copied-lyrics-post','copyright',E_TD,'Dev');A('takedown','repost-no-credit','copyright',N-40*D,'Dev');A('owner_suspend','copied-lyrics-post','copyright',E_SP,'Dev');A('admin_add',null,'Maya',E_AD2,'Super Admin');A('admin_revoke',null,'Dev',E_RV1,'Super Admin');A('dismiss','flagged-demo-page','',E_DIS,'Maya');
 // The paused ad: an admin paused it after the abuse report, which also put a strike and an alert on the owner.
 (function(){var ad=ads['wedding-moodboard'],at=Math.max(J(N-60*H,'adp',3600),ad.createdAt+H),rs='Harassing text in the note.',m='Your ad on /wedding-moodboard was paused. '+aRs(rs)+' '+AR,u=users['priya.nair@example.com'];A('ad_pause','wedding-moodboard',rs,at,'Maya');u.strikes.push({at:at,kind:'ad',message:m,dismissedAt:null});u.alerts.push({at:at,kind:'ad',strike:true,dismissedAt:null,message:m})})();
 (function(){var last={};reports.slice().sort(function(a,c){return a.reportedAt-c.reportedAt}).forEach(function(r){var g=pages[r.slug],k=r.slug+':'+r.reason;if(!g||!g.owner||(last[k]&&r.reportedAt-last[k]<D))return;last[k]=r.reportedAt;note(g.owner,'report','Your note '+aNm(g)+' was reported. '+aRs(ARR[r.reason]||'Other')+' '+AS,r.reportedAt)})})();
@@ -992,9 +994,39 @@ function legalCheck(html) {
   }
   return stack.length ? 'the tag <' + stack[stack.length - 1] + '> is never closed' : '';
 }
+// Mirrors adminAuthOk: 10 failed tokens lock every admin call for 5 minutes (the lock applies even to a correct token).
+var AUTH_FAILS=0,AUTH_FAIL_AT=0;
+function adminAuth(tk){
+  if(AUTH_FAILS&&Date.now()-AUTH_FAIL_AT>3e5)AUTH_FAILS=0;
+  if(AUTH_FAILS>=10)return{r:'limited'};
+  var w=authOf(tk);if(w)return{r:'ok',who:w};
+  AUTH_FAILS++;AUTH_FAIL_AT=Date.now();return{r:'denied'}}
+function authErr(a){return a.r==='limited'?err(429,'too many failed attempts, try again in 5 minutes'):err(403,'invalid admin token')}
+// Mirrors /admin/img: only https on 443, hostnames only, nothing local or internal.
+function imgTargetOk(u){
+  if(u.protocol!=='https:')return false;if(u.username||u.password)return false;if(u.port&&u.port!=='443')return false;
+  var h=u.hostname.toLowerCase().replace(/\.$/,'');
+  if(!/^[a-z0-9.-]+$/.test(h))return false;if(h.indexOf('.')<0)return false;
+  if(/^\d+(\.\d+){0,3}$/.test(h))return false;if(/^0x/i.test(h.split('.').pop()))return false;
+  if(h==='localhost'||/\.(localhost|local|internal|lan|home|corp|intranet)$/.test(h))return false;return true}
+// The demo cannot reach the internet, so these made-up hosts stand in for the worker's upstream failures:
+// /admin/img?u=https://gone.example.com/a.png gives "upstream 404", and so on. Any other valid https URL returns a sample image.
+var IMG_FAIL={'unreachable.example.com':[502,'fetch failed'],'gone.example.com':[502,'upstream 404'],'forbidden.example.com':[502,'upstream 403'],'notimage.example.com':[415,'not a supported image type'],'huge.example.com':[413,'image too large'],'loop.example.com':[502,'too many redirects'],'badredirect.example.com':[502,'bad redirect']};
 function route(path,o){
   o=o||{};var u=new URL(path,'https://demo.local/'),p=u.pathname,q=u.searchParams,m=(o.method||'GET').toUpperCase(),b=body(o),mt;
-  if(p.indexOf('/admin/')===0){var hd=o.headers||{},tk=hd['X-Admin-Token']!=null?hd['X-Admin-Token']:hd['x-admin-token'];who=authOf(tk);if(!who)return err(403,'invalid admin token')}
+  if(p.indexOf('/admin/')===0){var hd=o.headers||{},tk=hd['X-Admin-Token']!=null?hd['X-Admin-Token']:hd['x-admin-token'];var au=adminAuth(tk);if(au.r!=='ok')return authErr(au);who=au.who}
+  if(p==='/admin/media'){var mls=(q.get('slug')||'').toLowerCase();if(!SLUG_RE.test(mls))return err(400,'invalid slug');var mk=q.get('kind'),mpg=pages[mls];
+    if(mk==='ring'){if(!mpg)return err(404,'not found')}
+    else if(mk==='card'){var mi=parseInt(q.get('i')||'',10);if(!(mi>=0&&mi<3))return err(400,'invalid index');if(!mpg)return err(404,'not found')}
+    else if(mk==='profile'){if(!mpg||!mpg.owner)return err(404,'not found')}
+    else return err(400,'invalid kind');
+    return new Response(svg(mls+mk+(q.get('i')||''),mk==='card'?'card':'ring'))}
+  if(p==='/admin/img'){var iu=q.get('u')||'',iuu;try{iuu=new URL(iu)}catch(e){return err(400,'invalid url')}
+    if(iuu.href.length>2048)return err(400,'url too long');
+    var selfH=(typeof location!=='undefined'&&location.hostname||'demo.local').toLowerCase();
+    if(iuu.hostname.toLowerCase()===selfH||!imgTargetOk(iuu))return err(400,'url not allowed');
+    var ifx=IMG_FAIL[iuu.hostname.toLowerCase()];if(ifx)return err(ifx[0],ifx[1]);
+    return new Response(svg(iu,'card'))}
   if(p==='/admin/reports'){var rpD=q.get('dismissed')==='1',rpR=(q.get('reason')||'').slice(0,40),rpQ=(q.get('q')||'').toLowerCase().trim(),rpS=q.get('sort'),rpF=!q.get('cursor'),rpFr=parseInt(q.get('from'),10),rpTo=parseInt(q.get('to'),10),rpPer=function(x){return(isNaN(rpFr)||x.reportedAt>=rpFr)&&(isNaN(rpTo)||x.reportedAt<=rpTo)},rpCo=parseInt(q.get('cursor'),10)||0,
     rpIn=reports.filter(function(x){return rpD?!!x.dismissedAt:!x.dismissedAt}),
     rpB=rpIn.filter(function(x){if(!rpPer(x))return false;if(!rpQ)return true;if(/^a_[a-f0-9]{32}$/.test(rpQ)){var g=pages[x.slug],w=g&&users[g.owner];return!!w&&w.authorId===rpQ&&aidSlugs(w.email).indexOf(x.slug)>=0}var z=rpQ.replace(/[^a-z0-9-]/g,'');return!z||x.slug.indexOf(z)>=0}),
@@ -1015,13 +1047,13 @@ function route(path,o){
     if(b.action==='revoke'){var ar=ADMINS.filter(function(x){return x.id===b.id&&!x.revokedAt})[0];if(!ar)return err(404,'not found');ar.revokedAt=Date.now();A('admin_revoke',null,ar.name);return ok({ok:true})}
     return err(400,'unknown action')}
   if(p==='/admin/reports/reindex')return ok({done:true});
-  if(mt=p.match(/^\/publish\/(.+)$/)){var s=decodeURIComponent(mt[1]),pg=pages[s];if(m!=='DELETE')return err(405,'Method not allowed');if(typeof b.adminToken==='string'&&b.adminToken){who=authOf(b.adminToken);if(!who)return err(403,'invalid admin token')}if(!SLUG_RE.test(s))return err(400,'invalid slug');if(!pg||pg.status!=='live')return err(404,'not found');if(!b.release&&!reasonOf(b))return err(400,'reason required');var now=Date.now();snap(pg,b.release?'release':'takedown',now);var wasSt=pg.showInStories,rad=ads[s],adOn=!!rad&&(rad.status==='active'||rad.status==='paused'),rleft=rad?rad.viewsTotal-rad.viewsUsed:0;pg.deletedAt=now;pg.showInStories=false;pg.story=null;if(ads[s])ads[s].status='unpublished';
+  if(mt=p.match(/^\/publish\/(.+)$/)){var s=decodeURIComponent(mt[1]),pg=pages[s];if(m!=='DELETE')return err(405,'Method not allowed');if(!SLUG_RE.test(s))return err(400,'invalid slug');if(!pg||pg.status!=='live')return err(404,'not found');if(typeof b.adminToken==='string'&&b.adminToken){var pau=adminAuth(b.adminToken);if(pau.r!=='ok')return authErr(pau);who=pau.who}else{if(typeof b.token!=='string'||!b.token)return err(401,'missing token');return err(403,'invalid token')}if(!b.release&&!reasonOf(b))return err(400,'reason required');var now=Date.now();snap(pg,b.release?'release':'takedown',now);var wasSt=pg.showInStories,rad=ads[s],adOn=!!rad&&(rad.status==='active'||rad.status==='paused'),rleft=rad?rad.viewsTotal-rad.viewsUsed:0;pg.deletedAt=now;pg.showInStories=false;pg.story=null;if(ads[s])ads[s].status='unpublished';
     if(b.release){pg.status='unpublished';pg.likes=0;A('release',s,'',now);var rref=0;if(adOn&&rleft>0&&!rad.refunded){rref=rleft;rad.refunded=true;rad.viewsTotal=rad.viewsUsed;var rw=users[rad.ownerEmail];if(rw){rw.credit+=rref;rw.ledger.unshift({delta:rref,reason:'refund',slug:s,at:now})}A('ad_refund',s,'refunded '+rref+' (release)',now)}if(pg.owner&&users[pg.owner])users[pg.owner].alerts.unshift({at:now,kind:'release',strike:false,dismissedAt:null,message:'Your note '+aNm(pg)+' was unpublished by an admin. Its address is free, so you can publish it again. Its likes'+(wasSt?' and story':'')+' were removed'+(adOn?', and its ad was stopped':'')+'.'+(rref?' '+(rref===1?'1 unused ad view was':rref+' unused ad views were')+' refunded to your balance.':'')})}else{pg.status='taken down';pg.likes=0;A('takedown',s,reasonOf(b),now);if(pg.owner)strike(pg.owner,'takedown','Your note '+aNm(pg)+' was taken down. '+aRs(reasonOf(b))+' Its address can\u2019t be reused. '+AR,now)}
     return ok({ok:true})}
-  if(mt=p.match(/^\/admin\/restore\/(.+)$/)){var s2=decodeURIComponent(mt[1]),pg2=pages[s2];if(!SLUG_RE.test(s2))return err(400,'invalid slug');if(!pg2)return err(404,'not found');if(pg2.status!=='taken down')return err(409,'slug is not admin-taken-down');var rts=q.get('ts');if(rts){if(!/^\d{10,16}$/.test(rts))return err(400,'invalid timestamp');if(!pg2.snaps.some(function(x){return String(x.ts)===rts}))return err(404,'snapshot not found')}else if(!pg2.snaps.length&&N-(pg2.deletedAt||0)>30*D)return err(409,'content no longer exists (past retention); cannot restore');pg2.status='live';pg2.deletedAt=null;A('restore',s2,rts?'snapshot '+rts:'');return ok({ok:true})}
+  if(mt=p.match(/^\/admin\/restore\/(.+)$/)){var s2=decodeURIComponent(mt[1]),pg2=pages[s2];if(!SLUG_RE.test(s2))return err(400,'invalid slug');if(!pg2)return err(404,'not found');if(pg2.status!=='taken down')return err(409,'slug is not admin-taken-down');var rts=q.get('ts');if(rts){if(!/^\d{10,16}$/.test(rts))return err(400,'invalid timestamp');if(!pg2.snaps.some(function(x){return String(x.ts)===rts&&!x.missing}))return err(404,'snapshot not found')}else if(N-(pg2.deletedAt||0)>30*D){var bsn=pg2.snaps.slice().sort(function(a,c){return c.ts-a.ts})[0];if(!bsn)return err(409,'content no longer exists (past retention); cannot restore');if(bsn.missing)return err(409,'snapshot missing; cannot restore')}pg2.status='live';pg2.deletedAt=null;A('restore',s2,rts?'snapshot '+rts:'');return ok({ok:true})}
   if(p==='/admin/ncmec'){if(who.role!=='super')return err(403,'super admin only');var nsl=typeof b.slug==='string'?b.slug.toLowerCase():'';if(!SLUG_RE.test(nsl))return err(400,'invalid slug');var pg3=pages[nsl];if(!pg3)return err(404,'not found');var nrid=typeof b.reportId==='string'?b.reportId.trim().slice(0,64):'',nnt=typeof b.note==='string'?b.note.trim().slice(0,200):'';pg3.ncmec=pg3.ncmec.slice(-19);pg3.ncmec.push({at:Date.now(),reportId:nrid||null,note:nnt||null});A('ncmec_recorded',nsl,'');return ok({ok:true,ncmec:pg3.ncmec})}
   if(mt=p.match(/^\/admin\/snapshots\/(.+)$/)){var ssn=decodeURIComponent(mt[1]);if(!SLUG_RE.test(ssn))return err(400,'invalid slug');var pg4=pages[ssn];return ok({snapshots:(pg4?pg4.snaps:[]).map(function(x){return{ts:x.ts,source:x.source,size:x.size}}).sort(function(a,c){return c.ts-a.ts})})}
-  if(mt=p.match(/^\/admin\/snapshot\/([^/]+)\/(.+)$/)){var gsl=decodeURIComponent(mt[1]),gts=mt[2];if(!SLUG_RE.test(gsl))return err(400,'invalid slug');if(!/^\d{10,16}$/.test(gts))return err(400,'invalid timestamp');var pg5=pages[gsl];return pg5&&pg5.snaps.some(function(x){return String(x.ts)===gts})?new Response(snapHtml(pg5),{headers:{'Content-Type':'text/plain; charset=utf-8'}}):err(404,'snapshot not found')}
+  if(mt=p.match(/^\/admin\/snapshot\/([^/]+)\/(.+)$/)){var gsl=decodeURIComponent(mt[1]),gts=mt[2];if(!SLUG_RE.test(gsl))return err(400,'invalid slug');if(!/^\d{10,16}$/.test(gts))return err(400,'invalid timestamp');var pg5=pages[gsl];return pg5&&pg5.snaps.some(function(x){return String(x.ts)===gts&&!x.missing})?new Response(snapHtml(pg5),{headers:{'Content-Type':'text/plain; charset=utf-8'}}):err(404,'snapshot not found')}
   if(p==='/admin/resolve'){var ra=(q.get('aid')||'').toLowerCase();if(!AID_RE.test(ra))return err(400,'invalid author ID');var ru=Object.keys(users).map(function(e){return users[e]}).filter(function(x){return x.authorId===ra})[0];if(!ru)return err(404,'no account with that author ID');var rs=aidSlugs(ru.email),rc=(q.get('cursor')||'').toLowerCase().replace(/[^a-z0-9-]/g,'').slice(0,64),rp=rs.filter(function(k){return!rc||k>rc}),rm=rp.length>100,an=null;rp=rp.slice(0,100);if(!rc){var lv=rs.filter(function(k){return pages[k].owner===ru.email&&pages[k].status==='live'}).sort(function(a,c){return pages[c].createdAt-pages[a].createdAt})[0],rl={};if(!lv)reports.forEach(function(r){var g=pages[r.slug];if(g&&g.owner===ru.email&&!(rl[r.slug]>=r.reportedAt))rl[r.slug]=r.reportedAt});an=lv||Object.keys(rl).sort(function(a,c){return rl[c]-rl[a]})[0]||null}return ok({slug:an,slugs:rp,next:rm&&rp.length?rp[rp.length-1]:null})}
   if(p==='/admin/lookup'){var lsl=(q.get('slug')||'').toLowerCase();return SLUG_RE.test(lsl)?ok(lookup(lsl)):err(400,'invalid slug')}
   if(p==='/admin/owner'){var od=owner((q.get('slug')||'').toLowerCase());return od.error?err(od.status||404,od.error):ok(od)}
@@ -1167,9 +1199,7 @@ function route(path,o){
 }
 window.fetch=function(path,o){
   var p=String(path),r;
-  if(p.indexOf('/admin/media')===0){var mq=new URL(p,'https://demo.local/').searchParams;r=new Response(svg((mq.get('slug')||'')+(mq.get('kind')||'')+(mq.get('i')||''),mq.get('kind')==='card'?'card':'ring'))}
-  else if(p.indexOf('/admin/img')===0){var iu=new URL(p,'https://demo.local/').searchParams.get('u')||'';r=new Response(svg(iu,'card'))}
-  else r=route(p,o);
+  r=route(p,o);
   return new Promise(function(res){setTimeout(function(){res(r)},120+Math.random()*180)})
 };
 function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
