@@ -365,6 +365,7 @@ async function handleSetProfileName(env, request) {
   const user = (await getUser(env, sub)) || {};
   user.profileName = name || null;
   await putUser(env, sub, user);
+  await syncCommentName(env, sub, user.profileName);
   return json({ ok: true, profileName: user.profileName });
 }
 
@@ -1107,6 +1108,7 @@ async function adOwnerBlocked(env, sub) {
 // toggling can't be used to double the allowance.
 const ACCOUNT_RATE_LIMITS = {
   like:      { max: 60,  windowS: 60 },
+  comment:   { max: 20,  windowS: 60 },
   subscribe: { max: 30,  windowS: 60 },
   seen:      { max: 120, windowS: 60 },
   syncPush:  { max: 30,  windowS: 60 },
@@ -1568,6 +1570,7 @@ async function handleUnpublish(env, request, slug) {
     // ...and every liker's latest-tap clock for it, which would otherwise pile up unused.
     env.ADS_DB.prepare("DELETE FROM action_clocks WHERE kind = 'like' AND item = ?").bind(slug)
   ]);
+  await deleteCommentsForSlug(env, slug); // comments belong to the note too, for the same reason as its likes
   // An ad IS this page: unpublishing the page must take the ad down too, or
   // /ads/next would keep handing out its HTML until the 30-day purge.
   // For an admin release, read the ad first: a release is not a penalty, so its unused views are refunded.
@@ -2196,7 +2199,7 @@ async function handleLikeCounts(env, request) {
   const found = await likeCountsFor(env, slugs);
   const counts = {};
   slugs.forEach(sl => { counts[sl] = found[sl] || 0; });
-  return json({ counts });
+  return json({ counts, comments: await commentCountsFor(env, slugs) });
 }
 
 // GET /likes — every slug this account has liked, so a second device shows
@@ -2224,11 +2227,15 @@ async function handleLike(env, request, slug) {
   if (!meta || meta.deletedAt || meta.adminLocked) return textError(404, 'note isn\u2019t available');
   if (meta.ownerSub && meta.ownerSub === sub) return textError(400, 'can\u2019t like your own note');
   const t = actionTime(request);
-  await env.ADS_DB.batch([
+  const likeRes = await env.ADS_DB.batch([
     clockUpsert(env, sub, 'like', slug, t),
     env.ADS_DB.prepare('INSERT OR IGNORE INTO likes (liker_sub, slug, author_sub, created_at) SELECT ?, ?, ?, ? WHERE ' + CLOCK_IS)
       .bind(sub, slug, meta.ownerSub || '', Date.now(), sub, 'like', slug, t)
   ]);
+  if (meta.ownerSub && likeRes[1] && likeRes[1].meta && likeRes[1].meta.changes > 0) {
+    // One alert per note per half hour, so a run of likes (or like/unlike/like) can't flood the owner's list.
+    await createAlert(env, meta.ownerSub, 'like', 'Someone liked ' + alertNoteName(meta, slug), { ref: 'l:' + slug, dedupeMs: 30 * 60 * 1000 });
+  }
   const row = await env.ADS_DB.prepare('SELECT 1 AS x FROM likes WHERE liker_sub = ? AND slug = ?').bind(sub, slug).first();
   if (row) {
     await maybeNotifyAdUnlock(env, meta.ownerSub, AD_TIER_CHECK_GAP_MS);
@@ -2253,6 +2260,237 @@ async function handleUnlike(env, request, slug) {
   ]);
   const row = await env.ADS_DB.prepare('SELECT 1 AS x FROM likes WHERE liker_sub = ? AND slug = ?').bind(sub, slug).first();
   return json({ ok: true, liked: !!row });
+}
+
+/* ---------------- Comments ---------------- */
+// Comments live in D1 (comments, comment_likes, comment_settings) and are rendered into the page itself when it is served
+// (see commentsPageBlock), so they are part of the page for anyone who opens it while the stored page file never changes.
+// Tables are created on first use, like alerts, so no separate migration is needed.
+const COMMENT_MAX_LEN = 500;
+const COMMENTS_LISTED_MAX = 400;
+const COMMENT_NAME_MAX = 30;
+let commentsReady = null;
+function ensureComments(env) {
+  if (!commentsReady) {
+    commentsReady = env.ADS_DB.batch([
+      env.ADS_DB.prepare('CREATE TABLE IF NOT EXISTS comments (id TEXT PRIMARY KEY, slug TEXT NOT NULL, author_sub TEXT NOT NULL, author_id TEXT, name TEXT, parent_id TEXT, reply_to TEXT, body TEXT NOT NULL, created_at INTEGER NOT NULL)'),
+      env.ADS_DB.prepare('CREATE INDEX IF NOT EXISTS comments_slug_time ON comments (slug, created_at)'),
+      env.ADS_DB.prepare('CREATE INDEX IF NOT EXISTS comments_author ON comments (author_sub)'),
+      env.ADS_DB.prepare('CREATE INDEX IF NOT EXISTS comments_parent ON comments (parent_id)'),
+      env.ADS_DB.prepare('CREATE TABLE IF NOT EXISTS comment_likes (comment_id TEXT NOT NULL, liker_sub TEXT NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY (comment_id, liker_sub)) WITHOUT ROWID'),
+      env.ADS_DB.prepare('CREATE TABLE IF NOT EXISTS comment_settings (slug TEXT PRIMARY KEY, enabled INTEGER NOT NULL)')
+    ]).catch((e) => { commentsReady = null; throw e; });
+  }
+  return commentsReady;
+}
+function cleanCommentBody(v) {
+  if (typeof v !== 'string') return '';
+  return v.replace(/[\u0000-\u0009\u000B-\u001F\u007F\u200B-\u200F\u202A-\u202E\u2066-\u2069]/g, '').replace(/\n{3,}/g, '\n\n').trim().slice(0, COMMENT_MAX_LEN);
+}
+// Text that ends up inside an alert (which the app renders as markdown): no link/image/emphasis syntax can survive.
+function alertSafe(t, n) { return String(t || '').replace(/:\/\//g, ' ').replace(/[\[\]()<>*_`~!\\|#]/g, '').replace(/\s+/g, ' ').trim().slice(0, n); }
+function commentDisplayName(user) {
+  const n = user && typeof user.profileName === 'string' ? user.profileName.trim().slice(0, COMMENT_NAME_MAX) : '';
+  return n || null;
+}
+async function commentsEnabled(env, slug) {
+  await ensureComments(env);
+  const row = await env.ADS_DB.prepare('SELECT enabled FROM comment_settings WHERE slug = ?').bind(slug).first();
+  return !!(row && row.enabled === 1);
+}
+// { slug: n } of comments plus replies, only for notes whose comments are switched on (a note with them off shows no count).
+async function commentCountsFor(env, slugs) {
+  const out = {};
+  const uniq = [...new Set((slugs || []).filter(Boolean))];
+  if (!uniq.length) return out;
+  try {
+    await ensureComments(env);
+    for (let i = 0; i < uniq.length; i += 80) {
+      const chunk = uniq.slice(i, i + 80);
+      const { results } = await env.ADS_DB.prepare(
+        'SELECT c.slug, COUNT(*) AS n FROM comments c JOIN comment_settings s ON s.slug = c.slug AND s.enabled = 1 WHERE c.slug IN (' + chunk.map(() => '?').join(',') + ') GROUP BY c.slug'
+      ).bind(...chunk).all();
+      results.forEach((r) => { out[r.slug] = r.n; });
+      chunk.forEach((sl) => { if (out[sl] === undefined) out[sl] = 0; });
+    }
+  } catch (e) { console.log('comment counts failed: ' + (e && e.message)); }
+  return out;
+}
+async function listCommentsFor(env, slug, viewerSub, ownerSub) {
+  await ensureComments(env);
+  const liked = viewerSub ? ', EXISTS(SELECT 1 FROM comment_likes m WHERE m.comment_id = c.id AND m.liker_sub = ?) AS liked' : ', 0 AS liked';
+  const { results } = await env.ADS_DB.prepare(
+    'SELECT c.id, c.parent_id, c.reply_to, c.author_sub, c.author_id, c.name, c.body, c.created_at, ' +
+    '(SELECT COUNT(*) FROM comment_likes l WHERE l.comment_id = c.id) AS likes, ' +
+    '(SELECT COUNT(*) FROM comments r WHERE r.parent_id = c.id) AS replies' + liked +
+    ' FROM comments c WHERE c.slug = ? ORDER BY c.created_at ASC, c.id ASC LIMIT ?'
+  ).bind(...(viewerSub ? [viewerSub] : []), slug, COMMENTS_LISTED_MAX).all();
+  return results.map((r) => ({
+    id: r.id, parentId: r.parent_id || null, replyTo: r.reply_to || null, body: r.body, createdAt: r.created_at,
+    name: r.name || null, authorId: r.name ? r.author_id || null : null,
+    likes: r.likes, replies: r.replies, liked: !!r.liked,
+    mine: !!viewerSub && r.author_sub === viewerSub,
+    byOwner: !!ownerSub && r.author_sub === ownerSub
+  }));
+}
+// GET /comments/:slug — public (the page embeds the same data). A signed-in caller also gets liked/mine flags.
+async function handleCommentsList(env, request, slug) {
+  if (!validSlug(slug)) return textError(400, 'invalid slug');
+  const meta = await getMeta(env, slug);
+  if (!meta || meta.deletedAt || meta.adminLocked) return textError(404, 'note isn\u2019t available');
+  const hasAuth = !!request.headers.get('Authorization');
+  const sub = hasAuth ? await requireSession(env, request) : null;
+  if (!(await commentsEnabled(env, slug))) return json({ enabled: false, owner: false, total: 0, comments: [] });
+  const comments = await listCommentsFor(env, slug, sub, meta.ownerSub);
+  return json({ enabled: true, owner: !!sub && sub === meta.ownerSub, total: comments.length, comments }, 200, { 'Cache-Control': 'no-store' });
+}
+// POST /comments/counts — body { slugs } -> { counts }, for the live numbers on cards.
+async function handleCommentCounts(env, request) {
+  const sub = await requireSession(env, request);
+  if (!sub) return textError(401, 'sign-in required');
+  let body; try { body = await request.json(); } catch (e) { return textError(400, 'invalid JSON body'); }
+  const slugs = Array.isArray(body && body.slugs) ? body.slugs.filter((x) => typeof x === 'string' && x).slice(0, 200) : [];
+  return json({ counts: await commentCountsFor(env, slugs) });
+}
+// POST /comments/:slug — { body, parentId? }. A reply to a reply lands in the same thread (one level deep) and remembers who it answers.
+async function handleCommentPost(env, request, slug) {
+  const sub = await requireSession(env, request);
+  if (!sub) return textError(401, 'sign-in required');
+  { const limited = await accountRateLimitResponse(env, sub, 'comment'); if (limited) return limited; }
+  if (!validSlug(slug)) return textError(400, 'invalid slug');
+  const meta = await getMeta(env, slug);
+  if (!meta || meta.deletedAt || meta.adminLocked) return textError(404, 'note isn\u2019t available');
+  if (!(await commentsEnabled(env, slug))) return textError(403, 'comments are off for this note');
+  let body; try { body = await request.json(); } catch (e) { return textError(400, 'invalid JSON body'); }
+  const text = cleanCommentBody(body && body.body);
+  if (!text) return textError(400, 'write something first');
+  let target = null, parentId = null, replyTo = null;
+  if (body && body.parentId) {
+    target = await env.ADS_DB.prepare('SELECT id, slug, parent_id, author_sub FROM comments WHERE id = ?').bind(String(body.parentId)).first();
+    if (!target || target.slug !== slug) return textError(404, 'that comment is gone');
+    replyTo = target.id; parentId = target.parent_id || target.id;
+  }
+  const user = await getUser(env, sub);
+  if (user && user.suspended) return textError(403, 'account suspended');
+  const name = commentDisplayName(user);
+  const authorId = await authorIdFor(env, sub);
+  const id = crypto.randomUUID().replace(/-/g, '').slice(0, 20);
+  const now = Date.now();
+  await env.ADS_DB.prepare('INSERT INTO comments (id, slug, author_sub, author_id, name, parent_id, reply_to, body, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+    .bind(id, slug, sub, authorId, name, parentId, replyTo, text, now).run();
+  // Alerts: whoever was replied to, then the note's owner (unless they already got one or wrote it themselves).
+  const noteName = alertNoteName(meta, slug), who = name ? alertSafe(name, COMMENT_NAME_MAX) || 'Someone' : 'Someone';
+  const snip = '\u201c' + alertSafe(text, 80) + '\u201d', ref = 'c:' + slug + ':' + id;
+  const told = new Set([sub]);
+  if (target && target.author_sub && !told.has(target.author_sub)) {
+    told.add(target.author_sub);
+    await createAlert(env, target.author_sub, 'reply', who + ' replied to your comment on ' + noteName + ': ' + snip, { ref });
+  }
+  if (meta.ownerSub && !told.has(meta.ownerSub)) {
+    await createAlert(env, meta.ownerSub, 'comment', who + (target ? ' replied in a thread on ' : ' commented on ') + noteName + ': ' + snip, { ref });
+  }
+  await maybeNotifyAdUnlock(env, sub, AD_TIER_CHECK_GAP_MS);
+  await maybeNotifyAdUnlock(env, meta.ownerSub, AD_TIER_CHECK_GAP_MS);
+  return json({ ok: true, comment: { id, parentId, replyTo, body: text, createdAt: now, name, authorId: name ? authorId : null, likes: 0, replies: 0, liked: false, mine: true, byOwner: !!meta.ownerSub && meta.ownerSub === sub } });
+}
+// DELETE /comment/:id — the commenter, or the note's owner. A comment takes its replies and likes with it.
+async function handleCommentDelete(env, request, id) {
+  const sub = await requireSession(env, request);
+  if (!sub) return textError(401, 'sign-in required');
+  { const limited = await accountRateLimitResponse(env, sub, 'comment'); if (limited) return limited; }
+  await ensureComments(env);
+  const row = await env.ADS_DB.prepare('SELECT id, slug, author_sub FROM comments WHERE id = ?').bind(id).first();
+  if (!row) return json({ ok: true, removed: 0 });
+  const meta = await getMeta(env, row.slug);
+  if (row.author_sub !== sub && !(meta && meta.ownerSub === sub)) return textError(403, 'not allowed');
+  await env.ADS_DB.batch([
+    env.ADS_DB.prepare('DELETE FROM comment_likes WHERE comment_id IN (SELECT id FROM comments WHERE id = ? OR parent_id = ?)').bind(id, id),
+    env.ADS_DB.prepare('DELETE FROM comments WHERE id = ? OR parent_id = ?').bind(id, id)
+  ]);
+  return json({ ok: true, removed: 1 });
+}
+// POST/DELETE /comment-likes/:id
+async function handleCommentLike(env, request, id, want) {
+  const sub = await requireSession(env, request);
+  if (!sub) return textError(401, 'sign-in required');
+  { const limited = await accountRateLimitResponse(env, sub, 'like'); if (limited) return limited; }
+  await ensureComments(env);
+  const row = await env.ADS_DB.prepare('SELECT id, slug, author_sub FROM comments WHERE id = ?').bind(id).first();
+  if (!row) return textError(404, 'that comment is gone');
+  if (want) {
+    if (row.author_sub === sub) return textError(400, 'can\u2019t like your own comment');
+    const r = await env.ADS_DB.prepare('INSERT OR IGNORE INTO comment_likes (comment_id, liker_sub, created_at) VALUES (?, ?, ?)').bind(id, sub, Date.now()).run();
+    if (r && r.meta && r.meta.changes > 0) {
+      const meta = await getMeta(env, row.slug);
+      await createAlert(env, row.author_sub, 'comment_like', 'Someone liked your comment on ' + alertNoteName(meta, row.slug), { ref: 'c:' + row.slug + ':' + id, dedupeMs: 60 * 60 * 1000 });
+    }
+  } else {
+    await env.ADS_DB.prepare('DELETE FROM comment_likes WHERE comment_id = ? AND liker_sub = ?').bind(id, sub).run();
+  }
+  const n = await env.ADS_DB.prepare('SELECT COUNT(*) AS c FROM comment_likes WHERE comment_id = ?').bind(id).first();
+  return json({ ok: true, liked: !!want, likes: (n && n.c) || 0 });
+}
+// PUT /publish/:slug/comments — { token, showComments }. The owner's Publish-sheet switch; same token rule as the stories switch.
+async function handleSetComments(env, request, slug) {
+  if (!(await checkPublishRateLimit(env, request))) return textError(429, 'too many publishes, slow down');
+  if (!validSlug(slug)) return textError(400, 'invalid slug');
+  let body; try { body = await request.json(); } catch (e) { return textError(400, 'invalid JSON body'); }
+  const { token, showComments } = body || {};
+  if (typeof token !== 'string' || !token) return textError(401, 'missing token');
+  if (typeof showComments !== 'boolean') return textError(400, 'showComments must be true or false');
+  const meta = await getMeta(env, slug);
+  if (!meta || meta.deletedAt) return textError(404, 'not found');
+  if (!timingSafeEqual(await sha256Hex(token), meta.tokenHash)) return textError(403, 'invalid token');
+  if (!meta.ownerSub) {
+    const adopted = await adoptAnonymousPage(env, request, slug, meta);
+    if (adopted === 'cap') return textError(403, `page limit reached (max ${MAX_PAGES_PER_ACCOUNT} live pages per account). Unpublish something first`);
+    if (!adopted) return textError(403, 'sign-in required to turn on comments');
+  }
+  await ensureComments(env);
+  await env.ADS_DB.prepare('INSERT INTO comment_settings (slug, enabled) VALUES (?, ?) ON CONFLICT(slug) DO UPDATE SET enabled = excluded.enabled').bind(slug, showComments ? 1 : 0).run();
+  return json({ ok: true, showComments });
+}
+async function deleteCommentsForSlug(env, slug) {
+  try {
+    await ensureComments(env);
+    await env.ADS_DB.batch([
+      env.ADS_DB.prepare('DELETE FROM comment_likes WHERE comment_id IN (SELECT id FROM comments WHERE slug = ?)').bind(slug),
+      env.ADS_DB.prepare('DELETE FROM comments WHERE slug = ?').bind(slug),
+      env.ADS_DB.prepare('DELETE FROM comment_settings WHERE slug = ?').bind(slug)
+    ]);
+  } catch (e) { console.log('comment cleanup failed: ' + (e && e.message)); }
+}
+async function deleteCommentsForAccount(env, sub) {
+  try {
+    await ensureComments(env);
+    await env.ADS_DB.batch([
+      env.ADS_DB.prepare('DELETE FROM comment_likes WHERE liker_sub = ?').bind(sub),
+      env.ADS_DB.prepare('DELETE FROM comment_likes WHERE comment_id IN (SELECT id FROM comments WHERE author_sub = ? OR parent_id IN (SELECT id FROM comments WHERE author_sub = ?))').bind(sub, sub),
+      env.ADS_DB.prepare('DELETE FROM comments WHERE author_sub = ? OR parent_id IN (SELECT id FROM comments WHERE author_sub = ?)').bind(sub, sub),
+      env.ADS_DB.prepare('DELETE FROM comment_likes WHERE comment_id IN (SELECT c.id FROM comments c JOIN published_notes p ON p.slug = c.slug WHERE p.author_sub = ?)').bind(sub),
+      env.ADS_DB.prepare('DELETE FROM comments WHERE slug IN (SELECT slug FROM published_notes WHERE author_sub = ?)').bind(sub),
+      env.ADS_DB.prepare('DELETE FROM comment_settings WHERE slug IN (SELECT slug FROM published_notes WHERE author_sub = ?)').bind(sub)
+    ]);
+  } catch (e) { console.log('comment account cleanup failed: ' + (e && e.message)); }
+}
+// A changed or cleared display name follows the account's existing comments, so a name an admin removes is gone everywhere.
+async function syncCommentName(env, sub, name) {
+  try { await ensureComments(env); await env.ADS_DB.prepare('UPDATE comments SET name = ? WHERE author_sub = ?').bind(name || null, sub).run(); }
+  catch (e) { console.log('comment name sync failed: ' + (e && e.message)); }
+}
+
+
+const COMMENTS_PAGE_CSS = ".nbcm-fab{position:fixed;right:.9rem;bottom:1.1rem;width:38px;height:38px;padding:0;border-radius:50%;border:1px solid #e0e0db;background:#fff;color:#4a4a46;display:flex;align-items:center;justify-content:center;box-shadow:0 4px 8px rgba(20,20,20,.12),0 8px 20px rgba(20,20,20,.08);cursor:pointer;z-index:999990;opacity:1;transition:opacity .6s ease,transform .6s ease,color .12s,border-color .12s;-webkit-tap-highlight-color:transparent}.nbcm-fab:hover,.nbcm-fab:active{color:#5b5bd6;border-color:#c9c9f5}.nbcm-fab svg{width:16px;height:16px}.nbcm-fab.nbcm-hidden,.nbcm-fab.nbcm-gone{opacity:0;transform:scale(.85);pointer-events:none}#nb-cm-badge{position:absolute;top:-5px;right:-5px;min-width:16px;height:16px;padding:0 4px;box-sizing:border-box;border-radius:8px;background:#3366cc;color:#fff;font:700 9.5px/16px -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;display:none;align-items:center;justify-content:center}#nb-cm-overlay{display:none;position:fixed;inset:0;z-index:999998;background:rgba(20,20,24,.5);backdrop-filter:blur(2px);align-items:flex-end;justify-content:center;font:13px -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;animation:nbcmFade .18s ease}#nb-cm-box{width:100%;max-width:520px;height:min(86vh,700px);display:flex;flex-direction:column;box-sizing:border-box;background:#fff;color:#202122;border-radius:18px 18px 0 0;box-shadow:0 20px 50px rgba(20,20,40,.28);animation:nbcmIn .22s ease;text-align:left}#nb-cm-box *{box-sizing:border-box}.nbcm-head{display:flex;align-items:flex-start;gap:.65rem;padding:1.2rem 1.2rem .8rem}.nbcm-tile{flex:none;width:34px;height:34px;border-radius:10px;background:#eef2fc;display:flex;align-items:center;justify-content:center}.nbcm-title{font-weight:700;font-size:15.5px;color:#202122;letter-spacing:-.01em}.nbcm-subt{font-size:12.5px;color:#8a8d99;margin-top:.15rem}#nb-cm-close{margin-left:auto;flex:none;width:30px;height:30px;border:0;border-radius:9px;background:transparent;color:#8a8d99;cursor:pointer;display:flex;align-items:center;justify-content:center;padding:0}#nb-cm-close:hover{background:#f4f5f8}.nbcm-filter{padding:0 1.2rem .7rem}.nbcm-lab{display:block;font-size:11px;font-weight:700;color:#8a8d99;margin-bottom:.4rem;letter-spacing:.04em;text-transform:uppercase}#nb-cm-sel{position:relative}#nb-cm-sel-btn{width:100%;display:flex;align-items:center;justify-content:space-between;gap:.5rem;padding:.6rem .85rem;border:1.5px solid #e2e5ee;border-radius:11px;background:#f8f9fc;color:#202122;font:inherit;font-size:14px;cursor:pointer;text-align:left;transition:border-color .15s,background .15s}#nb-cm-sel-btn:hover{border-color:#c7cee6}#nb-cm-sel-btn.is-open{border-color:#3366cc;background:#fff}#nb-cm-sel-btn svg{color:#8a8d99;transition:transform .18s;flex:none}#nb-cm-sel-btn.is-open svg{transform:rotate(180deg);color:#3366cc}#nb-cm-sel-list{display:none;position:absolute;left:0;right:0;top:calc(100% + 6px);background:#fff;border:1px solid #e2e5ee;border-radius:12px;box-shadow:0 10px 28px rgba(20,20,40,.14);overflow:hidden;z-index:3}.nbcm-opt{padding:.68rem .85rem;font-size:14px;cursor:pointer}.nbcm-opt:hover{background:#eef2fc}.nbcm-opt.is-selected{color:#3366cc;font-weight:600;background:#f3f6fd}#nb-cm-list{flex:1;min-height:0;overflow-y:auto;padding:.2rem 1.2rem 1rem;border-top:1px solid #eef0f6;-webkit-overflow-scrolling:touch}.nbcm-empty{padding:2.2rem 0;text-align:center;color:#8a8d99;font-size:13px}.nbcm-thread{padding:.85rem 0;border-bottom:1px solid #f0f1f6}.nbcm-thread:last-child{border-bottom:0}.nbcm-row{display:flex;gap:.6rem;border-radius:10px;transition:background .6s}.nbcm-row.flash{background:#fff6d6}.nbcm-replies{margin:.7rem 0 0 2.35rem;padding-left:.7rem;border-left:2px solid #eef0f6;display:flex;flex-direction:column;gap:.8rem}.nbcm-av{flex:none;width:30px;height:30px;border-radius:50%;background:#eef2fc;color:#3366cc;font-weight:700;font-size:13px;display:flex;align-items:center;justify-content:center;overflow:hidden}.nbcm-av.anon{background:#f1f2f6;color:#8a8d99}.nbcm-av img{width:100%;height:100%;object-fit:cover;display:block}.nbcm-reply .nbcm-av,.nbcm-row.reply .nbcm-av{width:26px;height:26px;font-size:12px}.nbcm-main{flex:1;min-width:0}.nbcm-top{display:flex;align-items:center;gap:.4rem;flex-wrap:wrap}.nbcm-name{font-weight:700;font-size:13px;color:#202122}.nbcm-name.anon{color:#8a8d99;font-weight:600}.nbcm-pill{font-size:10px;font-weight:700;letter-spacing:.03em;text-transform:uppercase;color:#3366cc;background:#eef2fc;border-radius:6px;padding:1px 6px}.nbcm-time{font-size:11.5px;color:#8a8d99}.nbcm-to{font-size:11.5px;color:#8a8d99;margin-top:1px}.nbcm-text{font-size:14px;line-height:1.42;color:#202122;margin-top:.15rem;white-space:pre-wrap;overflow-wrap:anywhere}.nbcm-act{display:flex;align-items:center;gap:.9rem;margin-top:.3rem;flex-wrap:wrap}.nbcm-btn{border:0;background:transparent;padding:.2rem 0;font:inherit;font-size:12.5px;font-weight:600;color:#8a8d99;cursor:pointer;display:inline-flex;align-items:center;gap:.28rem}.nbcm-btn:hover{color:#3366cc}.nbcm-like.on{color:#c23b3b}.nbcm-like svg{fill:none;stroke:currentColor;stroke-width:2.2}.nbcm-like.on svg{fill:currentColor}.nbcm-del{margin-left:auto}.nbcm-del:hover,.nbcm-del.armed{color:#c23b3b}#nb-cm-comp{border-top:1px solid #eef0f6;padding:.7rem 1.2rem calc(.8rem + env(safe-area-inset-bottom,0px));background:#fff}#nb-cm-note{font-size:12.5px;color:#8a8d99;text-align:center;padding:.3rem 0}#nb-cm-rep{display:none;align-items:center;justify-content:space-between;font-size:12px;color:#3366cc;font-weight:600;margin-bottom:.4rem}#nb-cm-rep-x{border:0;background:transparent;color:#8a8d99;font-size:16px;line-height:1;cursor:pointer;padding:0 .2rem}.nbcm-field{display:flex;gap:.5rem;align-items:flex-end}#nb-cm-ta{flex:1;min-width:0;border:1.5px solid #e2e5ee;border-radius:11px;padding:.6rem .85rem;font:inherit;font-size:14px;color:#202122;background:#f8f9fc;outline:none;resize:none;height:42px;max-height:110px;line-height:1.35;transition:border-color .15s,background .15s}#nb-cm-ta:focus{border-color:#3366cc;background:#fff}#nb-cm-send{flex:none;padding:.6rem 1.05rem;border-radius:10px;border:none;background:#3366cc;color:#fff;font:inherit;font-size:13.5px;font-weight:600;cursor:pointer;box-shadow:0 4px 12px rgba(51,102,204,.35);transition:background .15s,transform .1s}#nb-cm-send:hover{background:#2c58b3}#nb-cm-send:active{transform:scale(.97)}#nb-cm-send:disabled{opacity:.5;cursor:default;box-shadow:none;transform:none}.nbcm-foot{display:flex;justify-content:space-between;align-items:center;margin-top:.3rem;min-height:1.1rem;font-size:11.5px;color:#8f8f89}#nb-cm-msg{color:#a83232;font-size:12.5px}@keyframes nbcmIn{from{opacity:0;transform:translateY(14px)}to{opacity:1;transform:translateY(0)}}@keyframes nbcmFade{from{opacity:0}to{opacity:1}}";
+const COMMENTS_PAGE_HTML = "<button id=\"nb-cm-fab\" class=\"nbcm-fab nbcm-hidden\" type=\"button\" aria-label=\"Comments\"><svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"M21 11.5a8.4 8.4 0 0 1-9 8.4 9 9 0 0 1-3.6-.8L3 21l1.9-5.4A8.4 8.4 0 0 1 3 11.5 8.5 8.5 0 0 1 12 3a8.5 8.5 0 0 1 9 8.5z\"/></svg><span id=\"nb-cm-badge\"></span></button><div id=\"nb-cm-overlay\"><div id=\"nb-cm-box\" role=\"dialog\" aria-modal=\"true\" aria-label=\"Comments\"><div class=\"nbcm-head\"><div class=\"nbcm-tile\"><svg width=\"18\" height=\"18\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"#3366cc\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"M21 11.5a8.4 8.4 0 0 1-9 8.4 9 9 0 0 1-3.6-.8L3 21l1.9-5.4A8.4 8.4 0 0 1 3 11.5 8.5 8.5 0 0 1 12 3a8.5 8.5 0 0 1 9 8.5z\"/></svg></div><div><div class=\"nbcm-title\">Comments</div><div class=\"nbcm-subt\" id=\"nb-cm-sub\"></div></div><button id=\"nb-cm-close\" type=\"button\" aria-label=\"Close\"><svg width=\"16\" height=\"16\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2.4\" stroke-linecap=\"round\"><line x1=\"6\" y1=\"6\" x2=\"18\" y2=\"18\"/><line x1=\"18\" y1=\"6\" x2=\"6\" y2=\"18\"/></svg></button></div><div class=\"nbcm-filter\"><span class=\"nbcm-lab\">Show</span><div id=\"nb-cm-sel\"><button type=\"button\" id=\"nb-cm-sel-btn\" aria-haspopup=\"listbox\" aria-expanded=\"false\"><span id=\"nb-cm-sel-lbl\">Newest</span><svg width=\"15\" height=\"15\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2.5\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><polyline points=\"6 9 12 15 18 9\"/></svg></button><div id=\"nb-cm-sel-list\" role=\"listbox\"></div></div></div><div id=\"nb-cm-list\"></div><div id=\"nb-cm-comp\"><div id=\"nb-cm-note\" style=\"display:none\"></div><div id=\"nb-cm-rep\"><span></span><button type=\"button\" id=\"nb-cm-rep-x\" aria-label=\"Cancel reply\">&times;</button></div><div class=\"nbcm-field\"><textarea id=\"nb-cm-ta\" rows=\"1\" maxlength=\"500\" placeholder=\"Add a comment\"></textarea><button type=\"button\" id=\"nb-cm-send\" disabled>Post</button></div><div class=\"nbcm-foot\"><span id=\"nb-cm-msg\" role=\"status\" aria-live=\"polite\"></span><span id=\"nb-cm-count\">0/500</span></div></div></div></div>";
+const COMMENTS_PAGE_JS = "(function(){\nvar d=document,W=window,dataEl=d.getElementById('nb-cm-data'),D={};\ntry{D=JSON.parse(dataEl.textContent)}catch(e){}\nvar slug=D.slug,list=D.comments||[],isOwner=false,inApp=false,signedIn=false,mode='new',open={},replyTo=null,busy=false,delArm=null,sheetOpen=false;\nvar fab=d.getElementById('nb-cm-fab'),badge=d.getElementById('nb-cm-badge'),ov=d.getElementById('nb-cm-overlay'),box=d.getElementById('nb-cm-box');\nvar body=d.getElementById('nb-cm-list'),sub=d.getElementById('nb-cm-sub'),ta=d.getElementById('nb-cm-ta'),send=d.getElementById('nb-cm-send'),cnt=d.getElementById('nb-cm-count'),note=d.getElementById('nb-cm-note'),rep=d.getElementById('nb-cm-rep'),msg=d.getElementById('nb-cm-msg');\nvar selBtn=d.getElementById('nb-cm-sel-btn'),selLbl=d.getElementById('nb-cm-sel-lbl'),selList=d.getElementById('nb-cm-sel-list'),comp=d.getElementById('nb-cm-comp');\nvar MODES=[['new','Newest'],['old','Oldest'],['top','Most liked'],['replies','Most replies'],['mine','My comments']];\nvar pend={},rid=0;\nfunction bridge(op,data){return new Promise(function(res,rej){if(W.parent===W)return rej(new Error('no app'));var id=++rid,m={type:'nb-cm',rid:id,op:op,slug:slug};for(var k in data)m[k]=data[k];pend[id]={res:res,rej:rej};W.parent.postMessage(m,'*');setTimeout(function(){if(pend[id]){delete pend[id];rej(new Error('That took too long'))}},15000)})}\nW.addEventListener('message',function(e){var m=e.data;if(!m||e.source!==W.parent)return;if(m.type==='nb-cm-res'){var p=pend[m.rid];if(p){delete pend[m.rid];m.ok?p.res(m.data):p.rej(new Error(m.error||'Something went wrong'))}}else if(m.type==='nb-cm-open'){showSheet(m.commentId)}});\nfunction el(t,c,x){var n=d.createElement(t);if(c)n.className=c;if(x!=null)n.textContent=x;return n}\nfunction ago(ts){var s=Math.max(0,Math.floor((Date.now()-ts)/1000));if(s<60)return 'just now';var m=Math.floor(s/60);if(m<60)return m+'m';var h=Math.floor(m/60);if(h<24)return h+'h';var dd=Math.floor(h/24);if(dd<30)return dd+'d';var mo=Math.floor(dd/30);return mo<12?mo+'mo':Math.floor(dd/365)+'y'}\nfunction plural(n,w){return n+' '+w+(n===1?'':'s')}\nvar ICON_HEART='<svg width=\"14\" height=\"14\" viewBox=\"0 0 24 24\" fill=\"currentColor\"><path d=\"M12 21s-7.5-4.6-9.6-9.2C.8 8.3 2.6 4.5 6.3 4.5c2 0 3.6 1 5.7 3.2 2.1-2.2 3.7-3.2 5.7-3.2 3.7 0 5.5 3.8 3.9 7.3C19.5 16.4 12 21 12 21z\"/></svg>';\nvar ICON_TRASH='<svg width=\"14\" height=\"14\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"M3 6h18\"/><path d=\"M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2\"/><path d=\"M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6\"/></svg>';\nvar ICON_USER='<svg width=\"16\" height=\"16\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><circle cx=\"12\" cy=\"8\" r=\"4\"/><path d=\"M4 21c0-4 4-6 8-6s8 2 8 6\"/></svg>';\nfunction byId(id){for(var i=0;i<list.length;i++)if(list[i].id===id)return list[i];return null}\nfunction paintCount(){var n=list.length;badge.textContent=n>99?'99+':String(n);badge.style.display=n?'flex':'none';fab.setAttribute('aria-label',n?plural(n,'comment'):'Comments');sub.textContent=n?plural(n,'comment'):'Be the first to comment'}\nfunction avatar(c){var a=el('div','nbcm-av');if(c.name&&c.authorId){var im=d.createElement('img');im.alt='';im.src='/account/profile-image/'+encodeURIComponent(c.authorId);im.onerror=function(){a.removeChild(im);a.textContent=c.name.charAt(0).toUpperCase()};a.appendChild(im)}else if(c.name){a.textContent=c.name.charAt(0).toUpperCase()}else{a.innerHTML=ICON_USER;a.className+=' anon'}return a}\nfunction row(c,isReply){\nvar r=el('div','nbcm-row'+(isReply?' reply':''));r.setAttribute('data-id',c.id);r.appendChild(avatar(c));\nvar main=el('div','nbcm-main'),top=el('div','nbcm-top');\ntop.appendChild(el('span','nbcm-name'+(c.name?'':' anon'),c.name||'Anonymous'));\nif(c.byOwner)top.appendChild(el('span','nbcm-pill','Author'));\ntop.appendChild(el('span','nbcm-time',ago(c.createdAt)));main.appendChild(top);\nif(c.replyTo){var t=byId(c.replyTo);if(t&&t.id!==c.parentId)main.appendChild(el('div','nbcm-to','Replying to '+(t.name||'Anonymous')))}\nmain.appendChild(el('div','nbcm-text',c.body));\nvar act=el('div','nbcm-act'),lk=el('button','nbcm-btn nbcm-like'+(c.liked?' on':''));lk.type='button';lk.innerHTML=ICON_HEART;lk.appendChild(el('span',null,String(c.likes||0)));lk.setAttribute('aria-label',(c.liked?'Unlike':'Like')+' comment, '+plural(c.likes||0,'like'));lk.onclick=function(){toggleLike(c)};act.appendChild(lk);\nif(inApp&&signedIn){var rp=el('button','nbcm-btn','Reply');rp.type='button';rp.onclick=function(){startReply(c)};act.appendChild(rp)}\nif(!isReply&&c.replies){var tg=el('button','nbcm-btn nbcm-rc',open[c.id]?'Hide replies':plural(c.replies,'reply'));tg.type='button';tg.onclick=function(){open[c.id]=!open[c.id];render()};act.appendChild(tg)}\nif(inApp&&(c.mine||isOwner)){var dl=el('button','nbcm-btn nbcm-del'+(delArm===c.id?' armed':''));dl.type='button';if(delArm===c.id){dl.textContent='Delete?'}else{dl.innerHTML=ICON_TRASH;dl.setAttribute('aria-label','Delete comment')}dl.onclick=function(){if(delArm===c.id){doDelete(c)}else{delArm=c.id;render();setTimeout(function(){if(delArm===c.id){delArm=null;render()}},3000)}};act.appendChild(dl)}\nmain.appendChild(act);r.appendChild(main);return r}\nfunction render(){\nvar keep=body.scrollTop;body.textContent='';var tops=[],kids={};\nlist.forEach(function(c){if(c.parentId){(kids[c.parentId]=kids[c.parentId]||[]).push(c)}else tops.push(c)});\nfunction hasMine(c){return c.mine||(kids[c.id]||[]).some(function(k){return k.mine})}\nif(mode==='mine')tops=tops.filter(hasMine);\ntops.sort(function(a,b){if(mode==='old')return a.createdAt-b.createdAt;if(mode==='top')return (b.likes-a.likes)||(b.createdAt-a.createdAt);if(mode==='replies')return (b.replies-a.replies)||(b.createdAt-a.createdAt);return b.createdAt-a.createdAt});\nif(!tops.length){body.appendChild(el('div','nbcm-empty',mode==='mine'?'You have not commented yet.':'No comments yet.'))}\ntops.forEach(function(c){var w=el('div','nbcm-thread');w.appendChild(row(c,false));if(open[c.id]&&kids[c.id]){var rw=el('div','nbcm-replies');kids[c.id].forEach(function(k){rw.appendChild(row(k,true))});w.appendChild(rw)}body.appendChild(w)});\nbody.scrollTop=keep;paintCount();paintComposer()}\nfunction paintComposer(){\ncomp.style.display='';\nif(!inApp){note.style.display='';note.textContent='Open this page in the Bluebook app to join the conversation.';ta.parentNode.style.display='none';return}\nif(!signedIn){note.style.display='';note.textContent='Sign in to Bluebook to comment.';ta.parentNode.style.display='none';return}\nnote.style.display='none';ta.parentNode.style.display='';\nif(replyTo){var t=byId(replyTo);rep.style.display='flex';rep.firstChild.textContent='Replying to '+((t&&t.name)||'Anonymous');ta.placeholder='Write a reply'}else{rep.style.display='none';ta.placeholder='Add a comment'}\ncnt.textContent=ta.value.length+'/500';send.disabled=busy||!ta.value.trim()}\nfunction say(t){msg.textContent=t||'';if(t)setTimeout(function(){if(msg.textContent===t)msg.textContent=''},4000)}\nfunction startReply(c){replyTo=c.id;if(c.parentId)open[c.parentId]=true;else open[c.id]=true;render();ta.focus()}\nfunction apply(r){if(!r)return;if(typeof r.owner==='boolean')isOwner=r.owner;if(r.comments){list=r.comments;if(r.owner!==undefined)isOwner=!!r.owner}}\nfunction refresh(){var p=inApp?bridge('list'):fetch('/comments/'+encodeURIComponent(slug),{cache:'no-store'}).then(function(r){if(!r.ok)throw new Error('x');return r.json()});return p.then(function(r){apply(r);render()}).catch(function(){})}\nfunction toggleLike(c){if(!inApp||!signedIn){say(inApp?'Sign in to like comments.':'Open this page in Bluebook to like comments.');return}if(c.mine){say('You can\\u2019t like your own comment.');return}var want=!c.liked,was=c.liked,wasN=c.likes;c.liked=want;c.likes=Math.max(0,c.likes+(want?1:-1));render();bridge(want?'like':'unlike',{id:c.id}).then(function(r){if(r&&typeof r.likes==='number'){c.likes=r.likes;render()}}).catch(function(e){c.liked=was;c.likes=wasN;render();say(e.message)})}\nfunction doDelete(c){delArm=null;bridge('del',{id:c.id}).then(function(){if(replyTo===c.id)replyTo=null;return refresh()}).catch(function(e){render();say(e.message)})}\nfunction post(){var text=ta.value.trim();if(!text||busy)return;busy=true;paintComposer();bridge('post',{body:text,parentId:replyTo}).then(function(r){ta.value='';var pid=r&&r.comment&&r.comment.parentId;if(pid)open[pid]=true;replyTo=null;busy=false;return refresh().then(function(){var id=r&&r.comment&&r.comment.id;if(id)focusComment(id,true)})}).catch(function(e){busy=false;paintComposer();say(e.message)})}\nfunction focusComment(id,quiet){var n=body.querySelector('[data-id=\"'+id+'\"]');if(!n){var c=byId(id);if(c&&c.parentId&&!open[c.parentId]){open[c.parentId]=true;render();n=body.querySelector('[data-id=\"'+id+'\"]')}}if(!n)return;if(mode==='mine'&&!quiet){}n.scrollIntoView({block:'center'});if(!quiet){n.classList.add('flash');setTimeout(function(){n.classList.remove('flash')},2200)}}\nfunction showSheet(id){sheetOpen=true;ov.style.display='flex';fab.classList.add('nbcm-gone');paintCount();render();refresh().then(function(){if(id){if(mode==='mine')setMode('new');focusComment(id)}});if(!id)body.scrollTop=0}\nfunction hideSheet(){sheetOpen=false;ov.style.display='none';fab.classList.remove('nbcm-gone');closeSel();reveal()}\nfunction closeSel(){selList.style.display='none';selBtn.classList.remove('is-open');selBtn.setAttribute('aria-expanded','false')}\nfunction setMode(m){mode=m;MODES.forEach(function(x){if(x[0]===m)selLbl.textContent=x[1]});[].forEach.call(selList.children,function(o){var on=o.getAttribute('data-v')===m;o.className='nbcm-opt'+(on?' is-selected':'');o.setAttribute('aria-selected',on?'true':'false')});render()}\nMODES.forEach(function(x){var o=el('div','nbcm-opt'+(x[0]==='new'?' is-selected':''),x[1]);o.setAttribute('role','option');o.setAttribute('data-v',x[0]);o.onclick=function(){closeSel();setMode(x[0])};selList.appendChild(o)});\nselBtn.onclick=function(){var o=selList.style.display==='none';selList.style.display=o?'block':'none';selBtn.classList.toggle('is-open',o);selBtn.setAttribute('aria-expanded',o?'true':'false')};\nd.getElementById('nb-cm-close').onclick=hideSheet;d.getElementById('nb-cm-rep-x').onclick=function(){replyTo=null;paintComposer()};\nov.addEventListener('click',function(e){if(e.target===ov)hideSheet()});\nd.addEventListener('keydown',function(e){if(e.key==='Escape'&&sheetOpen)hideSheet()});\nta.addEventListener('input',paintComposer);send.onclick=post;\nfab.onclick=function(){showSheet()};\nvar ft=null;function reveal(){if(sheetOpen)return;fab.classList.remove('nbcm-hidden');clearTimeout(ft);ft=setTimeout(function(){fab.classList.add('nbcm-hidden')},1800)}\nW.addEventListener('scroll',reveal,{passive:true,capture:true});d.addEventListener('touchstart',reveal,{passive:true});d.addEventListener('touchmove',reveal,{passive:true});d.addEventListener('wheel',reveal,{passive:true});\nfab.addEventListener('mouseenter',function(){clearTimeout(ft);fab.classList.remove('nbcm-hidden')});fab.addEventListener('mouseleave',reveal);fab.addEventListener('focus',function(){clearTimeout(ft);fab.classList.remove('nbcm-hidden')});fab.addEventListener('blur',reveal);\npaintCount();render();reveal();\nif(W.parent!==W){bridge('hello').then(function(r){inApp=true;signedIn=!!(r&&r.signedIn);return refresh()}).catch(function(){})}\nelse{refresh()}\n})();\n";
+// The comments section, rendered into the page as it is served: a floating button, a sheet, and the comments themselves as JSON.
+async function commentsPageBlock(env, slug, meta) {
+  try {
+    if (!meta || meta.adminLocked || !(await commentsEnabled(env, slug))) return '';
+    const comments = await listCommentsFor(env, slug, null, meta.ownerSub);
+    const data = JSON.stringify({ slug, comments }).replace(/</g, '\\u003c').replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029');
+    return '<style id="nb-cm-style">' + COMMENTS_PAGE_CSS + '</style>' + COMMENTS_PAGE_HTML + '<script type="application/json" id="nb-cm-data">' + data + '</script><script>' + COMMENTS_PAGE_JS + '</script>';
+  } catch (e) { console.log('comments block failed: ' + (e && e.message)); return ''; }
 }
 
 const SUBSCRIPTIONS_FEED_PAGE_SIZE = 20;
@@ -2345,6 +2583,7 @@ async function handleMyStories(env, request) {
   const { results } = await env.ADS_DB.prepare(query).bind(...params).all();
 
   const likeCounts = await likeCountsFor(env, results.map(r => r.slug));
+  const commentCounts = await commentCountsFor(env, results.map(r => r.slug));
   const user = await getUser(env, sub);
   const authorId = (await authorIdsFor(env, [sub]))[sub] || null;
   const origin = url.origin;
@@ -2367,7 +2606,7 @@ async function handleMyStories(env, request) {
         seen: false,
         images: card.images,
         imageCount: card.count,
-        likes: likeCounts[r.slug] || 0
+        likes: likeCounts[r.slug] || 0, comments: commentCounts[r.slug] || 0
       };
     }),
     nextCursor: (last && results.length === SUBSCRIPTIONS_FEED_PAGE_SIZE) ? `${last.created_at}:${last.slug}` : null
@@ -2423,6 +2662,7 @@ async function handlePublishedNotes(env, request) {
     storyRows.forEach(r => { storyBySlug[r.slug] = r; });
   }
   const likeCounts = await likeCountsFor(env, rows.map(x => x.slug));
+  const commentCounts = await commentCountsFor(env, rows.map(x => x.slug));
   const user = await getUser(env, sub);
   const authorId = (await authorIdsFor(env, [sub]))[sub] || null;
   const origin = url.origin;
@@ -2444,7 +2684,7 @@ async function handlePublishedNotes(env, request) {
       seen: false,
       images: card.images,
       imageCount: card.count,
-      likes: likeCounts[slug] || 0
+      likes: likeCounts[slug] || 0, comments: commentCounts[slug] || 0
     });
   }
   const last = results[results.length - 1];
@@ -2505,6 +2745,7 @@ async function handleLikedNotes(env, request) {
   }
   const idBySub = authorSubs.length ? await authorIdsFor(env, authorSubs) : {};
   const likeCounts = await likeCountsFor(env, rows.map(x => x.r.slug));
+  const commentCounts = await commentCountsFor(env, rows.map(x => x.r.slug));
 
   const origin = url.origin;
   const last = results[results.length - 1];
@@ -2528,7 +2769,7 @@ async function handleLikedNotes(env, request) {
         seen: false,
         images: card.images,
         imageCount: card.count,
-        likes: likeCounts[r.slug] || 0
+        likes: likeCounts[r.slug] || 0, comments: commentCounts[r.slug] || 0
       };
     }),
     nextCursor: (last && results.length === SUBSCRIPTIONS_FEED_PAGE_SIZE) ? `${last.liked_at}:${last.slug}` : null
@@ -2642,6 +2883,7 @@ async function handleSubscriptionsFeed(env, request) {
   }
   const idBySub = await authorIdsFor(env, authorSubs);
   const likeCounts = await likeCountsFor(env, results.map(r => r.slug));
+  const commentCounts = await commentCountsFor(env, results.map(r => r.slug));
 
   const origin = new URL(request.url).origin;
   const last = results[results.length - 1];
@@ -2665,7 +2907,7 @@ async function handleSubscriptionsFeed(env, request) {
         seen: !!r.seen,
         images: card.images,
         imageCount: card.count, // total images in the note, for the "+N" badge
-        likes: likeCounts[r.slug] || 0 // likes the note has received, shown beside the time-ago
+        likes: likeCounts[r.slug] || 0, comments: commentCounts[r.slug] || 0 // likes the note has received, shown beside the time-ago
       };
     }),
     // A short page means we've hit the end; only hand back a cursor when
@@ -2698,6 +2940,7 @@ async function handleServe(env, slug) {
     "base-uri 'none'"
   ].join('; ');
 
+  const cmBlock = typeof HTMLRewriter === 'undefined' ? '' : await commentsPageBlock(env, slug, meta);
   const res = new Response(obj.body, {
     headers: {
       'Content-Type': 'text/html; charset=utf-8',
@@ -2709,7 +2952,7 @@ async function handleServe(env, slug) {
       ...corsHeaders()
     }
   });
-  return typeof HTMLRewriter === 'undefined' ? res : holdUntilLaidOut(res);
+  return typeof HTMLRewriter === 'undefined' ? res : holdUntilLaidOut(res, cmBlock);
 }
 
 // A page's blocks are laid out by a script at the very end of the page, but the browser paints as the page streams in, so
@@ -2723,11 +2966,12 @@ const HOLD_BODY = '<script>(function(){var d=document,done=false;function show()
   + 'function settle(){requestAnimationFrame(function(){requestAnimationFrame(show)})}'
   + 'var w=[].slice.call(d.querySelectorAll(".cv-canvas img")).filter(function(i){return !i.complete}).map(function(i){return new Promise(function(r){i.addEventListener("load",r);i.addEventListener("error",r)})});'
   + 'if(d.fonts&&d.fonts.ready)w.push(d.fonts.ready);Promise.all(w).then(settle,settle);setTimeout(show,5000)})()</script>';
-function holdUntilLaidOut(res) {
-  return new HTMLRewriter()
+function holdUntilLaidOut(res, extraBody) {
+  const rw = new HTMLRewriter()
     .on('head', { element(el) { el.append(HOLD_HEAD, { html: true }); } })
-    .on('body', { element(el) { el.append(HOLD_BODY, { html: true }); } })
-    .transform(res);
+    .on('body', { element(el) { el.append(HOLD_BODY, { html: true }); } });
+  if (extraBody) rw.on('body', { element(el) { el.append(extraBody, { html: true }); } });
+  return rw.transform(res);
 }
 
 // Best-effort rate limit for POST /report/:slug. Cloudflare dashboard rate-limit
@@ -3049,6 +3293,7 @@ async function handleDeleteAccount(env, request) {
 // job below, once an account's grace period (see handleDeleteAccount)
 // has elapsed.
 async function purgeAccountData(env, sub) {
+  await deleteCommentsForAccount(env, sub);
   const prefix = 'owner:' + sub + ':';
   let cursor;
   do {
@@ -3070,6 +3315,7 @@ async function purgeAccountData(env, sub) {
           env.ADS_DB.prepare('DELETE FROM likes WHERE slug = ?').bind(slug),
           env.ADS_DB.prepare("DELETE FROM action_clocks WHERE kind = 'like' AND item = ?").bind(slug)
         ]);
+        await deleteCommentsForSlug(env, slug);
         await deleteStoryCardImages(env, slug);
         await env.SLUGS.delete(cardImagesKey(slug));
         await deleteStoryImage(env, slug); // not gated on meta.showInStories, see handleUnpublish
@@ -3449,7 +3695,7 @@ function newReferralCode() {
 }
 const REQ_WORDS = {
   subs: ['subscriber', 'subscribers'], notes: ['published note', 'published notes'],
-  likesReceived: ['like received', 'likes received'], likesGiven: ['like given to other notes', 'likes given to other notes'],
+  likesReceived: ['like or comment received', 'likes and comments received'], likesGiven: ['like or comment given to other notes', 'likes and comments given to other notes'],
   follows: ['account you follow', 'accounts you follow'], activeDays: ['active day in the last 30', 'active days in the last 30'],
   stories: ['note shared to stories', 'notes shared to stories']
 };
@@ -3484,13 +3730,15 @@ function ensureAdStanding(env) {
 // Everything the tiers are judged on, in one D1 round trip.
 async function adMetrics(env, sub) {
   await ensureAdStanding(env);
+  await ensureComments(env);
   const today = Math.floor(Date.now() / 86400000);
   const q = (sql, ...b) => env.ADS_DB.prepare(sql).bind(...b);
   const rs = await env.ADS_DB.batch([
     q('SELECT COUNT(*) AS c FROM subscriptions WHERE author_sub = ?', sub),
     q('SELECT COUNT(*) AS c FROM published_notes WHERE author_sub = ?', sub),
-    q('SELECT COUNT(*) AS c FROM likes WHERE author_sub = ?', sub),
-    q('SELECT COUNT(*) AS c FROM likes WHERE liker_sub = ?', sub),
+    // Comments and replies count next to likes, once per person per note (like a like), and never your own on your own notes.
+    q("SELECT (SELECT COUNT(*) FROM likes WHERE author_sub = ?) + (SELECT COUNT(DISTINCT c.author_sub || '|' || c.slug) FROM comments c JOIN published_notes p ON p.slug = c.slug WHERE p.author_sub = ? AND c.author_sub <> ?) AS c", sub, sub, sub),
+    q('SELECT (SELECT COUNT(*) FROM likes WHERE liker_sub = ?) + (SELECT COUNT(DISTINCT c.slug) FROM comments c WHERE c.author_sub = ? AND NOT EXISTS (SELECT 1 FROM published_notes p WHERE p.slug = c.slug AND p.author_sub = ?)) AS c', sub, sub, sub),
     q('SELECT COUNT(*) AS c FROM subscriptions WHERE subscriber_sub = ?', sub),
     q('SELECT COUNT(*) AS c FROM activity_daily WHERE id = ? AND day > ?', 'u:' + sub, today - 30),
     q('SELECT COUNT(*) AS c FROM stories WHERE author_sub = ?', sub),
@@ -4065,6 +4313,7 @@ async function handleAdView(env, request, slug) {
 // (created on first use, like report_index). The person can delete an alert from their own list,
 // which only sets dismissed_at; the row stays so the admin page can still show what was sent.
 const ALERTS_PAGE = 30;
+const ALERT_TAP_KINDS = new Set(['comment', 'reply', 'like', 'comment_like']); // alerts that open something when tapped; their ref says what
 const ALERT_MAX_LEN = 600;
 const ALERT_RETENTION_MS = 365 * 24 * 60 * 60 * 1000;
 const ALERT_REPORT_DEDUPE_MS = 24 * 60 * 60 * 1000; // same note + same reason: one alert a day, so a pile of reports can't flood the list
@@ -4145,7 +4394,7 @@ async function handleAlertsList(env, request, url) {
   await ensureAlerts(env);
   const cur = parseAdminCursor(url.searchParams.get('cursor'));
   const stmts = [
-    env.ADS_DB.prepare('SELECT id, kind, message, created_at FROM alerts WHERE sub = ? AND dismissed_at IS NULL' + (cur ? ' AND (created_at, id) < (?, ?)' : '') + ' ORDER BY created_at DESC, id DESC LIMIT ?')
+    env.ADS_DB.prepare('SELECT id, kind, message, ref, created_at FROM alerts WHERE sub = ? AND dismissed_at IS NULL' + (cur ? ' AND (created_at, id) < (?, ?)' : '') + ' ORDER BY created_at DESC, id DESC LIMIT ?')
       .bind(sub, ...(cur ? [cur.key, cur.id] : []), ALERTS_PAGE + 1)
   ];
   if (!cur) stmts.unshift(env.ADS_DB.prepare('SELECT COUNT(*) AS t FROM alerts WHERE sub = ? AND dismissed_at IS NULL').bind(sub));
@@ -4155,7 +4404,7 @@ async function handleAlertsList(env, request, url) {
   if (more) rows.pop();
   const last = rows[rows.length - 1];
   return json({
-    alerts: rows.map(r => ({ id: r.id, kind: r.kind, message: r.message, createdAt: r.created_at })),
+    alerts: rows.map(r => ({ id: r.id, kind: r.kind, message: r.message, createdAt: r.created_at, ref: ALERT_TAP_KINDS.has(r.kind) ? r.ref || null : null })),
     total: cur ? null : res[0].results[0].t,
     nextCursor: more && last ? last.created_at + '|' + last.id : null
   });
@@ -5029,6 +5278,7 @@ async function handleAdminLookup(env, request, url) {
     noteCreatedAt: meta.noteCreatedAt || null,
     story: story ? { title: story.title, createdAt: story.created_at, images: adminStoryImageSpecs(story) } : null,
     likes: likes ? likes.n : 0,
+    comments: ((await env.ADS_DB.prepare('SELECT COUNT(*) AS n FROM comments WHERE slug = ?').bind(slug).first()) || {}).n || 0,
     ad: ad ? { status: ad.status, viewsTotal: ad.views_total, viewsUsed: ad.views_used } : null,
     reports, reportStats, csamHold: hold !== null, snapshots: (snaps.objects || []).length, ncmec
   });
@@ -5218,7 +5468,7 @@ async function handleAdminOwnerAction(env, request) {
   if (['suspend', 'clear-name', 'clear-picture'].includes(action) && !reason) return textError(400, 'reason required');
   if (action === 'suspend') user.suspended = true;
   else if (action === 'unsuspend') delete user.suspended;
-  else if (action === 'clear-name') user.profileName = null;
+  else if (action === 'clear-name') { user.profileName = null; await syncCommentName(env, sub, null); }
   else if (action === 'clear-picture') { await env.NOTES_BUCKET.delete(profileImageKey(sub)); user.hasProfileImage = false; }
   else if (action === 'delete') { user.suspended = true; user.adminDeleted = true; user.pendingDeletionAt = Date.now(); }
   else if (action === 'cancel-delete') {
@@ -6230,6 +6480,7 @@ const ADMIN_COUNT_SORTS = {
   most_subs: { t: 'subscriptions', col: 'subs', asc: false }, least_subs: { t: 'subscriptions', col: 'subs', asc: true },
   most_posts: { t: 'published_notes', col: 'notes', asc: false }, least_posts: { t: 'published_notes', col: 'notes', asc: true },
   most_likes: { t: 'likes', col: 'likes', asc: false }, least_likes: { t: 'likes', col: 'likes', asc: true },
+  most_comments: { t: 'comments', col: 'comments', asc: false }, least_comments: { t: 'comments', col: 'comments', asc: true },
   // Following = accounts this one subscribes to, so it counts the other side of the subscriptions table (`by`).
   most_following: { t: 'subscriptions', by: 'subscriber_sub', col: 'following', asc: false }, least_following: { t: 'subscriptions', by: 'subscriber_sub', col: 'following', asc: true }
 };
@@ -6239,6 +6490,7 @@ function adminCountSort(sort, col, slugCol) {
   if (typeof sort !== 'string' || !Object.prototype.hasOwnProperty.call(ADMIN_COUNT_SORTS, sort)) return null;
   const s = ADMIN_COUNT_SORTS[sort];
   if (s.t === 'likes') return { col: s.col, asc: s.asc, expr: '(SELECT COUNT(*) FROM likes ct WHERE ct.' + (slugCol ? 'slug = ' + slugCol : 'author_sub = ' + col) + ')' };
+  if (s.t === 'comments') return { col: s.col, asc: s.asc, expr: slugCol ? '(SELECT COUNT(*) FROM comments ct WHERE ct.slug = ' + slugCol + ')' : '(SELECT COUNT(*) FROM comments ct JOIN published_notes cp ON cp.slug = ct.slug WHERE cp.author_sub = ' + col + ')' };
   return { col: s.col, asc: s.asc, expr: '(SELECT COUNT(*) FROM ' + s.t + ' ct WHERE ct.' + (s.by || 'author_sub') + ' = ' + col + ')' };
 }
 // An account's follower and note counts, as extra columns for lists whose rows belong to an account (col).
@@ -6377,7 +6629,7 @@ async function handleAdminNotes(env, request, url) {
   const curBind = !cur ? [] : cs ? [cur.key, cur.key, cur.at, cur.slug] : [cur.key, cur.id];
   const order = (cs ? cs.expr + (cs.asc ? ' ASC' : ' DESC') + ', ' : '') + 'n.created_at DESC, n.slug DESC';
   const stmts = [
-    env.ADS_DB.prepare('SELECT n.slug, n.created_at, s.title, (s.slug IS NOT NULL) AS story, (SELECT COUNT(*) FROM likes xl WHERE xl.slug = n.slug) AS likes, ' + adminAuthorCols('n.author_sub') + (cs ? ', ' + cs.expr + ' AS sort_key' : '') + from + whereSql + curSql + ' ORDER BY ' + order + ' LIMIT ?')
+    env.ADS_DB.prepare('SELECT n.slug, n.created_at, s.title, (s.slug IS NOT NULL) AS story, (SELECT COUNT(*) FROM likes xl WHERE xl.slug = n.slug) AS likes, (SELECT COUNT(*) FROM comments xc WHERE xc.slug = n.slug) AS comments, ' + adminAuthorCols('n.author_sub') + (cs ? ', ' + cs.expr + ' AS sort_key' : '') + from + whereSql + curSql + ' ORDER BY ' + order + ' LIMIT ?')
       .bind(...bind, ...curBind, ADMIN_DIR_PAGE + 1)
   ];
   if (!cur) stmts.unshift(env.ADS_DB.prepare('SELECT COUNT(*) AS t' + from + whereSql).bind(...bind));
@@ -6387,7 +6639,7 @@ async function handleAdminNotes(env, request, url) {
   if (more) rows.pop();
   const last = rows[rows.length - 1];
   return json({
-    notes: rows.map(r => ({ slug: r.slug, title: r.title || null, createdAt: r.created_at, story: !!r.story, authorSubs: r.author_subs, authorFollowing: r.author_following, authorNotes: r.author_notes, likes: r.likes })),
+    notes: rows.map(r => ({ slug: r.slug, title: r.title || null, createdAt: r.created_at, story: !!r.story, authorSubs: r.author_subs, authorFollowing: r.author_following, authorNotes: r.author_notes, likes: r.likes, comments: r.comments })),
     total: cur ? null : res[0].results[0].t,
     next: more && last ? (cs ? last.sort_key + '|' + last.created_at + ':' + last.slug : last.created_at + '|' + last.slug) : null
   });
@@ -7447,12 +7699,12 @@ function ask(o){
   })
 }
 
-var CSORT=[['most_subs','Most subscribers'],['least_subs','Least subscribers'],['most_posts','Most notes'],['least_posts','Least notes'],['most_likes','Most likes'],['least_likes','Least likes'],['most_following','Most following'],['least_following','Least following']];
+var CSORT=[['most_subs','Most subscribers'],['least_subs','Least subscribers'],['most_posts','Most notes'],['least_posts','Least notes'],['most_likes','Most likes'],['least_likes','Least likes'],['most_comments','Most comments'],['least_comments','Least comments'],['most_following','Most following'],['least_following','Least following']];
 // "12 subscribers" / "1 note" / "84 likes" for a count k (subs | posts | likes).
-function cntWord(k,n){return num(n)+(k==='subs'?(n===1?' subscriber':' subscribers'):k==='posts'?(n===1?' note':' notes'):k==='following'?' following':(n===1?' like':' likes'))}
-function isCsort(so){return /^(most|least)_(subs|posts|likes|following)$/.test(so||'')}
+function cntWord(k,n){return num(n)+(k==='subs'?(n===1?' subscriber':' subscribers'):k==='posts'?(n===1?' note':' notes'):k==='following'?' following':k==='comments'?(n===1?' comment':' comments'):(n===1?' like':' likes'))}
+function isCsort(so){return /^(most|least)_(subs|posts|likes|comments|following)$/.test(so||'')}
 // What a count sort on the Reports list ordered a card by: the reported note's likes, or its owner's subscribers / notes.
-function repCnt(r){var so=$('fsort').value;if(!isCsort(so)||r.sortCount==null)return '';var k=so.split('_')[1];return ' - '+(k==='likes'?'':'owner has ')+cntWord(k,r.sortCount)}
+function repCnt(r){var so=$('fsort').value;if(!isCsort(so)||r.sortCount==null)return '';var k=so.split('_')[1];return ' - '+(k==='likes'||(k==='comments'&&r.slug)?'':'owner has ')+cntWord(k,r.sortCount)}
 var PICKS={ovnsort:[['new','Newest first']].concat(CSORT),adsort:[['new','Newest first']].concat(CSORT),ovsort:[['new', 'Newest first'], ['old', 'Oldest first'], ['active', 'Last active']].concat(CSORT),ovfilter:[['', 'All users'], ['online', 'Online now'], ['active24', 'Active 24h']],fstatus:[['', 'Any status'], ['live', 'live'], ['taken down', 'taken down'], ['unpublished', 'unpublished'], ['missing', 'missing']],fsort:[['new', 'Default order'], ['most', 'Most reported'], ['old', 'Oldest first']].concat(CSORT),adst:[['', 'All ads'], ['active', 'Active'], ['paused', 'Paused'], ['exhausted', 'Used up'], ['unpublished', 'Down']],adkind:[['', 'Write & Share'], ['write', 'Write'], ['share', 'Share']]};
 function pickSet(id,v){
   var b=$(id),o=PICKS[id].filter(function(x){return x[0]===v})[0]||PICKS[id][0];
@@ -8116,6 +8368,7 @@ function renderLookup(d){
   kv(k,'Stories',(d.showInStories?'showing':'not showing')+(d.storyBlocked?' (blocked by admin)':''));
   if(d.story)kv(k,'Story',(d.story.title||'untitled')+' ('+fmt(d.story.createdAt)+')');
   kv(k,'Likes',num(d.likes));
+  kv(k,'Comments',num(d.comments));
   kv(k,'Ad',d.ad?d.ad.status+', '+d.ad.viewsUsed+' of '+pl(d.ad.viewsTotal,'view'):'none');
   repKvs(k,d);kv(k,'Snapshots',String(d.snapshots));
   if(d.csamHold)kv(k,'CSAM hold','yes (kept out of purge)');
@@ -9896,7 +10149,7 @@ function ovNote(n){
   var r=el('button','pgrow');r.type='button';r.onclick=function(){openLookup(n.slug)};
   var l=el('div');l.appendChild(slugEl(n.slug));
   var nk=isCsort(ovS.nsort)?ovS.nsort.split('_')[1]:'';
-  l.appendChild(el('small',null,(n.title||'Untitled')+' - published '+ago(n.createdAt)+(n.likes==null?'':' - '+cntWord('likes',n.likes))+((nk==='subs'||nk==='posts'||nk==='following')&&n.authorSubs!=null?' - author has '+cntWord(nk,nk==='subs'?n.authorSubs:nk==='following'?n.authorFollowing:n.authorNotes):'')));
+  l.appendChild(el('small',null,(n.title||'Untitled')+' - published '+ago(n.createdAt)+(n.likes==null?'':' - '+cntWord('likes',n.likes))+(n.comments==null?'':' - '+cntWord('comments',n.comments))+((nk==='subs'||nk==='posts'||nk==='following')&&n.authorSubs!=null?' - author has '+cntWord(nk,nk==='subs'?n.authorSubs:nk==='following'?n.authorFollowing:n.authorNotes):'')));
   r.appendChild(l);
   var m=el('div','pm');if(n.story)m.appendChild(chip('story'));
   r.appendChild(m);$('ovlist').appendChild(r)
@@ -10432,6 +10685,10 @@ export default {
           && pathname.length > '/publish/'.length + '/relink'.length) {
         return handleRelink(env, request, decodeURIComponent(pathname.slice('/publish/'.length, -'/relink'.length)));
       }
+      if (method === 'PUT' && pathname.startsWith('/publish/') && pathname.endsWith('/comments')
+          && pathname.length > '/publish/'.length + '/comments'.length) {
+        return handleSetComments(env, request, decodeURIComponent(pathname.slice('/publish/'.length, -'/comments'.length)));
+      }
       if (method === 'PUT' && pathname.startsWith('/publish/') && pathname.endsWith('/stories')
           && pathname.length > '/publish/'.length + '/stories'.length) {
         return handleSetStories(env, request, decodeURIComponent(pathname.slice('/publish/'.length, -'/stories'.length)));
@@ -10524,6 +10781,11 @@ export default {
       if (method === 'GET' && pathname === '/account/liked-notes') {
         return handleLikedNotes(env, request);
       }
+      if (method === 'POST' && pathname === '/comments/counts') return handleCommentCounts(env, request);
+      if (method === 'GET' && pathname.startsWith('/comments/')) return handleCommentsList(env, request, decodeURIComponent(pathname.slice('/comments/'.length)));
+      if (method === 'POST' && pathname.startsWith('/comments/')) return handleCommentPost(env, request, decodeURIComponent(pathname.slice('/comments/'.length)));
+      if (method === 'DELETE' && pathname.startsWith('/comment/')) return handleCommentDelete(env, request, decodeURIComponent(pathname.slice('/comment/'.length)));
+      if ((method === 'POST' || method === 'DELETE') && pathname.startsWith('/comment-likes/')) return handleCommentLike(env, request, decodeURIComponent(pathname.slice('/comment-likes/'.length)), method === 'POST');
       if (method === 'POST' && pathname === '/likes/counts') {
         return handleLikeCounts(env, request);
       }
@@ -10607,6 +10869,7 @@ export default {
         await auditBy(env, request, 'purge', null, purged + ' removed');
         return json({ ok: true, purged });
       }
+      if (pathname.startsWith('/admin/')) { try { await ensureComments(env); } catch (e) { console.log('comments tables: ' + (e && e.message)); } } // the admin lists sort and count by them
       if (method === 'GET' && pathname === '/admin') return handleAdminPage();
       if (method === 'GET' && pathname === '/admin/me') return handleAdminMe(env, request);
       if ((method === 'GET' || method === 'POST') && pathname === '/admin/admins') return handleAdminAdmins(env, request);
