@@ -1519,8 +1519,9 @@ function pick(id,fn){
   var b=$(id),back=el('div','sheet-back'),sh=el('div','sheet'),list=el('div','plist');
   sh.setAttribute('role','dialog');sh.setAttribute('aria-modal','true');sh.setAttribute('aria-label',b.getAttribute('aria-label'));
   sh.appendChild(el('div','grab'));
-  var sb=el('div','sheet-body');sh.appendChild(sb);
-  sb.appendChild(el('div','ptitle',b.getAttribute('aria-label')));
+  var top=el('div','sheet-top'),sb=el('div','sheet-body');
+  top.appendChild(el('div','ptitle',b.getAttribute('aria-label')));
+  sh.appendChild(top);sh.appendChild(sb);
   PICKS[id].forEach(function(o){
     var ob=el('button','popt',o[1]);ob.type='button';ob.setAttribute('role','option');
     ob.setAttribute('aria-selected',o[0]===b.value?'true':'false');
