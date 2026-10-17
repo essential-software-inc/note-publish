@@ -61,6 +61,12 @@ const RESERVED_SLUGS = new Set([
   'www', 'assets', 'static', 'favicon.ico', 'robots.txt', 'health',
   'auth', 'sync', 'my', 'presence'
 ]);
+// Reserved addresses: SLUGS key "reserved:<slug>" (value '1', metadata {at, by, note}). A reserved slug reads as taken in
+// GET /check-slug and POST /publish refuses it, even though no page is linked to it. Only the admin Tools screen
+// writes or clears these keys (POST /admin/reserved); a reservation never touches slug:<slug> metadata.
+const RESERVED_PREFIX = 'reserved:';
+const RESERVE_MAX = 2000;
+const RESERVE_BATCH_MAX = 20;
 const SOFT_DELETE_RETENTION_MS = 30 * 24 * 60 * 60 * 1000; // soft-deleted pages are kept 30 days before purge
 // CSAM-reported pages and their report records are held for 18 months (548 days),
 // counted from the report (or, for dismissed report records, from dismissal). 18 U.S.C.
@@ -116,6 +122,10 @@ function timingSafeEqual(a, b) {
 }
 function validSlug(slug) {
   return typeof slug === 'string' && SLUG_RE.test(slug) && !RESERVED_SLUGS.has(slug);
+}
+
+async function isReserved(env, slug) {
+  return (await env.SLUGS.get(RESERVED_PREFIX + slug)) !== null;
 }
 
 async function getMeta(env, slug) {
@@ -815,6 +825,7 @@ async function gcSyncImages(env) {
 
 async function handleCheckSlug(env, slug, request) {
   if (!validSlug(slug)) return json({ available: false, reason: 'invalid-format' });
+  if (await isReserved(env, slug)) return json({ available: false, reason: 'reserved' });
   const meta = await getMeta(env, slug);
   // A signed-in owner asking about their OWN live slug: still taken (nothing is ever overwritten), but
   // offer the next free numbered address (my-note-2, -3, ...) so both pages can live side by side.
@@ -826,7 +837,7 @@ async function handleCheckSlug(env, slug, request) {
         const cand = slug.slice(0, 48 - suffix.length).replace(/-+$/, '') + suffix;
         if (!validSlug(cand)) continue;
         const m = await getMeta(env, cand);
-        if (!m || (m.deletedAt && !m.adminLocked)) return json({ available: false, yours: true, suggest: cand });
+        if ((!m || (m.deletedAt && !m.adminLocked)) && !(await isReserved(env, cand))) return json({ available: false, yours: true, suggest: cand });
       }
       return json({ available: false, yours: true });
     }
@@ -1279,6 +1290,7 @@ async function handlePublish(env, request) {
   const existing = await getMeta(env, slug);
   if (existing && existing.adminLocked) return textError(403, 'slug permanently disabled');
   if (existing && !existing.deletedAt) return textError(409, 'slug already taken');
+  if (await isReserved(env, slug)) return textError(409, 'slug already taken');
 
   // Ownership tagging normally happens further down (after the token is
   // minted), but the page-count cap only means anything for an owned
@@ -5362,6 +5374,76 @@ async function handleAdminAdmins(env, request) {
   }
   return textError(400, 'unknown action');
 }
+// All reserved addresses (one KV key each, so one or two list calls), unsorted.
+async function listReserved(env) {
+  const out = [];
+  let cursor;
+  for (let i = 0; i < 3; i++) {
+    const page = await env.SLUGS.list({ prefix: RESERVED_PREFIX, cursor, limit: 1000 });
+    for (const k of page.keys) {
+      const m = k.metadata || {};
+      out.push({ slug: k.name.slice(RESERVED_PREFIX.length), at: m.at || null, by: m.by || null, note: m.note || null });
+    }
+    if (page.list_complete) break;
+    cursor = page.cursor;
+  }
+  return out;
+}
+
+// GET /admin/reserved?q=&sort=new|az&limit=&cursor=: one page of reserved addresses (limit 1 to 50, default 25). q matches part
+// of the slug or note. cursor is the offset in the filtered, sorted list, and next is null on the last page. total counts
+// every reservation, found those matching q.
+// POST /admin/reserved {action:'reserve', slugs:[...], note} reserves up to RESERVE_BATCH_MAX addresses (200 with
+// {reserved, skipped:[{slug, reason}]}); {action:'unreserve', slug} frees one. Any admin may use it, like Release.
+async function handleAdminReserved(env, request) {
+  const g = await adminGate(env, request, false); if (g) return g;
+  const all = await listReserved(env);
+  if (request.method === 'GET') {
+    const sp = new URL(request.url).searchParams;
+    const q = (sp.get('q') || '').trim().toLowerCase();
+    const sort = sp.get('sort') === 'az' ? 'az' : 'new';
+    const limit = Math.min(50, Math.max(1, parseInt(sp.get('limit') || '25', 10) || 25));
+    const start = Math.max(0, parseInt(sp.get('cursor') || '0', 10) || 0);
+    const rows = (q ? all.filter((r) => r.slug.includes(q) || (r.note && r.note.toLowerCase().includes(q))) : all.slice())
+      .sort(sort === 'az' ? (a, b) => (a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0) : (a, b) => (b.at || 0) - (a.at || 0) || (a.slug < b.slug ? -1 : 1));
+    return json({ ok: true, max: RESERVE_MAX, total: all.length, found: rows.length, reserved: rows.slice(start, start + limit), next: start + limit < rows.length ? start + limit : null });
+  }
+  const body = await adminBody(request);
+  if (body.action === 'reserve') {
+    const raw = Array.isArray(body.slugs) ? body.slugs : (typeof body.slug === 'string' ? [body.slug] : []);
+    if (!raw.length) return textError(400, 'no slugs given');
+    if (raw.length > RESERVE_BATCH_MAX) return textError(400, 'at most ' + RESERVE_BATCH_MAX + ' slugs at a time');
+    const note = typeof body.note === 'string' ? body.note.trim().replace(/\s+/g, ' ').slice(0, 100) : '';
+    let count = all.length;
+    const reserved = [], skipped = [], seen = new Set();
+    for (const r of raw) {
+      const slug = typeof r === 'string' ? r.trim().toLowerCase() : '';
+      if (seen.has(slug)) continue;
+      seen.add(slug);
+      const skip = (reason) => skipped.push({ slug: slug.slice(0, 48), reason });
+      if (!SLUG_RE.test(slug)) { skip('not a valid slug (3 to 48 characters: a-z, 0-9, hyphen)'); continue; }
+      if (RESERVED_SLUGS.has(slug)) { skip('already blocked by the system'); continue; }
+      if (count >= RESERVE_MAX) { skip('reservation limit reached (' + RESERVE_MAX + ')'); continue; }
+      const meta = await getMeta(env, slug);
+      if (meta && meta.adminLocked) { skip('locked by a takedown'); continue; }
+      if (meta && !meta.deletedAt) { skip('a live page already uses it'); continue; }
+      if (await isReserved(env, slug)) { skip('already reserved'); continue; }
+      await env.SLUGS.put(RESERVED_PREFIX + slug, '1', { metadata: { at: Date.now(), by: actorOf(request), note: note || null } });
+      await auditBy(env, request, 'reserve', slug, note || null);
+      count++;
+      reserved.push(slug);
+    }
+    return json({ ok: true, reserved, skipped });
+  }
+  if (body.action === 'unreserve') {
+    const slug = typeof body.slug === 'string' ? body.slug.trim().toLowerCase() : '';
+    if (!SLUG_RE.test(slug) || !(await isReserved(env, slug))) return textError(404, 'not reserved');
+    await env.SLUGS.delete(RESERVED_PREFIX + slug);
+    await auditBy(env, request, 'unreserve', slug, null);
+    return json({ ok: true });
+  }
+  return textError(400, 'unknown action');
+}
 // Author IDs are the public handle for an account, so admin searches accept them wherever a slug works.
 // adminAidQ: the lowercased ID if the text is one, else null. adminSubFromAid: its account sub, or null.
 function adminAidQ(raw) {
@@ -5484,7 +5566,9 @@ async function handleAdminLookup(env, request, url) {
   const [reportMap, reasonMap] = await Promise.all([reportCounts(env), reportReasonStats(env, [slug])]);
   const reports = reportMap.get(slug) || 0;
   const reportStats = reasonMap ? (reasonMap.get(slug) || { total: 0, open: 0, byReason: {} }) : null;
-  if (!meta) return json({ found: false, slug, reports, reportStats });
+  const resv = await env.SLUGS.getWithMetadata(RESERVED_PREFIX + slug);
+  const reserved = resv && resv.value !== null ? { at: (resv.metadata || {}).at || null, by: (resv.metadata || {}).by || null, note: (resv.metadata || {}).note || null } : null;
+  if (!meta) return json({ found: false, slug, reports, reportStats, reserved });
   const [user, story, likes, ad, head, snaps, hold, ncmec] = await Promise.all([
     meta.ownerSub ? getUser(env, meta.ownerSub) : null,
     env.ADS_DB.prepare('SELECT title, created_at, description, tags, image_url, image_urls FROM stories WHERE slug = ?').bind(slug).first(),
@@ -5511,7 +5595,7 @@ async function handleAdminLookup(env, request, url) {
     likes: likes ? likes.n : 0,
     comments: ((await env.ADS_DB.prepare('SELECT COUNT(*) AS n FROM comments WHERE slug = ?').bind(slug).first()) || {}).n || 0,
     ad: ad ? { status: ad.status, viewsTotal: ad.views_total, viewsUsed: ad.views_used } : null,
-    reports, reportStats, csamHold: hold !== null, snapshots: (snaps.objects || []).length, ncmec
+    reports, reportStats, reserved, csamHold: hold !== null, snapshots: (snaps.objects || []).length, ncmec
   });
 }
 
@@ -7005,7 +7089,7 @@ main{position:relative;z-index:1;max-width:720px;margin:0 auto;padding:2px 16px 
 .field-wrap .ico{position:absolute;left:15px;top:15px;width:20px;height:20px;color:var(--muted);pointer-events:none}
 .field-wrap .field{padding-left:44px}
 .clr{position:relative;flex:1;min-width:0}
-.clr>.field.has-clr,.field-wrap>.field.has-clr{padding-right:46px}
+.clr:has(>.clr-x.on)>.field.has-clr,.field-wrap:has(>.clr-x.on)>.field.has-clr{padding-right:46px}
 .clr-x{position:absolute;right:5.25px;top:50%;width:40px;height:40px;margin:-20px 0 0;padding:0;border:0;background:none;color:var(--muted);display:none;place-items:center;border-radius:50%}
 .clr-x.on{display:grid}
 .field-wrap .clr-x{right:6.5px}
@@ -7639,6 +7723,13 @@ html:has(.sheet-back){overflow:hidden}
         <div class="search"><input class="field" id="relslug" placeholder="Slug or link" autocomplete="off" autocapitalize="off" spellcheck="false"></div>
         <button class="btn block" id="relgo">Release slug</button>
       </div>
+      <div class="card static">
+        <div class="sec-head"><span class="tile sev-other"><span class="ico" data-i="shield"></span></span><div><div class="card-t">Reserved addresses</div><div class="card-s">Hold a slug so it shows as taken, even though no page uses it. Separate several with commas. Remove a reservation any time to free it.</div></div></div>
+        <div class="search"><input class="field" id="resslug" placeholder="Slug or link" autocomplete="off" autocapitalize="off" spellcheck="false"></div>
+        <div class="search"><input class="field" id="resnote" placeholder="Note (optional)" maxlength="100" autocomplete="off"></div>
+        <button class="btn primary block" id="resgo">Reserve</button>
+        <div class="recip" id="resrecip"></div>
+      </div>
       <div class="card static fo">
         <div class="sec-head"><span class="tile sev-csam"><span class="ico" data-i="trash"></span></span><div><div class="card-t">Purge</div><div class="card-s">The same jobs the cron runs: deletes expired unpublished pages, accounts past their deletion window, stale like/follow timestamps, unreferenced backup images, and old presence, alert, activity and report-index records.</div></div></div>
         <button class="btn danger block" id="purgego">Run purge now</button>
@@ -7716,7 +7807,7 @@ function clearable(i){
   b.onclick=function(){VALD.set.call(i,'');sync();i.dispatchEvent(new Event('input',{bubbles:true}));i.focus()};
   sync()
 }
-function clearableAll(){['tok','ovq','fq','adq','auq','lkslug','relslug'].forEach(function(id){clearable($(id))})}
+function clearableAll(){['tok','ovq','fq','adq','auq','lkslug','relslug','resslug','resnote'].forEach(function(id){clearable($(id))})}
 
 /* ---------- Snapshot preview (sandboxed) ---------- */
 function toDataUrl(b){return new Promise(function(res){var r=new FileReader();r.onload=function(){res(r.result)};r.onerror=function(){res(null)};r.readAsDataURL(b)})}
@@ -8086,7 +8177,7 @@ function showTab(t){
   if(t==='overview'){if(!ovS.loaded){ovS.loaded=true;loadOverview();ovList(true)}else if(fresh('ov')){loadOverview(true);trLoad(true);ovList(true,true)}}
   if(t==='ads'){if(!$('adlist').firstChild)loadAds(true);else if(fresh('ads'))loadAds(true,true)}
   if(t==='audit'){if(!auAll.length&&!$('aulist').firstChild)loadAudit(true);else if(fresh('audit'))loadAudit(true,true)}
-  if(t==='tools'){lgLoad();if(fresh('lg'))lgWarm(true);if(ME.role==='super')admLoad()}
+  if(t==='tools'){lgLoad();if(fresh('lg'))lgWarm(true);resLoad();if(ME.role==='super')admLoad()}
   requestAnimationFrame(xHintAll)
 }
 function goTab(t){showTab(t);navPush();window.scrollTo(0,0)}
@@ -8246,6 +8337,79 @@ function admRevoke(a){
     return api('/admin/admins',{method:'POST',body:{action:'revoke',id:a.id}}).then(function(o){
       if(o.ok){msg('Revoked '+a.name,'ok');admLoad()}else showErr(o,'Could not revoke '+a.name)
     }).catch(function(e){netFail(e)})
+  })
+}
+
+/* ---------- Reserved addresses ---------- */
+function resLoad(){
+  var r=$('resrecip');if(!r.firstChild)skel(r,1,'row');
+  return api('/admin/reserved?limit=1').then(function(o){
+    r.textContent='';r.className='recip';
+    if(!o.ok){r.classList.add('err');r.textContent=errMsg(o,'Could not load the reserved addresses');bad(o,'Could not load the reserved addresses');return}
+    var n=o.j.total;
+    if(!n){r.textContent='Nothing reserved yet.';return}
+    var go=el('button','recip-go');go.type='button';go.setAttribute('aria-label','View reserved addresses');
+    go.appendChild(el('b',null,num(n)));go.appendChild(document.createTextNode(' reserved address'+(n===1?'':'es')+', view all'));go.appendChild(ico('chev'));
+    go.onclick=resSheet;r.appendChild(go)
+  },function(e){r.textContent='';netFail(e)})
+}
+function resKv(k,d){
+  var r=d.reserved;if(!r)return;
+  kv(k,'Reserved',(r.note?r.note+' - ':'')+(r.at?fmtD(r.at):'yes')+(r.by?' by '+r.by:'')+' (shows as taken)')
+}
+function resAdd(){
+  var slugs=$('resslug').value.split(',').map(slugFrom).filter(Boolean);
+  if(!slugs.length){msg('Enter a slug or link');return}
+  return api('/admin/reserved',{method:'POST',body:{action:'reserve',slugs:slugs,note:$('resnote').value.trim()}}).then(function(o){
+    if(!o.ok){showErr(o,'Could not reserve');return}
+    var ok=o.j.reserved||[],sk=o.j.skipped||[];
+    if(ok.length){$('resslug').value='';$('resnote').value=''}
+    if(ok.length&&!sk.length)msg(ok.length===1?'Reserved /'+ok[0]:'Reserved '+ok.length+' addresses','ok');
+    else if(ok.length)msg('Reserved '+ok.length+'. Skipped /'+sk[0].slug+': '+sk[0].reason+(sk.length>1?' (and '+(sk.length-1)+' more)':''),'err');
+    else msg('Not reserved: /'+sk[0].slug+' - '+sk[0].reason+(sk.length>1?' (and '+(sk.length-1)+' more)':''),'err');
+    resLoad()
+  }).catch(function(e){netFail(e)})
+}
+// One reserved address in the list: the same row the notes list uses, and a tap opens its Lookup (where it can be removed).
+function resRow(x,open){
+  var r=el('button','pgrow'),l=el('div');r.type='button';r.onclick=function(){open(x.slug)};
+  l.appendChild(slugEl(x.slug));
+  l.appendChild(el('small',null,(x.note?x.note+' - ':'')+(x.at?'reserved '+ago(x.at):'reserved')+(x.by?' by '+x.by:'')));
+  r.appendChild(l);r.appendChild(el('div','pm'));
+  return r
+}
+// Run fn once a closing sheet's history step has landed, so a navigation made right after closing it cannot pop the wrong entry.
+function afterSheet(fn){var t=0;(function w(){if(ignorePop&&t++<40)return setTimeout(w,25);fn()})()}
+// Every reserved address, 25 at a time, with search (address or note) and sort. Built on the shared list sheet.
+function resSheet(){
+  var cur=null,shown=0,total=0,found=0,
+    s=listSheet({title:'Reserved addresses',ph:'Search addresses or notes',label:'Search reserved addresses',sorts:[['new','Newest'],['az','A to Z']],load:load});
+  function setCnt(){s.cnt.textContent=s.q?num(found)+(found===1?' match':' matches')+' among '+num(total):'Showing '+num(shown)+' of '+num(total)}
+  function open(slug){s.close();afterSheet(function(){openLookup(slug)})}
+  function load(first){
+    var gg=++s.g;
+    if(first){cur=null;shown=0;s.reset()}
+    return api('/admin/reserved?limit=25&sort='+s.sort+'&q='+encodeURIComponent(s.q)+(!first&&cur!=null?'&cursor='+cur:'')).then(function(r){
+      if(!s.live(gg))return;
+      unskel(s.list);
+      if(!r.ok){bad(r,'Could not load the reserved addresses');return}
+      var j=r.j;
+      j.reserved.forEach(function(x){s.list.appendChild(resRow(x,open))});
+      cur=j.next;shown+=j.reserved.length;s.more.hidden=cur==null;total=j.total;found=j.found;
+      setCnt();
+      if(!s.list.firstChild)s.list.appendChild(empty(s.q?'No matches':'Nothing reserved',s.q?'No reserved address or note contains this.':'Reserve an address from Tools and it is listed here.',s.q?'search':'shield'))
+    },function(e){if(!s.live(gg))return;unskel(s.list);netFail(e)})
+  }
+  load(true)
+}
+// Lookup's "Remove reservation": confirm like Release, then free the address.
+function unreserve(slug,done){
+  return ask({title:'Remove the reservation on /'+slug+'?',text:'The address shows as available again and anyone can publish to it.',ok:'Remove',danger:true}).then(function(ok){
+    if(!ok)return;
+    return api('/admin/reserved',{method:'POST',body:{action:'unreserve',slug:slug}}).then(function(o){
+      if(o.ok){msg('Freed /'+slug,'ok');resLoad();if(done)done()}
+      else if(o.s===404){msg('/'+slug+' is not reserved');resLoad();if(done)done()}
+      else showErr(o,'Could not remove the reservation')}).catch(function(e){netFail(e)})
   })
 }
 
@@ -8599,7 +8763,7 @@ function renderLookup(d){
   if(d.found){var cr=el('div','chips');cr.appendChild(stChip(d.status));if(d.csamHold)cr.appendChild(chip('CSAM hold','bad'));hm.appendChild(cr)}
   hd.appendChild(hm);c.appendChild(hd);
   var k=el('div','kvs');c.appendChild(k);
-  if(!d.found){kv(k,'Published','never');repKvs(k,d);out.appendChild(c);return}
+  if(!d.found){kv(k,'Published','never');resKv(k,d);repKvs(k,d);out.appendChild(c);if(d.reserved){var nf=el('div','foot');nf.appendChild(btn('Remove reservation',null,function(){return unreserve(d.slug,function(){doLookup(d.slug)})}));c.appendChild(nf)}return}
   var refresh=function(){doLookup(d.slug)};
   kv(k,'Title',d.title||'-');
   if(d.desc)kv(k,'Description',d.desc);
@@ -8607,6 +8771,7 @@ function renderLookup(d){
   kv(k,'Created',fmt(d.createdAt));kv(k,'Updated',fmt(d.updatedAt));
   if(d.noteCreatedAt)kv(k,'Note written',fmt(d.noteCreatedAt));
   if(d.deletedAt)kv(k,'Went offline',fmt(d.deletedAt));
+  resKv(k,d);
   kv(k,'Size',d.sizeBytes!=null?Math.round(d.sizeBytes/1024)+' KB':'-');
   kv(k,'Owner',d.hasOwner?(d.ownerEmail||'account missing'):'anonymous (no account)');
   aidRow(k,d.ownerAuthorId);
@@ -8634,6 +8799,7 @@ function renderLookup(d){
   if(d.storyBlocked)foot.appendChild(btn('Allow stories again',null,function(){return storyAct(d.slug,'allow',refresh)}));
   if(d.status==='taken down')foot.appendChild(btn('Restore',null,function(){return restore(d.slug,d.csamHold,0,refresh)}));
   if((d.csamHold||d.reports)&&ME.role==='super')foot.appendChild(btn(d.ncmec.length?'Add NCMEC record':'Record NCMEC report',null,function(){return recordNcmec(d.slug,refresh)}));
+  if(d.reserved)foot.appendChild(btn('Remove reservation',null,function(){return unreserve(d.slug,refresh)}));
   out.appendChild(c);
   if(foot.children.length)c.appendChild(foot)
 }
@@ -8921,7 +9087,7 @@ function renderAd(a){
 }
 
 /* ---------- Audit ---------- */
-var ACT_LBL={takedown:'Takedown',release:'Release',restore:'Restore',dismiss:'Dismiss',undismiss:'Undismiss',purge:'Purge',ncmec_recorded:'NCMEC recorded',owner_suspend:'Suspend account',owner_unsuspend:'Unsuspend account',owner_delete:'Delete account','owner_cancel-delete':'Cancel deletion','owner_clear-name':'Clear name','owner_clear-picture':'Clear picture',story_remove:'Story removed',story_allow:'Story allowed',strike_excuse:'Strike excused',strike_restore:'Strike reinstated',referral_void:'Referral voided',referral_restore:'Referral restored',ad_pause:'Ad paused',ad_resume:'Ad resumed',ad_takedown:'Ad taken down',ad_refund:'Ad refunded',custom_alert:'Custom alert',legal_update:'Policy update',admin_add:'Admin added',admin_revoke:'Admin revoked'};
+var ACT_LBL={takedown:'Takedown',release:'Release',restore:'Restore',dismiss:'Dismiss',undismiss:'Undismiss',purge:'Purge',ncmec_recorded:'NCMEC recorded',owner_suspend:'Suspend account',owner_unsuspend:'Unsuspend account',owner_delete:'Delete account','owner_cancel-delete':'Cancel deletion','owner_clear-name':'Clear name','owner_clear-picture':'Clear picture',story_remove:'Story removed',story_allow:'Story allowed',strike_excuse:'Strike excused',strike_restore:'Strike reinstated',referral_void:'Referral voided',referral_restore:'Referral restored',ad_pause:'Ad paused',ad_resume:'Ad resumed',ad_takedown:'Ad taken down',ad_refund:'Ad refunded',custom_alert:'Custom alert',legal_update:'Policy update',admin_add:'Admin added',admin_revoke:'Admin revoked',reserve:'Address reserved',unreserve:'Reservation removed'};
 function actLbl(a){a=String(a||'');if(ACT_LBL[a])return ACT_LBL[a];a=a.replace(/[_-]+/g,' ').trim();return a.charAt(0).toUpperCase()+a.slice(1)}
 function actTone(a){a=String(a||'');if(/take|purge|suspend|delete|ban|revoke/.test(a)&&!/unsuspend|cancel/.test(a))return'bad';if(/restore|release|unsuspend|cancel|allow|refund|resume/.test(a))return'good';return''}
 var auT=null,auBusy=false;
@@ -9754,54 +9920,37 @@ function alList(){
   var a=alAudience();if(alWhy(a)||!(alCount>0))return;
   recipSheet({body:{preview:true,list:true,audience:a},past:false})
 }
-// The recipients sheet, shared by the Message screen (who will receive it) and Audit (who did receive it). The top part
-// (title, count, search, result) stays put while the list scrolls. The search matches any part of an author ID; a whole
-// author ID also gets a plain yes or no. o.body is the request (the sheet adds q and cursor); o.past words it as already sent.
-function recipSheet(o){
+// The shell the list sheets share (recipients, reserved addresses): a fixed top (title, a sub line, the count, search, sort chips, then
+// anything in o.after), a scrolling list with Load more, a note above Close, and Close. o.sorts is [key, label] pairs and the first is
+// the default. o.load(first) is the caller's fetch, run on search, sort change and Load more; the caller starts it once this returns.
+// The returned s has list, cnt, note, more, q, sort and g: a load takes ++s.g and later asks s.live(gen), s.reset() clears the list
+// for a fresh load, and s.close() closes the sheet.
+function listSheet(o){
   if(curSheet)curSheet.done(false,true);
-  var trig=document.activeElement,back=el('div','sheet-back'),sh=el('div','sheet'),top=el('div','sheet-top'),sb=el('div','sheet-body'),list=el('div'),
-    sub=el('div','rsub',o.sub||''),cnt=el('div','rcnt'),chk=el('div','rchk'),note=el('div','rsub rnote'),inp=el('input','field'),
-    cur='',shown=0,total=0,found=0,g=0,closed=false,q='',qt=null,sort='';
-  sh.setAttribute('role','dialog');sh.setAttribute('aria-modal','true');sh.setAttribute('aria-label','Recipients');
+  var s={list:el('div'),cnt:el('div','rcnt'),note:el('div','rsub rnote'),q:'',sort:o.sorts[0][0],g:0,closed:false},
+    trig=document.activeElement,back=el('div','sheet-back'),sh=el('div','sheet'),top=el('div','sheet-top'),sb=el('div','sheet-body'),
+    sub=el('div','rsub',o.sub||''),inp=el('input','field'),qt=null;
+  sh.setAttribute('role','dialog');sh.setAttribute('aria-modal','true');sh.setAttribute('aria-label',o.title);
   sh.appendChild(el('div','grab'));
-  top.appendChild(el('div','ptitle','Recipients'));top.appendChild(sub);top.appendChild(cnt);
+  top.appendChild(el('div','ptitle',o.title));top.appendChild(sub);top.appendChild(s.cnt);
   var sr=el('div','search'),fw=el('div','field-wrap');
-  inp.type='text';inp.placeholder='Check an author ID';inp.setAttribute('autocomplete','off');inp.setAttribute('autocapitalize','off');inp.setAttribute('spellcheck','false');inp.setAttribute('enterkeyhint','search');inp.setAttribute('aria-label','Search recipients by author ID');
+  inp.type='text';inp.placeholder=o.ph;inp.setAttribute('autocomplete','off');inp.setAttribute('autocapitalize','off');inp.setAttribute('spellcheck','false');inp.setAttribute('enterkeyhint','search');inp.setAttribute('aria-label',o.label);
   fw.appendChild(ico('search'));fw.appendChild(inp);sr.appendChild(fw);top.appendChild(sr);
   var sk=el('div','filters');
-  [['','Newest']].concat(CSORT).forEach(function(m){var b=el('button','key');b.type='button';b.setAttribute('aria-pressed',m[0]===sort?'true':'false');b.appendChild(el('span',null,m[1]));b.onclick=function(){if(sort===m[0])return;sort=m[0];[].forEach.call(sk.children,function(x){x.setAttribute('aria-pressed',x===b?'true':'false')});load(true)};sk.appendChild(b)});
-  top.appendChild(sk);top.appendChild(chk);
-  sh.appendChild(top);sh.appendChild(sb);
-  sb.appendChild(list);
-  var more=btn('Load more','block more',function(){return load(false)});more.hidden=true;sb.appendChild(more);
-  var acts=el('div','sheet-actions');acts.appendChild(btn('Close','quiet block',function(){fin()}));sh.appendChild(note);sh.appendChild(acts);
+  o.sorts.forEach(function(m){var b=el('button','key');b.type='button';b.setAttribute('aria-pressed',m[0]===s.sort?'true':'false');b.appendChild(el('span',null,m[1]));b.onclick=function(){if(s.sort===m[0])return;s.sort=m[0];[].forEach.call(sk.children,function(x){x.setAttribute('aria-pressed',x===b?'true':'false')});o.load(true)};sk.appendChild(b)});
+  top.appendChild(sk);(o.after||[]).forEach(function(n){top.appendChild(n)});
+  sh.appendChild(top);sh.appendChild(sb);sb.appendChild(s.list);
+  s.more=btn('Load more','block more',function(){return o.load(false)});s.more.hidden=true;sb.appendChild(s.more);
+  var acts=el('div','sheet-actions');acts.appendChild(btn('Close','quiet block',function(){fin()}));sh.appendChild(s.note);sh.appendChild(acts);
   back.appendChild(sh);document.body.appendChild(back);xHintAll();clearable(inp);
-  function setCnt(){cnt.textContent=q?num(found)+(found===1?' match':' matches')+' among '+num(total)+' recipient'+(total===1?'':'s'):'Showing '+num(shown)+' of '+num(total)}
-  function load(first){
-    var gg=++g;
-    if(first){cur='';shown=0;list.textContent='';chk.textContent='';chk.className='rchk';note.textContent='';more.hidden=true;sb.scrollTop=0;skel(list,4,'row')}
-    return api('/admin/alert',{method:'POST',body:Object.assign({},o.body,{q:q,cursor:cur,sort:sort})}).then(function(r){
-      if(gg!==g||closed)return;
-      unskel(list);
-      if(!r.ok){bad(r,'Could not load the recipients');return}
-      var j=r.j;
-      j.users.forEach(function(u){list.appendChild(ovUserRow(u))});
-      cur=j.next;shown+=j.users.length;more.hidden=cur==null;total=j.count;
-      if(first)found=j.found||0;
-      setCnt();
-      if(first&&j.check){
-        var ck={'in':['good',o.past?'Yes. This account received the alert.':'Yes. This account will receive the alert.'],'out':['bad',o.past?'No. This account did not receive the alert.':'No. This account will not receive the alert.'],'unknown':['warn','No account has this author ID.']}[j.check];
-        if(ck){chk.className='rchk '+ck[0];chk.textContent=ck[1]}
-      }
-      if(first&&!q&&o.sent!=null&&total<o.sent)note.textContent=num(o.sent-total)+' of '+pl(o.sent,'recipient')+(o.sent-total===1?" isn't listed because their account has":" aren't listed because their accounts have")+' since been deleted.';
-      if(!list.firstChild)list.appendChild(empty(q?'No matches':'No accounts',q?'No recipient has an author ID containing this.':'Nothing matches this audience.',q?'search':'users'))
-    },function(e){if(gg!==g||closed)return;unskel(list);netFail(e)})
-  }
-  inp.oninput=function(){clearTimeout(qt);qt=setTimeout(function(){var v=inp.value.trim().toLowerCase();if(v===q)return;q=v;load(true)},300)};
+  s.live=function(gg){return gg===s.g&&!s.closed};
+  s.reset=function(){s.list.textContent='';s.more.hidden=true;sb.scrollTop=0;skel(s.list,4,'row')};
+  s.close=function(){fin()};
+  inp.oninput=function(){clearTimeout(qt);qt=setTimeout(function(){var v=inp.value.trim().toLowerCase();if(v===s.q)return;s.q=v;o.load(true)},300)};
   function kd(e){if(e.key==='Escape')fin()}
   function fin(v,keep){
     if(curSheet!==me)return;
-    closed=true;clearTimeout(qt);curSheet=null;document.removeEventListener('keydown',kd);
+    s.closed=true;clearTimeout(qt);curSheet=null;document.removeEventListener('keydown',kd);
     back.classList.remove('open');setTimeout(function(){back.remove()},240);
     try{trig.focus()}catch(e){}
     sheetClose(keep)
@@ -9810,6 +9959,35 @@ function recipSheet(o){
   back.onclick=function(e){if(e.target===back)fin()};
   document.addEventListener('keydown',kd);
   requestAnimationFrame(function(){back.classList.add('open')});
+  return s
+}
+// The recipients sheet, shared by the Message screen (who will receive it) and Audit (who did receive it). The top part
+// (title, count, search, result) stays put while the list scrolls. The search matches any part of an author ID; a whole
+// author ID also gets a plain yes or no. o.body is the request (the sheet adds q and cursor); o.past words it as already sent.
+function recipSheet(o){
+  var chk=el('div','rchk'),cur='',shown=0,total=0,found=0,
+    s=listSheet({title:'Recipients',sub:o.sub||'',ph:'Check an author ID',label:'Search recipients by author ID',sorts:[['','Newest']].concat(CSORT),after:[chk],load:load});
+  function setCnt(){s.cnt.textContent=s.q?num(found)+(found===1?' match':' matches')+' among '+num(total)+' recipient'+(total===1?'':'s'):'Showing '+num(shown)+' of '+num(total)}
+  function load(first){
+    var gg=++s.g;
+    if(first){cur='';shown=0;chk.textContent='';chk.className='rchk';s.note.textContent='';s.reset()}
+    return api('/admin/alert',{method:'POST',body:Object.assign({},o.body,{q:s.q,cursor:cur,sort:s.sort})}).then(function(r){
+      if(!s.live(gg))return;
+      unskel(s.list);
+      if(!r.ok){bad(r,'Could not load the recipients');return}
+      var j=r.j;
+      j.users.forEach(function(u){s.list.appendChild(ovUserRow(u))});
+      cur=j.next;shown+=j.users.length;s.more.hidden=cur==null;total=j.count;
+      if(first)found=j.found||0;
+      setCnt();
+      if(first&&j.check){
+        var ck={'in':['good',o.past?'Yes. This account received the alert.':'Yes. This account will receive the alert.'],'out':['bad',o.past?'No. This account did not receive the alert.':'No. This account will not receive the alert.'],'unknown':['warn','No account has this author ID.']}[j.check];
+        if(ck){chk.className='rchk '+ck[0];chk.textContent=ck[1]}
+      }
+      if(first&&!s.q&&o.sent!=null&&total<o.sent)s.note.textContent=num(o.sent-total)+' of '+pl(o.sent,'recipient')+(o.sent-total===1?" isn't listed because their account has":" aren't listed because their accounts have")+' since been deleted.';
+      if(!s.list.firstChild)s.list.appendChild(empty(s.q?'No matches':'No accounts',s.q?'No recipient has an author ID containing this.':'Nothing matches this audience.',s.q?'search':'users'))
+    },function(e){if(!s.live(gg))return;unskel(s.list);netFail(e)})
+  }
   load(true)
 }
 // The period editor for one group: any time / in the last N hours or days / between two date-times in the chosen time zone.
@@ -10831,6 +11009,7 @@ var COC=[
     ["Custom alerts carry approved messages only.","Send the wording exactly as approved. If you are not sure, please check with another admin first."],
     ["Terms and policy changes need approval first.","Please make only approved changes, and use the wording exactly as approved. Not sure if something is approved? A quick check with another admin keeps us all on the same page."],
     ["Send to the intended audience.","Before you tap Send alert, check the audience and recipient count so it reaches just the people it was meant for."],
+    ["Reserve addresses with care.","Hold one only for a clear reason, like protecting an official name, and add a short note so the team knows why. The same rules apply to everyone, so please never hold one for a friend. Remove the reservation once it is no longer needed."],
     ["Slow down for permanent actions.","Take down all and Run purge cannot be undone, and purge already runs every night."],
     ["Ads:","pause first, and take down only if it keeps breaking the rules. Unused views can be refunded."],
     ["Not sure? Wait and ask another admin.","Slipped up? Restore it and tell the team. Honest mistakes are fine."]
@@ -10887,6 +11066,8 @@ $('ext').onchange=function(){
   if(!b.checked){refreshFrames();return}
   ask({title:'Load external images?',text:'External images will be fetched by the worker from whatever hosts the page points at. Those hosts see the worker (not your IP) and that a preview was opened, and content from CSAM reports may display.',ok:'Load images',danger:true}).then(function(ok){if(!ok)b.checked=false;else refreshFrames()})
 };
+$('resgo').onclick=function(){return resAdd()};
+$('resslug').onkeydown=function(e){if(e.key==='Enter')resAdd()};
 $('admadd').onclick=function(){admAdd()};
 $('purgego').onclick=function(){
   ask({title:'Run the purge now?',text:'Permanently deletes pages unpublished more than 30 days ago (except held or locked ones), accounts past their 30-day deletion window, stale like/follow timestamps, backup images older than 14 days that no note references, presence records older than 90 days, alerts older than a year, activity log entries older than 800 days, and dismissed CSAM report index rows older than 18 months.',ok:'Run purge',danger:true}).then(function(ok){
@@ -11139,6 +11320,7 @@ export default {
       if (method === 'GET' && pathname === '/admin') return handleAdminPage();
       if (method === 'GET' && pathname === '/admin/me') return handleAdminMe(env, request);
       if ((method === 'GET' || method === 'POST') && pathname === '/admin/admins') return handleAdminAdmins(env, request);
+      if ((method === 'GET' || method === 'POST') && pathname === '/admin/reserved') return handleAdminReserved(env, request);
       if (method === 'GET' && pathname === '/admin/reports') return handleAdminReports(env, request, url);
       if (method === 'POST' && pathname === '/admin/reports/reindex') return handleAdminReportsReindex(env, request);
       if (method === 'GET' && pathname === '/admin/img') return handleAdminImage(env, request, url);
