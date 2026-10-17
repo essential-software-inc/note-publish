@@ -810,14 +810,14 @@ P('trail-journal','Trail journal: Cascades','maya.chen@example.com',{likes:31,co
 P('garden-planner','Garden planner 2026','maya.chen@example.com',{likes:12,comments:2,age:9});
 P('study-cards-bio','Biology study cards','dev.patel@example.com',{likes:17,comments:3,age:30,story:1});
 P('budget-sheet','Monthly budget layout','dev.patel@example.com',{likes:5,age:12});
-P('cheap-watches-now','CHEAP WATCHES NOW!!!','sam.ortiz@example.com',{age:4,x:{desc:'Buy now'}});
-P('win-free-gift','You won a free gift','sam.ortiz@example.com',{age:3,story:1});
+P('cheap-watches-now','CHEAP WATCHES NOW!!!','sam.ortiz@example.com',{likes:3,comments:1,age:4,x:{desc:'Buy now'}});
+P('win-free-gift','You won a free gift','sam.ortiz@example.com',{likes:7,comments:2,age:3,story:1});
 P('letters-to-lisbon','Letters to Lisbon','lena.fischer@example.com',{likes:240,comments:38,age:80,story:1,tags:['travel']});
 P('old-recipe-box','Old recipe box',null,{likes:2,age:200});
 P('wedding-moodboard','Wedding moodboard','priya.nair@example.com',{likes:66,comments:9,age:18,story:1});
 P('release-notes-v2','Release notes v2','alex.rivera@example.com',{age:5});
 P('retired-draft','Retired draft','omar.haddad@example.com',{age:100,upd:46,x:{status:'unpublished',deletedAt:E_REL}});
-P('copied-lyrics-post','Lyrics collection','tom.becker@example.com',{age:60,upd:21,x:{status:'taken down',deletedAt:E_TD}});
+P('copied-lyrics-post','Lyrics collection','tom.becker@example.com',{likes:14,comments:4,age:60,upd:21,x:{status:'taken down',deletedAt:E_TD}});
 P('flagged-demo-page','Flagged demo page','alex.rivera@example.com',{age:2,x:{csamHold:true}});
 pages['retired-draft'].snaps.unshift({ts:pages['retired-draft'].deletedAt,source:'release',size:pages['retired-draft'].sizeBytes});
 pages['copied-lyrics-post'].snaps.unshift({ts:pages['copied-lyrics-post'].deletedAt,source:'takedown',size:pages['copied-lyrics-post'].sizeBytes});
@@ -909,7 +909,7 @@ function owner(slug){
   var u=users[p.owner],mine=Object.keys(pages).filter(function(s){return pages[s].owner===u.email}),rep=reports.filter(function(r){return pages[r.slug]&&pages[r.slug].owner===u.email});
   var by={};rep.forEach(function(r){var k=r.isCsam?'csam':r.reason;by[k]=by[k]||{total:0,open:0};by[k].total++;if(!r.dismissedAt)by[k].open++});
   var open=rep.filter(function(r){return!r.dismissedAt}).length,pgs={};rep.forEach(function(r){pgs[r.slug]=1});
-  return{referral:refInfo(u),email:u.email,authorId:u.authorId,displayName:u.displayName,suspended:!!u.suspended,pendingDeletionAt:u.pendingDeletionAt||null,hasProfileImage:u.hasProfileImage,subscribers:u.subscribers,adTier:adTierOf(u),following:followingOf(u),adsRunning:adsRunningOf(u),adLimit:AD_MAX_ACTIVE[adTierOf(u)-1],likes:mine.reduce(function(a,s){return a+pages[s].likes},0),strikeCount:u.strikes.filter(function(x){return !x.excusedAt}).length,strikes:u.strikes.slice().sort(function(a,c){return a.at-c.at}).map(function(x){if(!x.id)x.id=sid();return{id:x.id,kind:x.kind,message:x.message,at:x.at,dismissedAt:x.dismissedAt||null,excusedAt:x.excusedAt||null,counting:!x.excusedAt&&x.at>Date.now()-60*864e5}}),alertTotal:u.alerts.length,alerts:u.alerts.slice().sort(function(a,c){return c.at-a.at}).slice(0,300).map(function(x){return{kind:x.kind,message:x.message,at:x.at,dismissedAt:x.dismissedAt||null,strike:!!x.strike}}),createdAt:u.createdAt,lastSignInAt:u.lastSignInAt,ads:Object.keys(ads).filter(function(s){return ads[s].ownerEmail===u.email}).length,creditBalance:u.credit,backup:u.backup,ledger:u.ledger.slice().sort(function(a,c){return c.at-a.at}).slice(0,20),reportStats:{total:rep.length,open:open,pages:mine.filter(function(s){return pages[s].status==='live'}).length,byReason:by},pages:mine.filter(function(s){return pages[s].status==='live'}).map(function(s){var q=pages[s];return{slug:s,title:q.title,updatedAt:q.updatedAt,likes:q.likes,showInStories:q.showInStories,reports:reports.filter(function(r){return r.slug===s&&!r.dismissedAt}).length,byReason:rstats(reports.filter(function(r){return r.slug===s&&!r.dismissedAt})).byReason}})}
+  return{referral:refInfo(u),email:u.email,authorId:u.authorId,displayName:u.displayName,suspended:!!u.suspended,pendingDeletionAt:u.pendingDeletionAt||null,hasProfileImage:u.hasProfileImage,subscribers:u.subscribers,adTier:adTierOf(u),following:followingOf(u),adsRunning:adsRunningOf(u),adLimit:AD_MAX_ACTIVE[adTierOf(u)-1],likes:mine.reduce(function(a,s){return a+pages[s].likes},0),comments:mine.reduce(function(a,s){return a+pages[s].comments},0),strikeCount:u.strikes.filter(function(x){return !x.excusedAt}).length,strikes:u.strikes.slice().sort(function(a,c){return a.at-c.at}).map(function(x){if(!x.id)x.id=sid();return{id:x.id,kind:x.kind,message:x.message,at:x.at,dismissedAt:x.dismissedAt||null,excusedAt:x.excusedAt||null,counting:!x.excusedAt&&x.at>Date.now()-60*864e5}}),alertTotal:u.alerts.length,alerts:u.alerts.slice().sort(function(a,c){return c.at-a.at}).slice(0,300).map(function(x){return{kind:x.kind,message:x.message,at:x.at,dismissedAt:x.dismissedAt||null,strike:!!x.strike}}),createdAt:u.createdAt,lastSignInAt:u.lastSignInAt,ads:Object.keys(ads).filter(function(s){return ads[s].ownerEmail===u.email}).length,creditBalance:u.credit,backup:u.backup,ledger:u.ledger.slice().sort(function(a,c){return c.at-a.at}).slice(0,20),reportStats:{total:rep.length,open:open,pages:mine.filter(function(s){return pages[s].status==='live'}).length,byReason:by},pages:mine.filter(function(s){return pages[s].status==='live'}).map(function(s){var q=pages[s];return{slug:s,title:q.title,updatedAt:q.updatedAt,likes:q.likes,comments:q.comments,showInStories:q.showInStories,reports:reports.filter(function(r){return r.slug===s&&!r.dismissedAt}).length,byReason:rstats(reports.filter(function(r){return r.slug===s&&!r.dismissedAt})).byReason}})}
 }
 var ONLINE_MS=5*60*1000,PAGE=30;
 function isOn(u){return N-u.lastSeen<ONLINE_MS}
@@ -919,18 +919,39 @@ function offsOk(raw){if(!raw)return true;var p=String(raw).split(','),prev=-Infi
 function stats(){
   var us=Object.keys(users).map(function(e){return users[e]}),live=Object.keys(pages).filter(function(s){return pages[s].status==='live'}),av=Object.keys(ads).map(function(s){return ads[s]}),ow=live.filter(function(s){return pages[s].owner});
   function c(st){return av.filter(function(a){return a.status===st}).length}
-  return{stats:{users:us.length,usersOnline:us.filter(isOn).length,guests:1840,usersActive24h:us.filter(function(u){return N-u.lastSeen<D}).length,usersNew1d:us.filter(function(u){return N-u.createdAt<D}).length,usersNew7d:us.filter(function(u){return N-u.createdAt<7*D}).length,usersNew30d:us.filter(function(u){return N-u.createdAt<30*D}).length,usersActive7d:us.filter(function(u){return N-u.lastSeen<7*D}).length,guestsActive24h:420,guestsActive7d:1130,guestsOnline:23,notes:ow.length,notesNew1d:ow.filter(function(s){return N-pages[s].createdAt<D}).length,notesNew7d:ow.filter(function(s){return N-pages[s].createdAt<7*D}).length,publishers:us.filter(function(u){return live.some(function(s){return pages[s].owner===u.email})}).length,stories:live.filter(function(s){return pages[s].showInStories}).length,likes:live.reduce(function(a,s){return a+pages[s].likes},0),adsActive:c('active'),adsPaused:c('paused'),adViewsUsed:av.reduce(function(a,x){return a+x.viewsUsed},0),adsExhausted:c('exhausted'),adsUnpublished:c('unpublished'),subscriptions:us.reduce(function(a,u){return a+u.subscribers},0)},onlineWindowMin:5,trackingSince:N-120*D,at:N}
+  return{stats:{users:us.length,usersOnline:us.filter(isOn).length,guests:1840,usersActive24h:us.filter(function(u){return N-u.lastSeen<D}).length,usersNew1d:us.filter(function(u){return N-u.createdAt<D}).length,usersNew7d:us.filter(function(u){return N-u.createdAt<7*D}).length,usersNew30d:us.filter(function(u){return N-u.createdAt<30*D}).length,usersActive7d:us.filter(function(u){return N-u.lastSeen<7*D}).length,guestsActive24h:420,guestsActive7d:1130,guestsOnline:23,notes:ow.length,notesNew1d:ow.filter(function(s){return N-pages[s].createdAt<D}).length,notesNew7d:ow.filter(function(s){return N-pages[s].createdAt<7*D}).length,publishers:us.filter(function(u){return live.some(function(s){return pages[s].owner===u.email})}).length,stories:live.filter(function(s){return pages[s].showInStories}).length,likes:live.reduce(function(a,s){return a+pages[s].likes},0),comments:live.reduce(function(a,s){return a+pages[s].comments},0),adsActive:c('active'),adsPaused:c('paused'),adViewsUsed:av.reduce(function(a,x){return a+x.viewsUsed},0),adsExhausted:c('exhausted'),adsUnpublished:c('unpublished'),subscriptions:us.reduce(function(a,u){return a+u.subscribers},0)},onlineWindowMin:5,trackingSince:N-120*D,at:N}
 }
+// Timestamps behind each trend series. The demo keeps no time for a like, comment or subscription, so each is placed
+// deterministically between its note's (or account's) creation and now; everything else uses the record's own time.
+function trSpread(t0,k){return t0+(N-t0)*((hash(k)%1000)/1000)}
+function trEvents(){
+  var ev={signups:[],notes:[],stories:[],likes:[],comments:[],subs:[],ads:[],strikes:[],alerts:[]};
+  Object.keys(users).forEach(function(e){var u=users[e];ev.signups.push(u.createdAt);
+    for(var i=0;i<u.subscribers;i++)ev.subs.push(trSpread(u.createdAt,e+'s'+i));
+    (u.strikes||[]).forEach(function(x){ev.strikes.push(x.at)});(u.alerts||[]).forEach(function(a){ev.alerts.push(a.at)})});
+  Object.keys(pages).forEach(function(sl){var p=pages[sl];if(p.status!=='live')return;
+    if(p.owner)ev.notes.push(p.createdAt);if(p.showInStories)ev.stories.push(p.createdAt);
+    for(var i=0;i<p.likes;i++)ev.likes.push(trSpread(p.createdAt,sl+'l'+i));
+    for(var j=0;j<p.comments;j++)ev.comments.push(trSpread(p.createdAt,sl+'c'+j))});
+  Object.keys(ads).forEach(function(sl){ev.ads.push(ads[sl].createdAt)});
+  return ev}
 function trends(q){
   var ofs=(q.get('offs')||'').split(',').filter(Boolean).map(function(x){var a=x.split(':');return[+a[0],+a[1]]});
   function offAt(t){var r=ofs.length?ofs[0][1]:+q.get('off');for(var i=1;i<ofs.length;i++)if(ofs[i][0]<=t)r=ofs[i][1];return r}
-  var bk=q.get('bucket'),from=+q.get('from'),to=+q.get('to'),off=+q.get('off'),ep=Date.UTC(2025,0,1),s=trStart(bk,from+offAt(from)),out={},k,base={signups:6,active_u:140,active_g:300,notes:9,stories:4,likes:60,subs:10,ads:2,reports:5,strikes:1,alerts:3},mult={day:1,week:7,month:30,year:365}[bk],rr=[];
-  Object.keys(base).forEach(function(m){out[m]=[]});
+  var bk=q.get('bucket'),from=+q.get('from'),to=+q.get('to'),off=+q.get('off'),ep=Date.UTC(2025,0,1),s=trStart(bk,from+offAt(from)),out={},k,rr=[];
+  // Every count series is built from the demo's own records (see trEvents), so each one ends on the totals Overview shows.
+  var ev=trEvents(),cnt={},before={},lo0=Math.max(from,ep);
+  Object.keys(ev).forEach(function(m){cnt[m]={};before[m]=0;out[m]=[];ev[m].forEach(function(t){if(t<ep||t>=to)return;if(t<lo0){before[m]++;return}var k2=trKey(bk,trStart(bk,t+offAt(t)));cnt[m][k2]=(cnt[m][k2]||0)+1})});
+  out.active_u=[];out.active_g=[];
+  var us0=Object.keys(users).map(function(e){return users[e]}),AF={day:[30,40],week:[60,30],month:[75,20],year:[90,10]}[bk],AG={day:420,week:1130,month:1500,year:1840}[bk];
   for(;s<to+offAt(to);s=trNext(bk,s,1)){
-    k=trKey(bk,s);var h=hash(k),g=1+((s-ep)/864e5)/600;
-    Object.keys(base).forEach(function(m){var lvl=m==='active_u'||m==='active_g',v=Math.round(base[m]*(lvl?1:mult)*g*(0.7+((h>>(m.length))%60)/100));out[m].push([k,v])});
-      }
-  var before={};Object.keys(base).filter(function(m){return m!=='active_u'&&m!=='active_g'&&m!=='reports'}).forEach(function(m){before[m]=Math.round(base[m]*Math.max(0,(from-ep)/864e5)*1.2)});
+    k=trKey(bk,s);var h=hash(k),e1=trNext(bk,s,1),past=s<=N+offAt(N);
+    Object.keys(ev).forEach(function(m){out[m].push([k,cnt[m][k]||0])});
+    // Active accounts / guests are levels, not totals: a share of the accounts that existed by then, and of the 1,840 guests tracked since trackingSince.
+    var nu=us0.filter(function(u){return u.createdAt+offAt(u.createdAt)<e1}).length;
+    out.active_u.push([k,past&&nu?Math.max(1,Math.min(nu,Math.round(nu*(AF[0]+h%AF[1])/100))):0]);
+    out.active_g.push([k,past&&e1>N-120*D?Math.min(1840,Math.round(AG*(0.8+(hash(k+'g')%40)/100))):0])
+  }
   var lo=Math.max(from,ep),rk={},rbk={},rbf=0;
   reports.forEach(function(x){var t=x.reportedAt;if(t<ep||t>=to)return;if(t<lo){rbf++;return}var k2=trKey(bk,trStart(bk,t+offAt(t)));rk[k2]=(rk[k2]||0)+1;var kr=k2+'|'+x.reason;rbk[kr]=(rbk[kr]||0)+1});
   out.reports=Object.keys(rk).sort().map(function(k2){return[k2,rk[k2]]});before.reports=rbf;
@@ -1035,7 +1056,7 @@ function route(path,o){
     var rpM=mcs(rpS),rpCsl={};rpIn.forEach(function(x){if(x.isCsam)rpCsl[x.slug]=1});
     var rpK=function(x){var g=pages[x.slug];return rpM[0]==='likes'||rpM[0]==='comments'?(g?g[rpM[0]]:0):mcnt(g?g.owner:null,rpM[0])};
     rpL.sort(function(a,c){if(rpM)return(rpCsl[c.slug]?1:0)-(rpCsl[a.slug]?1:0)||(rpK(a)-rpK(c))*rpM[1]||(a.slug<c.slug?-1:a.slug>c.slug?1:0)||(c.reportedAt-a.reportedAt);return rpS==='old'?a.reportedAt-c.reportedAt:rpS==='most'?(rpC[c.slug]-rpC[a.slug])||(a.slug<c.slug?-1:a.slug>c.slug?1:0)||(c.reportedAt-a.reportedAt):c.reportedAt-a.reportedAt});
-    var rpO={reports:rpL.slice(rpCo,rpCo+PAGE).map(function(x){var pg=pages[x.slug];return Object.assign({},x,{status:pstatus(x.slug),sortCount:rpM?rpK(x):undefined,ncmec:x.isCsam&&pg&&pg.ncmec.length?pg.ncmec[pg.ncmec.length-1]:null})}),nextCursor:rpCo+PAGE<rpL.length?String(rpCo+PAGE):null,indexed:true};
+    var rpO={reports:rpL.slice(rpCo,rpCo+PAGE).map(function(x){var pg=pages[x.slug];return Object.assign({},x,{status:pstatus(x.slug),likes:pg?pg.likes:undefined,comments:pg?pg.comments:undefined,sortCount:rpM?rpK(x):undefined,ncmec:x.isCsam&&pg&&pg.ncmec.length?pg.ncmec[pg.ncmec.length-1]:null})}),nextCursor:rpCo+PAGE<rpL.length?String(rpCo+PAGE):null,indexed:true};
     if(rpF){var rpBy={},rpT=0,rpP={},rpCs={};rpB.forEach(function(x){rpBy[x.reason]=(rpBy[x.reason]||0)+1;rpT++});rpIn.forEach(function(x){rpP[x.slug]=1;if(x.isCsam)rpCs[x.slug]=1});rpO.agg={total:rpT,byReason:rpBy,pages:Object.keys(rpP).length,csam:Object.keys(rpCs).length}}
     return ok(rpO)}
   if(p==='/admin/dismiss'||p==='/admin/undismiss'){var dis=p==='/admin/dismiss';if(dis&&o.body&&typeof o.body==='string'){try{JSON.parse(o.body)}catch(e){return err(400,'invalid JSON body')}}var dk=typeof b.key==='string'?b.key:'';if(!RKEY_RE.test(dk))return err(400,'invalid report key');var r=reports.filter(function(x){return x.key===dk})[0];if(!r)return dis?ok({ok:true}):err(404,'report not found');if(dis){if(r.isCsam)r.dismissedAt=Date.now();else reports=reports.filter(function(x){return x!==r})}else{if(!r.dismissedAt)return ok({ok:true});r.dismissedAt=null}A(dis?'dismiss':'undismiss',r.slug,'');return ok({ok:true})}
@@ -1071,7 +1092,7 @@ function route(path,o){
   if(p==='/admin/referral'){var fsl=typeof b.slug==='string'?b.slug.toLowerCase():'';if(!SLUG_RE.test(fsl))return err(400,'invalid slug');var fa=b.action;if(fa!=='void'&&fa!=='restore')return err(400,'invalid action');var fr=reasonOf(b);if(fa==='void'&&!fr)return err(400,'reason required');var fo=ownerOf(fsl);if(!fo)return err(404,'no account for this slug');var tg=fo;if(b.aid){tg=Object.keys(users).map(function(e){return users[e]}).filter(function(x){return x.authorId===String(b.aid).toLowerCase()})[0];if(!tg)return err(404,'no account for that author ID')}var rb=tg.referredBy&&users[tg.referredBy];if(!rb||(b.aid&&rb.email!==fo.email))return err(404,'referral not found');var gx=0;
     if(fa==='void'){if(tg.refVoid&&tg.refVoid.reason==='admin')return err(409,'already voided');tg.refVoid={at:Date.now(),reason:'admin'};gx=giftMove(rb,tg,true)}else{if(!tg.refVoid)return err(409,'not voided');if(tg.refVoid.reason!=='admin')return err(409,'this referral is paused because the account is suspended or being deleted; it returns when that ends');tg.refVoid=null;gx=giftMove(rb,tg,false)}
     A('referral_'+fa,b.slug,fr+(b.aid?' ['+String(b.aid).slice(0,10)+']':'')+(gx?' ('+(fa==='void'?'-':'+')+gx+' gift views)':''));note(rb.email,'referral',fa==='void'?'A friend\u2019s invite no longer counts toward your ad access. '+(gx?(gx===1?'The 1 free view it gave you was':'The '+gx.toLocaleString('en-US')+' free views it gave you were')+' taken back. ':'')+aRs(fr):'A friend\u2019s invite counts toward your ad access again.'+(gx?(gx===1?' Its 1 free view is':' Its '+gx.toLocaleString('en-US')+' free views are')+' back in your balance.':''));return ok({ok:true})}
-  if(p==='/admin/ads'){var aLo=parseInt(q.get('from'),10),aHi=parseInt(q.get('to'),10),st=['active','paused','exhausted','unpublished'].indexOf(q.get('status'))>=0?q.get('status'):'',kd=q.get('kind')==='write'||q.get('kind')==='share'?q.get('kind'):'',aq=aidQ(q.get('q')),sq=aq?'':(q.get('q')||'').toLowerCase().replace(/[^a-z0-9-]/g,'').slice(0,48),L2=Object.keys(ads).map(function(s){return ads[s]}).filter(function(x){return(!st||x.status===st)&&(!kd||x.kind===kd)&&(!aq||(users[x.ownerEmail]||{}).authorId===aq)&&(!sq||x.slug.indexOf(sq)>-1)&&(isNaN(aLo)||x.createdAt>=aLo)&&(isNaN(aHi)||x.createdAt<=aHi)});var acs=mcs(q.get('sort'));if(acs)L2.sort(function(a,b2){return(scnt(a.slug,a.ownerEmail,acs[0])-scnt(b2.slug,b2.ownerEmail,acs[0]))*acs[1]||b2.createdAt-a.createdAt});var apg=pgOf(L2,q.get('cursor'));return ok({ads:apg.rows.map(function(x){return{ownerSubs:mcnt(x.ownerEmail,'subs'),ownerFollowing:mcnt(x.ownerEmail,'following'),ownerNotes:mcnt(x.ownerEmail,'notes'),likes:(pages[x.slug]||{}).likes||0,slug:x.slug,ownerEmail:x.ownerEmail,viewsTotal:x.viewsTotal,viewsUsed:x.viewsUsed,status:x.status,createdAt:x.createdAt,uniqueViewers:x.uniqueViewers,kind:x.kind}}),total:apg.total,next:apg.next})}
+  if(p==='/admin/ads'){var aLo=parseInt(q.get('from'),10),aHi=parseInt(q.get('to'),10),st=['active','paused','exhausted','unpublished'].indexOf(q.get('status'))>=0?q.get('status'):'',kd=q.get('kind')==='write'||q.get('kind')==='share'?q.get('kind'):'',aq=aidQ(q.get('q')),sq=aq?'':(q.get('q')||'').toLowerCase().replace(/[^a-z0-9-]/g,'').slice(0,48),L2=Object.keys(ads).map(function(s){return ads[s]}).filter(function(x){return(!st||x.status===st)&&(!kd||x.kind===kd)&&(!aq||(users[x.ownerEmail]||{}).authorId===aq)&&(!sq||x.slug.indexOf(sq)>-1)&&(isNaN(aLo)||x.createdAt>=aLo)&&(isNaN(aHi)||x.createdAt<=aHi)});var acs=mcs(q.get('sort'));if(acs)L2.sort(function(a,b2){return(scnt(a.slug,a.ownerEmail,acs[0])-scnt(b2.slug,b2.ownerEmail,acs[0]))*acs[1]||b2.createdAt-a.createdAt});var apg=pgOf(L2,q.get('cursor'));return ok({ads:apg.rows.map(function(x){return{ownerSubs:mcnt(x.ownerEmail,'subs'),ownerFollowing:mcnt(x.ownerEmail,'following'),ownerNotes:mcnt(x.ownerEmail,'notes'),likes:(pages[x.slug]||{}).likes||0,comments:(pages[x.slug]||{}).comments||0,slug:x.slug,ownerEmail:x.ownerEmail,viewsTotal:x.viewsTotal,viewsUsed:x.viewsUsed,status:x.status,createdAt:x.createdAt,uniqueViewers:x.uniqueViewers,kind:x.kind}}),total:apg.total,next:apg.next})}
   if(p==='/admin/ad'){var asl=typeof b.slug==='string'?b.slug.toLowerCase():'';if(!SLUG_RE.test(asl))return err(400,'invalid slug');var ad=ads[asl];if(!ad)return err(404,'ad not found');var ba=b.action,as=ad.status;if((ba==='pause'||ba==='takedown')&&!reasonOf(b))return err(400,'reason required');if(ba==='pause'&&as!=='active')return err(409,'ad is not active');if(ba==='resume'&&as!=='paused')return err(409,'ad is not paused');if(ba==='resume'&&users[ad.ownerEmail]&&(users[ad.ownerEmail].suspended||users[ad.ownerEmail].pendingDeletionAt))return err(409,'the owner account is suspended or being deleted');if(ba==='takedown'&&as!=='active'&&as!=='paused')return err(409,'ad is not running');if(ba==='refund'&&(as==='active'||as==='paused'))return err(409,'take the ad down first');if(ba!=='pause'&&ba!=='resume'&&ba!=='takedown'&&ba!=='refund')return err(400,'invalid action');var left=ad.viewsTotal-ad.viewsUsed,res={};
     if(b.action==='pause')ad.status='paused';else if(b.action==='resume')ad.status='active';
     else if(b.action==='takedown'){ad.status='unpublished';if(b.refund===true&&left>0&&!ad.refunded){res.refunded=left;ad.refunded=true}}
@@ -1145,7 +1166,7 @@ function route(path,o){
       var cl=cR.map(function(e){return users[e]}).sort(function(x,y){var s=mcs(b.sort);return s?(mcnt(x.email,s[0])-mcnt(y.email,s[0]))*s[1]||y.createdAt-x.createdAt:y.createdAt-x.createdAt}),
         cq=String(b.q||'').trim().toLowerCase().replace(/^@/,'').replace(/[^a-z0-9_]/g,'').slice(0,34),
         cf=cq?cl.filter(function(x){return x.authorId.indexOf(cq)>=0}):cl,
-        co=parseInt(b.cursor,10)||0,pg2=cf.slice(co,co+30),cres={users:pg2.map(function(x){return{email:x.email,name:x.displayName,authorId:x.authorId,createdAt:x.createdAt,notes:cLive(x).length,subs:x.subscribers,following:followingOf(x),likes:mcnt(x.email,'likes'),lastSeen:x.lastSeen,lastSignInAt:x.lastSignInAt,online:isOn(x),suspended:!!(x.suspended&&!x.pendingDeletionAt),deleting:!!x.pendingDeletionAt}}),count:cl.length,next:co+30<cf.length?String(co+30):null};
+        co=parseInt(b.cursor,10)||0,pg2=cf.slice(co,co+30),cres={users:pg2.map(function(x){return{email:x.email,name:x.displayName,authorId:x.authorId,createdAt:x.createdAt,notes:cLive(x).length,subs:x.subscribers,following:followingOf(x),likes:mcnt(x.email,'likes'),comments:mcnt(x.email,'comments'),lastSeen:x.lastSeen,lastSignInAt:x.lastSignInAt,online:isOn(x),suspended:!!(x.suspended&&!x.pendingDeletionAt),deleting:!!x.pendingDeletionAt}}),count:cl.length,next:co+30<cf.length?String(co+30):null};
       if(cq&&!co){cres.found=cf.length;if(/^a_[a-f0-9]{32}$/.test(cq))cres.check=cf.length?'in':(cE.some(function(e){return users[e].authorId===cq})?'out':'unknown')}
       return ok(cres)}
     if(b.preview)return ok({ok:true,count:cR.length,unknown:cU});
@@ -1190,7 +1211,7 @@ function route(path,o){
   if(p==='/admin/stats')return ok(stats());
   if(p==='/admin/users'||p==='/admin/notes'){var qq=(q.get('q')||'').toLowerCase(),isU=p==='/admin/users',uq=(q.get('q')||'').trim().slice(0,64).toLowerCase(),naq=aidQ(q.get('q')),nq=naq?'':(q.get('q')||'').toLowerCase().replace(/[^a-z0-9-]/g,'').slice(0,48);
     if(isU){var f=q.get('f'),so=q.get('sort'),ovRg=function(a,b){var lo=parseInt(q.get(a),10),hi=parseInt(q.get(b),10);return function(v){return(isNaN(lo)||v>=lo)&&(isNaN(hi)||v<=hi)}},ovC=ovRg('cf','ct'),ovS2=ovRg('sf','st'),L3=Object.keys(users).map(function(e){return users[e]}).filter(function(x){return(!uq||x.authorId.toLowerCase().indexOf(uq)===0)&&(f!=='online'||isOn(x))&&(f!=='active24'||N-x.lastSeen<D)&&ovC(x.createdAt)&&ovS2(x.lastSeen)});var ucs=mcs(so);L3.sort(function(a,b2){return ucs?(mcnt(a.email,ucs[0])-mcnt(b2.email,ucs[0]))*ucs[1]||b2.createdAt-a.createdAt:so==='old'?a.createdAt-b2.createdAt:so==='active'?b2.lastSeen-a.lastSeen:b2.createdAt-a.createdAt});
-      var upg=pgOf(L3,q.get('cursor'));return ok({users:upg.rows.map(function(x){return{email:x.email,name:x.displayName,authorId:x.authorId,createdAt:x.createdAt,notes:Object.keys(pages).filter(function(s){return pages[s].owner===x.email&&pages[s].status==='live'}).length,subs:x.subscribers,following:followingOf(x),likes:mcnt(x.email,'likes'),lastSeen:x.lastSeen,lastSignInAt:x.lastSignInAt,online:isOn(x),suspended:!!(x.suspended&&!x.pendingDeletionAt),deleting:!!x.pendingDeletionAt,referredBy:x.referredBy&&users[x.referredBy]?{email:x.referredBy,authorId:users[x.referredBy].authorId}:null,referralCode:x.referralCode||null}}),next:upg.next,total:upg.total})}
+      var upg=pgOf(L3,q.get('cursor'));return ok({users:upg.rows.map(function(x){return{email:x.email,name:x.displayName,authorId:x.authorId,createdAt:x.createdAt,notes:Object.keys(pages).filter(function(s){return pages[s].owner===x.email&&pages[s].status==='live'}).length,subs:x.subscribers,following:followingOf(x),likes:mcnt(x.email,'likes'),comments:mcnt(x.email,'comments'),lastSeen:x.lastSeen,lastSignInAt:x.lastSignInAt,online:isOn(x),suspended:!!(x.suspended&&!x.pendingDeletionAt),deleting:!!x.pendingDeletionAt,referredBy:x.referredBy&&users[x.referredBy]?{email:x.referredBy,authorId:users[x.referredBy].authorId}:null,referralCode:x.referralCode||null}}),next:upg.next,total:upg.total})}
     var nLo=parseInt(q.get('from'),10),nHi=parseInt(q.get('to'),10),ncs=mcs(q.get('sort')),L4=Object.keys(pages).map(function(s){return pages[s]}).filter(function(x){return x.status==='live'&&x.owner&&(!naq||(users[x.owner]||{}).authorId===naq)&&(!nq||x.slug.indexOf(nq)===0)&&(isNaN(nLo)||x.createdAt>=nLo)&&(isNaN(nHi)||x.createdAt<=nHi)}).sort(function(a,b2){return ncs?(scnt(a.slug,a.owner,ncs[0])-scnt(b2.slug,b2.owner,ncs[0]))*ncs[1]||b2.createdAt-a.createdAt:b2.createdAt-a.createdAt});
     var npg=pgOf(L4,q.get('cursor'));return ok({notes:npg.rows.map(function(x){return{slug:x.slug,title:x.story?x.story.title:null,createdAt:x.createdAt,story:x.showInStories,likes:x.likes,comments:x.comments,authorSubs:mcnt(x.owner,'subs'),authorFollowing:mcnt(x.owner,'following'),authorNotes:mcnt(x.owner,'notes')}}),next:npg.next,total:npg.total})}
   if(p==='/admin/trends'){var tb=q.get('bucket')||'day',tf=parseInt(q.get('from')||'',10),tt=parseInt(q.get('to')||'',10),to2=parseInt(q.get('off')||'0',10);if(['day','week','month','year'].indexOf(tb)<0)return err(400,'invalid bucket');if(!isFinite(tf)||!isFinite(tt)||tf<0||tt<=tf||tt-tf>70*366*864e5)return err(400,'invalid range');if(!isFinite(to2)||Math.abs(to2)>15*36e5||!offsOk(q.get('offs')))return err(400,'invalid offset');var tr=trends(q);tr.bucket=tb;tr.from=tf;tr.to=tt;tr.off=to2;return ok(tr)}
@@ -1254,6 +1275,7 @@ var ICON={
   tools:svg('<path d="M4 7h8M17 7h3M4 17h3M12 17h8"/><circle cx="14.5" cy="7" r="2.5"/><circle cx="9.5" cy="17" r="2.5"/>'),
   chart:svg('<path d="M5 20v-9"/><path d="M12 20V4"/><path d="M19 20v-6"/>'),
   check:svg('<circle cx="12" cy="12" r="9"/><path d="m8 12.5 3 3 5-6"/>'),
+  comment:svg('<path d="M5 5.5h14v9.5h-8.2L7 18.5V15H5Z"/>'),
   heart:svg('<path d="M12 18.9s-7.3-4.4-7.3-9.9A4.2 4.2 0 0 1 12 6.5a4.2 4.2 0 0 1 7.3 2.5c0 5.5-7.3 9.9-7.3 9.9Z"/>'),
   users:svg('<circle cx="9" cy="8.5" r="3.2"/><path d="M3.5 19c.5-3.2 2.8-5 5.5-5s5 1.8 5.5 5"/><path d="M16 5.5a3.2 3.2 0 0 1 0 6"/><path d="M17.5 14.2c1.8.5 3 2.3 3.3 4.8"/>'),
   image:svg('<rect x="4" y="5" width="16" height="14" rx="3"/><circle cx="9" cy="10" r="1.6"/><path d="m5 17 4.5-4.5 3 3L15 13l4 4"/>'),
@@ -1508,7 +1530,9 @@ var CSORT=[['most_subs','Most subscribers'],['least_subs','Least subscribers'],[
 function cntWord(k,n){return num(n)+(k==='subs'?(n===1?' subscriber':' subscribers'):k==='posts'?(n===1?' note':' notes'):k==='following'?' following':k==='comments'?(n===1?' comment':' comments'):(n===1?' like':' likes'))}
 function isCsort(so){return /^(most|least)_(subs|posts|likes|comments|following)$/.test(so||'')}
 // What a count sort on the Reports list ordered a card by: the reported note's likes, or its owner's subscribers / notes.
-function repCnt(r){var so=$('fsort').value;if(!isCsort(so)||r.sortCount==null)return '';var k=so.split('_')[1];return ' - '+(k==='likes'||(k==='comments'&&r.slug)?'':'owner has ')+cntWord(k,r.sortCount)}
+function repCnt(r){var so=$('fsort').value;if(!isCsort(so)||r.sortCount==null)return '';var k=so.split('_')[1],own=(k==='likes'||(k==='comments'&&r.slug));if(own&&r[k]!=null)return '';return ' - '+(own?'':'owner has ')+cntWord(k,r.sortCount)}
+// The reported note's likes and comments, shown on every report card.
+function repLC(r){return (r.likes==null?'':' - '+cntWord('likes',r.likes))+(r.comments==null?'':' - '+cntWord('comments',r.comments))}
 var PICKS={ovnsort:[['new','Newest first']].concat(CSORT),adsort:[['new','Newest first']].concat(CSORT),ovsort:[['new', 'Newest first'], ['old', 'Oldest first'], ['active', 'Last active']].concat(CSORT),ovfilter:[['', 'All users'], ['online', 'Online now'], ['active24', 'Active 24h']],fstatus:[['', 'Any status'], ['live', 'live'], ['taken down', 'taken down'], ['unpublished', 'unpublished'], ['missing', 'missing']],fsort:[['new', 'Default order'], ['most', 'Most reported'], ['old', 'Oldest first']].concat(CSORT),adst:[['', 'All ads'], ['active', 'Active'], ['paused', 'Paused'], ['exhausted', 'Used up'], ['unpublished', 'Down']],adkind:[['', 'Write & Share'], ['write', 'Write'], ['share', 'Share']]};
 function pickSet(id,v){
   var b=$(id),o=PICKS[id].filter(function(x){return x[0]===v})[0]||PICKS[id][0];
@@ -1958,7 +1982,7 @@ function renderGroup(g){
   chips.push(stChip(first.status));
   if(g.items.length>1)chips.push(chip(g.items.length+' reports'));
   if(csam)chips.push(chip(nc?'NCMEC '+fmtD(nc.at):'NCMEC not recorded',nc?'good':'bad'));
-  var card=mkCard({sev:sev,urgent:csam,icon:RICON[sev],slug:g.slug,chips:chips,sub:'Latest report '+ago(first.reportedAt)+repCnt(first),trail:agoS(first.reportedAt),key:'rep:'+g.key});
+  var card=mkCard({sev:sev,urgent:csam,icon:RICON[sev],slug:g.slug,chips:chips,sub:'Latest report '+ago(first.reportedAt)+repLC(first)+repCnt(first),trail:agoS(first.reportedAt),key:'rep:'+g.key});
   var pad=card.pad;
   g.items.forEach(function(x){
     var r=el('div','rep'),top=el('div','rep-top');
@@ -2243,7 +2267,7 @@ function loadOwner(slug){
     if(d.pendingDeletionAt)cr.appendChild(chip('deletion '+fmtD(d.pendingDeletionAt+2592000000),'bad'));
     hm.appendChild(cr);hd.appendChild(hm);c.appendChild(hd);
     var st=el('div','stats');
-    [['Subscribers',d.subscribers],['Likes',d.likes],['Following',d.following],['Live pages',d.pages.length],['Ad tier',d.adTier],['Strikes',d.strikeCount],['Reports',d.reportStats?d.reportStats.total:null],['Alerts',d.alertTotal]].forEach(function(x){var s=el('div','stat');s.appendChild(el('b',null,x[1]==null?'-':num(x[1])));s.appendChild(el('span',null,x[0]));st.appendChild(s)});
+    [['Subscribers',d.subscribers],['Likes',d.likes],['Comments',d.comments],['Following',d.following],['Live pages',d.pages.length],['Ad tier',d.adTier],['Strikes',d.strikeCount],['Reports',d.reportStats?d.reportStats.total:null],['Alerts',d.alertTotal]].forEach(function(x){var s=el('div','stat');s.appendChild(el('b',null,x[1]==null?'-':num(x[1])));s.appendChild(el('span',null,x[0]));st.appendChild(s)});
     c.appendChild(st);
     var k=el('div','kvs');c.appendChild(k);
     aidRow(k,d.authorId);
@@ -2308,6 +2332,7 @@ function loadOwner(slug){
         r.appendChild(l);
         var m=el('div','pm');
         if(p.likes!=null){var lk=el('span','lk');lk.appendChild(ico('heart'));lk.appendChild(el('span','n',num(p.likes)));m.appendChild(lk)}
+        if(p.comments!=null){var cm=el('span','lk');cm.appendChild(ico('comment'));cm.appendChild(el('span','n',num(p.comments)));m.appendChild(cm)}
         if(p.reports){if(p.byReason)repChips(m,p.byReason,true,true);else m.appendChild(chip(p.reports+(p.reports===1?' report':' reports'),'bad'))}
         if(p.showInStories)m.appendChild(chip('story'));
         if(m.children.length>1){r.className='pgrow stack';r.insertBefore(m,l)}else r.appendChild(m);
@@ -2465,7 +2490,7 @@ function renderAd(a){
   var ml=el('div','meter-l');ml.appendChild(el('span',null,num(a.viewsUsed)+' of '+pl(a.viewsTotal,'view')));ml.appendChild(el('span',null,pct+'%'));m.appendChild(ml);
   var card=mkCard({sev:'ad',icon:'ads',slug:a.slug,chips:[stChip(a.status)],sub:(a.ownerEmail||'account missing')+(a.ownerSubs==null?'':' - '+num(a.ownerSubs)+(a.ownerSubs===1?' subscriber':' subscribers')+(a.ownerFollowing==null?'':' - '+num(a.ownerFollowing)+' following')+' - '+num(a.ownerNotes)+(a.ownerNotes===1?' note':' notes')),extra:m,key:'ad:'+a.slug});
   var k=el('div','kvs');
-  kv(k,'Type',a.kind==='share'?'Share':'Write');if(a.likes!=null)kv(k,'Likes',num(a.likes));kv(k,'Unique viewers',num(a.uniqueViewers));kv(k,'Views left',num(left));kv(k,'Created',fmt(a.createdAt));
+  kv(k,'Type',a.kind==='share'?'Share':'Write');if(a.likes!=null)kv(k,'Likes',num(a.likes));if(a.comments!=null)kv(k,'Comments',num(a.comments));kv(k,'Unique viewers',num(a.uniqueViewers));kv(k,'Views left',num(left));kv(k,'Created',fmt(a.createdAt));
   card.pad.appendChild(k);
   var tools=el('div','tools');tools.appendChild(btn('Lookup',null,function(){openLookup(a.slug)}));card.pad.appendChild(tools);
   var foot=card.foot;
@@ -3890,7 +3915,7 @@ alRender();alSync();
 /* ---------- Overview ---------- */
 var OV=[
   ['People',[['users','Users'],['usersOnline','Online now'],['guests','Guests'],['usersActive24h','Active 24h'],['usersNew7d','New this week'],['guestsOnline','Guests online']]],
-  ['Content',[['notes','Published notes'],['notesNew1d','New today'],['notesNew7d','New this week'],['publishers','Publishers'],['stories','In stories'],['likes','Likes']]],
+  ['Content',[['notes','Published notes'],['notesNew1d','New today'],['notesNew7d','New this week'],['publishers','Publishers'],['stories','In stories'],['likes','Likes'],['comments','Comments']]],
   ['Ads and follows',[['adsActive','Active ads'],['adsPaused','Paused ads'],['adViewsUsed','Ad views used'],['adsExhausted','Used up'],['adsUnpublished','Taken down'],['subscriptions','Subscriptions']]]
 ];
 var ovS={view:'users',cur:'',total:0,shown:0,gen:0,loaded:false,fil:'',sort:'new',nsort:'new',q:'',t:null};
@@ -3937,7 +3962,7 @@ function ovUserRow(u){
   var r=el('button','pgrow'),l=el('div');r.type='button';
   r.onclick=function(){if(!u.authorId)return;try{navigator.clipboard.writeText(u.authorId).then(function(){msg('Author ID copied')},function(){msg(u.authorId)})}catch(e){msg(u.authorId)}};
   l.appendChild(el('div','slug',u.email||'Account missing'));
-  l.appendChild(el('small',null,(u.name?u.name+' - ':'')+'Joined '+ago(u.createdAt)+' - '+num(u.notes)+(u.notes===1?' note':' notes')+(u.subs!=null?' - '+num(u.subs)+(u.subs===1?' subscriber':' subscribers'):'')+(u.likes!=null?' - '+cntWord('likes',u.likes):'')+(u.following!=null?' - '+cntWord('following',u.following):'')+' - '+(u.lastSeen?'seen '+ago(u.lastSeen):'not seen yet')+(u.lastSignInAt?' - signed in '+ago(u.lastSignInAt):'')));
+  l.appendChild(el('small',null,(u.name?u.name+' - ':'')+'Joined '+ago(u.createdAt)+' - '+num(u.notes)+(u.notes===1?' note':' notes')+(u.subs!=null?' - '+num(u.subs)+(u.subs===1?' subscriber':' subscribers'):'')+(u.likes!=null?' - '+cntWord('likes',u.likes):'')+(u.comments!=null?' - '+cntWord('comments',u.comments):'')+(u.following!=null?' - '+cntWord('following',u.following):'')+' - '+(u.lastSeen?'seen '+ago(u.lastSeen):'not seen yet')+(u.lastSignInAt?' - signed in '+ago(u.lastSignInAt):'')));
   if(u.authorId)l.appendChild(el('small','aid',u.authorId));
   if(u.referredBy){l.appendChild(el('small',null,'Referred by '+(u.referredBy.email||'account missing')));if(u.referredBy.authorId)l.appendChild(el('small','aid',u.referredBy.authorId))}
   if(u.referralCode)l.appendChild(el('small','aid','Referral code '+u.referralCode));
@@ -4027,6 +4052,7 @@ var trM=[
   {k:'notes',l:'Notes published',t:'Notes',c:'#46D6C8',cum:1,good:1},
   {k:'stories',l:'Stories',t:'Stories',c:'#F7C35B',cum:1,good:1},
   {k:'likes',l:'Likes',t:'Likes',c:'#FF8FB1',cum:1,good:1},
+  {k:'comments',l:'Comments',t:'Comments',c:'#7FD1FF',cum:1,good:1},
   {k:'subs',l:'Subscriptions',t:'Subscriptions',c:'#97A3F0',cum:1,good:1},
   {k:'ads',l:'Ads created',t:'Ads',c:'#B69CFF',cum:1,good:1},
   {k:'reports',l:'Reports',t:'Reports',c:'#FF9A5C',cum:1,good:0},
