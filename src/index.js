@@ -4521,7 +4521,11 @@ async function handleAdNext(env, request) {
       // The hourly slot is taken now, as the ad is served, so the view that follows is never refused for the cap (see handleAdView).
       if (!(await takeAdViewSlot(env, ad.slug, await capFor(), await adViewerEstablished(env, vid)))) continue;
       if (vid) await checkAdDeviceRateLimit(env, vid);
-      return json({ ad: { slug: ad.slug, viewToken: await issueAdViewToken(env, ad.slug) } });
+      // The author rides along (the same opaque ID /meta gives) so the viewer's header can show Subscribe from its first frame, as for any
+      // note. null means the ad's page was published without an account; a failed lookup leaves the field out and the app asks /meta.
+      const adOut = { slug: ad.slug, viewToken: await issueAdViewToken(env, ad.slug) };
+      try { adOut.authorSub = meta.ownerSub ? await authorIdFor(env, meta.ownerSub) : null; } catch (e) {}
+      return json({ ad: adOut });
     }
     const obj = await env.NOTES_BUCKET.get(ad.slug + '.html');
     if (!obj) continue;
