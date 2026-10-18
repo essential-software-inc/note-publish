@@ -61,12 +61,54 @@ const RESERVED_SLUGS = new Set([
   'www', 'assets', 'static', 'favicon.ico', 'robots.txt', 'health',
   'auth', 'sync', 'my', 'presence'
 ]);
-// Reserved addresses: SLUGS key "reserved:<slug>" (value '1', metadata {at, by, note}). A reserved slug reads as taken in
-// GET /check-slug and POST /publish refuses it, even though no page is linked to it. Only the admin Tools screen
-// writes or clears these keys (POST /admin/reserved); a reservation never touches slug:<slug> metadata.
-const RESERVED_PREFIX = 'reserved:';
+// Reserved addresses: D1 table reserved_slugs, so a new reservation shows in the very next list or check (the KV list this started on
+// ran one write behind). A reserved slug reads as taken in GET /check-slug and POST /publish refuses it, though no page is linked
+// to it. Only the admin Tools screen writes or clears rows (POST /admin/reserved); a reservation never touches slug:<slug> metadata.
+//   CREATE TABLE reserved_slugs (slug TEXT PRIMARY KEY, reserved_at INTEGER NOT NULL, reserved_by TEXT, note TEXT) WITHOUT ROWID;
 const RESERVE_MAX = 2000;
 const RESERVE_BATCH_MAX = 20;
+let reservedReady = null;
+function ensureReserved(env) {
+  if (!reservedReady) {
+    reservedReady = (async () => {
+      await env.ADS_DB.batch([
+        env.ADS_DB.prepare('CREATE TABLE IF NOT EXISTS reserved_slugs (slug TEXT PRIMARY KEY, reserved_at INTEGER NOT NULL, reserved_by TEXT, note TEXT) WITHOUT ROWID')
+      ]);
+      await importKvReservations(env);
+    })().catch((e) => { reservedReady = null; throw e; });
+  }
+  return reservedReady;
+}
+// One-time import of reservations made while they lived in KV ("reserved:<slug>" keys in SLUGS, metadata {at, by, note}). Each one is
+// copied into reserved_slugs and then deleted, and a flag key stops later runs; a failure part-way retries on the next request and
+// skips what already moved. Once every deployment has run it, this function, its call above and the flag key can go.
+async function importKvReservations(env) {
+  if (await env.SLUGS.get('migrated:reserved-d1')) return;
+  let cursor;
+  do {
+    const page = await env.SLUGS.list({ prefix: 'reserved:', cursor, limit: 1000 });
+    for (const k of page.keys) {
+      const slug = k.name.slice('reserved:'.length);
+      const m = k.metadata || {};
+      if (SLUG_RE.test(slug)) {
+        await env.ADS_DB.prepare('INSERT INTO reserved_slugs (slug, reserved_at, reserved_by, note) VALUES (?, ?, ?, ?) ON CONFLICT(slug) DO NOTHING')
+          .bind(slug, m.at || Date.now(), m.by || null, m.note || null).run();
+      }
+      await env.SLUGS.delete(k.name);
+    }
+    cursor = page.list_complete ? undefined : page.cursor;
+  } while (cursor);
+  await env.SLUGS.put('migrated:reserved-d1', '1');
+}
+async function isReserved(env, slug) {
+  await ensureReserved(env);
+  return !!(await env.ADS_DB.prepare('SELECT 1 AS x FROM reserved_slugs WHERE slug = ?').bind(slug).first());
+}
+async function reservationOf(env, slug) {
+  await ensureReserved(env);
+  const r = await env.ADS_DB.prepare('SELECT reserved_at, reserved_by, note FROM reserved_slugs WHERE slug = ?').bind(slug).first();
+  return r ? { at: r.reserved_at, by: r.reserved_by || null, note: r.note || null } : null;
+}
 const SOFT_DELETE_RETENTION_MS = 30 * 24 * 60 * 60 * 1000; // soft-deleted pages are kept 30 days before purge
 // CSAM-reported pages and their report records are held for 18 months (548 days),
 // counted from the report (or, for dismissed report records, from dismissal). 18 U.S.C.
@@ -122,10 +164,6 @@ function timingSafeEqual(a, b) {
 }
 function validSlug(slug) {
   return typeof slug === 'string' && SLUG_RE.test(slug) && !RESERVED_SLUGS.has(slug);
-}
-
-async function isReserved(env, slug) {
-  return (await env.SLUGS.get(RESERVED_PREFIX + slug)) !== null;
 }
 
 async function getMeta(env, slug) {
@@ -5374,22 +5412,6 @@ async function handleAdminAdmins(env, request) {
   }
   return textError(400, 'unknown action');
 }
-// All reserved addresses (one KV key each, so one or two list calls), unsorted.
-async function listReserved(env) {
-  const out = [];
-  let cursor;
-  for (let i = 0; i < 3; i++) {
-    const page = await env.SLUGS.list({ prefix: RESERVED_PREFIX, cursor, limit: 1000 });
-    for (const k of page.keys) {
-      const m = k.metadata || {};
-      out.push({ slug: k.name.slice(RESERVED_PREFIX.length), at: m.at || null, by: m.by || null, note: m.note || null });
-    }
-    if (page.list_complete) break;
-    cursor = page.cursor;
-  }
-  return out;
-}
-
 // GET /admin/reserved?q=&sort=new|az&limit=&cursor=: one page of reserved addresses (limit 1 to 50, default 25). q matches part
 // of the slug or note. cursor is the offset in the filtered, sorted list, and next is null on the last page. total counts
 // every reservation, found those matching q.
@@ -5397,16 +5419,24 @@ async function listReserved(env) {
 // {reserved, skipped:[{slug, reason}]}); {action:'unreserve', slug} frees one. Any admin may use it, like Release.
 async function handleAdminReserved(env, request) {
   const g = await adminGate(env, request, false); if (g) return g;
-  const all = await listReserved(env);
+  await ensureReserved(env);
   if (request.method === 'GET') {
     const sp = new URL(request.url).searchParams;
     const q = (sp.get('q') || '').trim().toLowerCase();
     const sort = sp.get('sort') === 'az' ? 'az' : 'new';
     const limit = Math.min(50, Math.max(1, parseInt(sp.get('limit') || '25', 10) || 25));
     const start = Math.max(0, parseInt(sp.get('cursor') || '0', 10) || 0);
-    const rows = (q ? all.filter((r) => r.slug.includes(q) || (r.note && r.note.toLowerCase().includes(q))) : all.slice())
-      .sort(sort === 'az' ? (a, b) => (a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0) : (a, b) => (b.at || 0) - (a.at || 0) || (a.slug < b.slug ? -1 : 1));
-    return json({ ok: true, max: RESERVE_MAX, total: all.length, found: rows.length, reserved: rows.slice(start, start + limit), next: start + limit < rows.length ? start + limit : null });
+    const match = "(?1 = '' OR instr(slug, ?1) > 0 OR instr(lower(coalesce(note, '')), ?1) > 0)";
+    const order = sort === 'az' ? 'slug ASC' : 'reserved_at DESC, slug ASC';
+    const rs = await env.ADS_DB.batch([
+      env.ADS_DB.prepare('SELECT COUNT(*) AS n FROM reserved_slugs'),
+      env.ADS_DB.prepare('SELECT COUNT(*) AS n FROM reserved_slugs WHERE ' + match).bind(q),
+      env.ADS_DB.prepare('SELECT slug, reserved_at, reserved_by, note FROM reserved_slugs WHERE ' + match + ' ORDER BY ' + order + ' LIMIT ?2 OFFSET ?3').bind(q, limit, start)
+    ]);
+    const total = ((rs[0].results || [])[0] || {}).n || 0;
+    const found = ((rs[1].results || [])[0] || {}).n || 0;
+    const reserved = (rs[2].results || []).map((r) => ({ slug: r.slug, at: r.reserved_at, by: r.reserved_by || null, note: r.note || null }));
+    return json({ ok: true, max: RESERVE_MAX, total, found, reserved, next: start + limit < found ? start + limit : null }, 200, { 'Cache-Control': 'no-store' });
   }
   const body = await adminBody(request);
   if (body.action === 'reserve') {
@@ -5414,7 +5444,7 @@ async function handleAdminReserved(env, request) {
     if (!raw.length) return textError(400, 'no slugs given');
     if (raw.length > RESERVE_BATCH_MAX) return textError(400, 'at most ' + RESERVE_BATCH_MAX + ' slugs at a time');
     const note = typeof body.note === 'string' ? body.note.trim().replace(/\s+/g, ' ').slice(0, 100) : '';
-    let count = all.length;
+    let count = ((await env.ADS_DB.prepare('SELECT COUNT(*) AS n FROM reserved_slugs').first()) || {}).n || 0;
     const reserved = [], skipped = [], seen = new Set();
     for (const r of raw) {
       const slug = typeof r === 'string' ? r.trim().toLowerCase() : '';
@@ -5427,8 +5457,9 @@ async function handleAdminReserved(env, request) {
       const meta = await getMeta(env, slug);
       if (meta && meta.adminLocked) { skip('locked by a takedown'); continue; }
       if (meta && !meta.deletedAt) { skip('a live page already uses it'); continue; }
-      if (await isReserved(env, slug)) { skip('already reserved'); continue; }
-      await env.SLUGS.put(RESERVED_PREFIX + slug, '1', { metadata: { at: Date.now(), by: actorOf(request), note: note || null } });
+      const ins = await env.ADS_DB.prepare('INSERT INTO reserved_slugs (slug, reserved_at, reserved_by, note) VALUES (?, ?, ?, ?) ON CONFLICT(slug) DO NOTHING')
+        .bind(slug, Date.now(), actorOf(request), note || null).run();
+      if (!ins.meta || !ins.meta.changes) { skip('already reserved'); continue; }
       await auditBy(env, request, 'reserve', slug, note || null);
       count++;
       reserved.push(slug);
@@ -5437,8 +5468,9 @@ async function handleAdminReserved(env, request) {
   }
   if (body.action === 'unreserve') {
     const slug = typeof body.slug === 'string' ? body.slug.trim().toLowerCase() : '';
-    if (!SLUG_RE.test(slug) || !(await isReserved(env, slug))) return textError(404, 'not reserved');
-    await env.SLUGS.delete(RESERVED_PREFIX + slug);
+    if (!SLUG_RE.test(slug)) return textError(404, 'not reserved');
+    const del = await env.ADS_DB.prepare('DELETE FROM reserved_slugs WHERE slug = ?').bind(slug).run();
+    if (!del.meta || !del.meta.changes) return textError(404, 'not reserved');
     await auditBy(env, request, 'unreserve', slug, null);
     return json({ ok: true });
   }
@@ -5566,8 +5598,7 @@ async function handleAdminLookup(env, request, url) {
   const [reportMap, reasonMap] = await Promise.all([reportCounts(env), reportReasonStats(env, [slug])]);
   const reports = reportMap.get(slug) || 0;
   const reportStats = reasonMap ? (reasonMap.get(slug) || { total: 0, open: 0, byReason: {} }) : null;
-  const resv = await env.SLUGS.getWithMetadata(RESERVED_PREFIX + slug);
-  const reserved = resv && resv.value !== null ? { at: (resv.metadata || {}).at || null, by: (resv.metadata || {}).by || null, note: (resv.metadata || {}).note || null } : null;
+  const reserved = await reservationOf(env, slug);
   if (!meta) return json({ found: false, slug, reports, reportStats, reserved });
   const [user, story, likes, ad, head, snaps, hold, ncmec] = await Promise.all([
     meta.ownerSub ? getUser(env, meta.ownerSub) : null,
