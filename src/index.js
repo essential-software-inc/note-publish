@@ -30,7 +30,7 @@
  * intentionally open (read-only, cheap).
  */
 
-const MAX_HTML_BYTES = 2 * 1024 * 1024; // 2MB per published page, tune as needed
+const MAX_HTML_BYTES = 5 * 1024 * 1024; // 5MB per published page. A page ships the full editor stylesheet (~430KB incl. embedded fonts/splash images) on top of the note's own images, so the built-in demo note alone is ~2.5MB
 // Backup images are stored one object each under sync/<sub>/img/<id> rather
 // than embedded in the single notes.json, so the backup file itself stays
 // small (text only) and a sync only ever uploads images it hasn't sent before.
@@ -42,7 +42,7 @@ const SYNC_IMAGE_ID_RE = /^[A-Za-z0-9_-]{1,80}$/;
 const SYNC_IMAGE_GC_MIN_AGE_MS = 14 * 24 * 60 * 60 * 1000; // never delete a still-fresh upload — see gcSyncImages
 const MAX_SYNC_BYTES = 8 * 1024 * 1024; // notes backups carry embedded images, so a higher cap than a single published page
 // Per-account cap on simultaneously-live published pages. At MAX_HTML_BYTES
-// each this bounds one account's worst-case R2 footprint to ~1GB; well
+// each this bounds one account's worst-case R2 footprint to ~2.5GB; well
 // above any legitimate usage pattern, but closes off unbounded growth from
 // a compromised/scripted account. Anonymous (no ownerSub) publishes aren't
 // covered by this cap since there's no account to count against — they're
