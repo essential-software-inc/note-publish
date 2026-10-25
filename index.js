@@ -11590,7 +11590,7 @@ const TB_MAX_PER_PAGE = 50;
 const TB_MAX_FIELDS = 30;
 const TB_MAX_OPTS = 30;            // options on one dropdown / choice / checkbox field
 const TB_OPT_RE = /^[a-z0-9]{1,12}$/;
-const TB_TYPES = new Set(['s', 'l', 'e', 'n', 'p', 'u', 'd', 'c', 'r', 'k', 'y']); // short, long, email, number, phone, link, date, dropdown, choice, checkboxes, tick box
+const TB_TYPES = new Set(['s', 'l', 'e', 'n', 'p', 'u', 'd', 't', 'c', 'r', 'k', 'y']); // short, long, email, number, phone, link, date, time, dropdown, choice, checkboxes, tick box
 const TB_CHOICE = new Set(['c', 'r', 'k']);
 const TB_MAX_MSGS = 5000;          // stored messages per box; a full box stops taking new ones until the author deletes some
 const TB_MAX_BYTES = 120000;       // one message, all fields together
@@ -11600,7 +11600,7 @@ const TB_ALERT_GAP_MS = 60 * 60 * 1000;
 const TB_WARN_AT = Math.floor(TB_MAX_MSGS * 0.9); // the author is warned when a box reaches 90% of its message cap
 const TB_FULL_ALERT_GAP_MS = 24 * 60 * 60 * 1000; // 'someone was turned away' alerts: at most one a day per box
 const TB_BUSY_ALERT_GAP_MS = 6 * 60 * 60 * 1000;  // 'getting too many sends' alerts: at most one every six hours per box
-const TB_DEF_ML = { s: 200, l: 2000, e: 254, n: 40, p: 40, u: 500, d: 10 }; // default length per type; short and long can be raised by the author up to TB_CAP_ML
+const TB_DEF_ML = { s: 200, l: 2000, e: 254, n: 40, p: 40, u: 500, d: 10, t: 5 }; // default length per type; short and long can be raised by the author up to TB_CAP_ML
 const TB_CAP_ML = { s: 1000, l: 10000 };
 let textboxesReady = null;
 function ensureTextboxes(env) {
@@ -11786,6 +11786,7 @@ function checkTextboxField(f, raw) {
   if (t === 'p' && !/^\+?[0-9 ()\-.]{3,30}$/.test(val)) return { err: 'that phone number doesn\u2019t look right' };
   if (t === 'u' && !/^https?:\/\/[^\s]{3,480}$/i.test(val)) return { err: 'that link doesn\u2019t look right' };
   if (t === 'd') { const d = /^(\d{4})-(\d{2})-(\d{2})$/.exec(val); const dt = d && new Date(Date.UTC(+d[1], +d[2] - 1, +d[3])); if (!dt || dt.getUTCMonth() !== +d[2] - 1) return { err: 'that date doesn\u2019t look right' }; }
+  if (t === 't' && !/^([01]\d|2[0-3]):[0-5]\d$/.test(val)) return { err: 'that time doesn\u2019t look right' };
   return { val };
 }
 // POST /textbox/state { slug, box } -> whether the box is taking messages right now.
