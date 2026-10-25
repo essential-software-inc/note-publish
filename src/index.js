@@ -386,10 +386,10 @@ async function pruneActivity(env) {
   return 0;
 }
 
-// The six reporting/retention prunes, shared by the nightly cron and the admin purge button.
+// The seven reporting/retention prunes, shared by the nightly cron and the admin purge button.
 // Returns the total rows deleted.
 async function pruneAll(env) {
-  const n = await Promise.all([prunePresence(env), pruneAlerts(env), pruneActivity(env), pruneReportIndex(env), pruneRateLimits(env), prunePolls(env)]);
+  const n = await Promise.all([prunePresence(env), pruneAlerts(env), pruneActivity(env), pruneReportIndex(env), pruneRateLimits(env), prunePolls(env), pruneTextboxes(env), prunePays(env)]);
   return n.reduce((a, b) => a + b, 0);
 }
 
@@ -537,6 +537,7 @@ async function handleSetProfileImage(env, request) {
   if (dataUrl === null || dataUrl === undefined || dataUrl === '') {
     user.hasProfileImage = false;
     await putUser(env, sub, user);
+    await syncTextboxPic(env, sub, 0);
     return json({ ok: true, hasProfileImage: false });
   }
   if (typeof dataUrl !== 'string') return textError(400, 'invalid dataUrl');
@@ -564,6 +565,7 @@ async function handleSetProfileImage(env, request) {
   await env.NOTES_BUCKET.put(profileImageKey(sub), bytes, { httpMetadata: { contentType } });
   user.hasProfileImage = true;
   await putUser(env, sub, user);
+  await syncTextboxPic(env, sub, 1);
   return json({ ok: true, hasProfileImage: true });
 }
 
@@ -590,6 +592,10 @@ async function handleServeProfileImage(env, param, request) {
       let named = null;
       try { await ensureComments(env); named = await env.ADS_DB.prepare('SELECT 1 AS x FROM comments WHERE author_sub = ? AND name IS NOT NULL LIMIT 1').bind(sub).first(); }
       catch (e) { console.log('profile image comment check failed: ' + (e && e.message)); }
+      if (!named) { // a named text box message ("Send as me") also shows the sender's picture to the page's owner
+        try { await ensureTextboxes(env); const aid = await authorIdFor(env, sub); named = aid ? await env.ADS_DB.prepare('SELECT 1 AS x FROM textbox_msgs WHERE sender_id = ? AND sender_name IS NOT NULL LIMIT 1').bind(aid).first() : null; }
+        catch (e) { console.log('profile image text box check failed: ' + (e && e.message)); }
+      }
       if (!named) return textError(404, 'not found');
     }
   }
@@ -965,6 +971,9 @@ async function rlAtLimit(env, key, max) {
     return !!row && row.reset_at > Date.now() && row.n >= max;
   } catch (e) { return false; }
 }
+async function rlRelease(env, key) {
+  try { await ensureRateLimits(env); await env.ADS_DB.prepare('UPDATE rate_limits SET n = MAX(n - 1, 0) WHERE k = ?').bind(key).run(); } catch (e) { /* expires on its own */ }
+}
 async function rlClear(env, key) {
   try { await ensureRateLimits(env); await env.ADS_DB.prepare('DELETE FROM rate_limits WHERE k = ?').bind(key).run(); } catch (e) { /* expires on its own */ }
 }
@@ -1274,7 +1283,8 @@ const ACCOUNT_RATE_LIMITS = {
   syncImage: { max: 300, windowS: 60 },
   redeem:    { max: 8,   windowS: 60 },
   mlOptOut:  { max: 10,  windowS: 60 },
-  displayPrefs: { max: 20, windowS: 60 }
+  displayPrefs: { max: 20, windowS: 60 },
+  textbox:   { max: 10,  windowS: 60 }
 };
 async function checkAccountRateLimit(env, sub, action) {
   const cfg = ACCOUNT_RATE_LIMITS[action];
@@ -1435,6 +1445,8 @@ async function handlePublish(env, request) {
     ]);
   }
   await syncPollsSafe(env, slug, html);
+  await syncTextboxesSafe(env, slug, html);
+  await syncPaysSafe(env, slug, html);
   await afterPublishAdCheck(env, ownerSub);
   return json({ slug, token }, 201);
 }
@@ -1521,6 +1533,8 @@ async function handleUpdate(env, request, slug) {
 
   await putMeta(env, slug, meta);
   await syncPollsSafe(env, slug, html);
+  await syncTextboxesSafe(env, slug, html);
+  await syncPaysSafe(env, slug, html);
   return json({ ok: true });
 }
 
@@ -1725,6 +1739,8 @@ async function handleUnpublish(env, request, slug) {
   ]);
   await deleteCommentsForSlug(env, slug); // comments belong to the note too, for the same reason as its likes
   await softDeletePolls(env, slug, now); // polls keep their votes for the 30-day retention window (they only come back if the same poll is republished)
+  await softDeleteTextboxes(env, slug, now); // same 30-day window for text box messages
+  await softDeletePays(env, slug, now); // and for payment records
   // An ad IS this page: unpublishing the page must take the ad down too, or
   // /ads/next would keep handing out its HTML until the 30-day purge.
   // For an admin release, read the ad first: a release is not a penalty, so its unused views are refunded.
@@ -2778,11 +2794,33 @@ async function deleteCommentsForAccount(env, sub) {
       env.ADS_DB.prepare('DELETE FROM comment_settings WHERE slug IN (SELECT slug FROM published_notes WHERE author_sub = ?)').bind(sub)
     ]);
   } catch (e) { console.log('comment account cleanup failed: ' + (e && e.message)); }
+  try { // text box messages the account sent as itself stay with the page's author, but lose who sent them
+    await ensureTextboxes(env);
+    const a = await env.ADS_DB.prepare('SELECT author_id FROM authors WHERE sub = ?').bind(sub).first();
+    if (a && a.author_id) await env.ADS_DB.prepare('UPDATE textbox_msgs SET sender_id = NULL, sender_name = NULL, sender_pic = NULL WHERE sender_id = ?').bind(a.author_id).run();
+  } catch (e) { console.log('text box account cleanup failed: ' + (e && e.message)); }
+}
+// Text box messages sent as this account keep a picture flag; it follows the account when the picture is added or removed.
+async function syncTextboxPic(env, sub, pic) {
+  try {
+    await ensureTextboxes(env);
+    const a = await env.ADS_DB.prepare('SELECT author_id FROM authors WHERE sub = ?').bind(sub).first();
+    if (a && a.author_id) await env.ADS_DB.prepare('UPDATE textbox_msgs SET sender_pic = ? WHERE sender_id = ?').bind(pic, a.author_id).run();
+  } catch (e) { console.log('text box picture sync failed: ' + (e && e.message)); }
 }
 // A changed or cleared display name follows the account's existing comments, so a name an admin removes is gone everywhere.
 async function syncCommentName(env, sub, name, strict) {
   try { await ensureComments(env); await env.ADS_DB.prepare('UPDATE comments SET name = ? WHERE author_sub = ?').bind(name || null, sub).run(); }
   catch (e) { console.log('comment name sync failed: ' + (e && e.message)); if (strict) throw e; }
+  // text box messages sent as this account follow the same name; going Anonymous (or clearing the name) hides the sender on them (the owner is shown nothing), and a name coming back shows it again. Deleting the account unlinks them for good.
+  try {
+    await ensureTextboxes(env);
+    const a = await env.ADS_DB.prepare('SELECT author_id FROM authors WHERE sub = ?').bind(sub).first();
+    if (a && a.author_id) {
+      if (name) await env.ADS_DB.prepare('UPDATE textbox_msgs SET sender_name = ? WHERE sender_id = ?').bind(name, a.author_id).run();
+      else await env.ADS_DB.prepare('UPDATE textbox_msgs SET sender_name = NULL WHERE sender_id = ?').bind(a.author_id).run(); // hidden, not unlinked: the author id stays so the name comes back with the next name
+    }
+  } catch (e) { console.log('text box name sync failed: ' + (e && e.message)); if (strict) throw e; }
 }
 
 
@@ -3247,13 +3285,20 @@ async function handleServe(env, slug) {
     "connect-src 'self'",
     "object-src 'none'",
     "base-uri 'none'"
-  ].join('; ');
+  ];
+  // A page with an in-page payment block or a Stripe Buy Button (meta.hasPay, set when it is published) also loads Stripe's script and frames. No other page does.
+  if (meta.hasPay) {
+    csp[1] = "script-src 'unsafe-inline' https://js.stripe.com https://*.js.stripe.com";
+    csp[6] = csp[6] + ' https://js.stripe.com https://*.js.stripe.com https://hooks.stripe.com https://checkout.stripe.com';
+    csp[7] = "connect-src 'self' https://api.stripe.com https://*.stripe.com";
+  }
+  const cspHeader = csp.join('; ');
 
   const cmBlock = typeof HTMLRewriter === 'undefined' ? '' : await commentsPageBlock(env, slug, meta);
   const res = new Response(obj.body, {
     headers: {
       'Content-Type': 'text/html; charset=utf-8',
-      'Content-Security-Policy': csp,
+      'Content-Security-Policy': cspHeader,
       'X-Content-Type-Options': 'nosniff',
       'Referrer-Policy': 'strict-origin-when-cross-origin',
       // The app reads published pages with fetch() (Media > Likes scans liked notes for media links). Without this the browser/WebView
@@ -3598,6 +3643,7 @@ async function handleDeleteAccount(env, request) {
 // has elapsed.
 async function purgeAccountData(env, sub) {
   await deleteCommentsForAccount(env, sub);
+  try { await ensurePayments(env); await env.ADS_DB.prepare('DELETE FROM pay_accounts WHERE sub = ?').bind(sub).run(); } catch (e) { /* the Stripe account itself stays with its owner; only the link to it goes */ }
   const prefix = 'owner:' + sub + ':';
   let cursor;
   do {
@@ -3621,6 +3667,8 @@ async function purgeAccountData(env, sub) {
         ]);
         await deleteCommentsForSlug(env, slug);
         await softDeletePolls(env, slug, now);
+        await softDeleteTextboxes(env, slug, now);
+        await softDeletePays(env, slug, now);
         await deleteStoryCardImages(env, slug);
         await env.SLUGS.delete(cardImagesKey(slug));
         await deleteStoryImage(env, slug); // not gated on meta.showInStories, see handleUnpublish
@@ -3766,6 +3814,7 @@ async function validateAdEligibility(html) {
   const imageSrcs = [];
   let audioBlocks = 0; // voice notes are always recorded on the device, so an ad can't carry one
   let pollBlocks = 0; // polls collect votes from visitors, which an ad must never do
+  let textboxBlocks = 0; // text boxes collect messages from visitors, which an ad must never do
   const embedSrcs = [];
   const captionContents = [];
   let currentTextBuf = null; // accumulates text inside the block currently being walked
@@ -3786,6 +3835,9 @@ async function validateAdEligibility(html) {
     })
     .on('.blk[data-type="poll"]', {
       element() { pollBlocks++; }
+    })
+    .on('.blk[data-type="textbox"]', {
+      element() { textboxBlocks++; }
     })
     .on('.blk-media-frame iframe, .blk-social-embed iframe', {
       element(el) { embedSrcs.push(el.getAttribute('src') || ''); }
@@ -3857,6 +3909,7 @@ async function validateAdEligibility(html) {
   // Rule: no voice notes (device recordings).
   if (audioBlocks) return { ok: false, reason: 'device-voice-note' };
   if (pollBlocks) return { ok: false, reason: 'poll-not-allowed' };
+  if (textboxBlocks) return { ok: false, reason: 'textbox-not-allowed' };
 
   // Rule: any video/social embed must be one our own editor generates —
   // see AD_ALLOWED_EMBED_HOSTS above for why this is exact-match and why
@@ -5900,7 +5953,7 @@ async function handleAdminOwnerAction(env, request) {
   if (action === 'suspend') user.suspended = true;
   else if (action === 'unsuspend') delete user.suspended;
   else if (action === 'clear-name') { user.profileName = null; await syncCommentName(env, sub, null); }
-  else if (action === 'clear-picture') { await env.NOTES_BUCKET.delete(profileImageKey(sub)); user.hasProfileImage = false; }
+  else if (action === 'clear-picture') { await env.NOTES_BUCKET.delete(profileImageKey(sub)); user.hasProfileImage = false; await syncTextboxPic(env, sub, 0); }
   else if (action === 'delete') { user.suspended = true; user.adminDeleted = true; user.pendingDeletionAt = Date.now(); }
   else if (action === 'cancel-delete') {
     delete user.pendingDeletionAt;
@@ -6405,7 +6458,7 @@ const LEGAL_KINDS = { privacy: 'Privacy Policy', terms: 'Consumer Terms' };
 const LEGAL_MAX = 150000;
 // The copies built into the app, so the editor starts from what people already see until something has been published.
 // Keep them in step with the text in the app.
-const LEGAL_DEFAULTS = {"privacy": "      <p><em>Effective 23 October 2026</em></p>\n      <p><strong>Bluebook</strong> is published by Essential Software (&ldquo;we&rdquo;, &ldquo;us&rdquo;, and &ldquo;our&rdquo; in this policy), and we're glad you're here. This page explains in plain language what the app stores, where it lives, and what leaves your device.</p>\n      <h3>On-device storage</h3>\n      <p>Your pages, drafts, images, favourites, playlists, preferences and app settings all stay on your device. There's one exception: when you're signed in, we keep track of which stories you've opened on our servers, under your account (see \"Stories, subscriptions &amp; likes\" below). For each account signed in on the device, the app also keeps a copy of which notes you've liked and which accounts you follow (signing out clears the follow copy). It keeps a short queue of any likes or follows you tapped while offline that haven't been sent yet. It also keeps a small number that tells it how far your device's clock is off from our servers, so those taps get the right time. If you sign in with Google, your notes, along with your favorites, playlists, theme choice and your \"All my notes\" switches from Settings, are also backed up to our servers (see below). Those switches are kept on your device separately for each account, so one account's choices never touch another account's pages, even on a shared phone.</p>\n      <h3>App lock</h3>\n      <p>App lock is optional. If you turn it on, Bluebook asks for a PIN or password whenever you open the app fresh or refresh the page, and again when you come back after being away for more than 30 seconds, so other people can't peek at your notes.</p>\n      <p>Your PIN or password is never saved the way you typed it. The app turns it into a scrambled code (called a hash) and keeps only that code, on your device. When you type it later, the app scrambles what you typed and checks whether the two codes match. Nothing about your lock is sent to us or saved to your account, so we can't see it, reset it or recover it for you.</p>\n      <p>When you set it up, you also pick a recovery question and write an answer. The question is kept as plain text on your device so the app can show it to you if you forget your PIN. The answer is scrambled the same way as your PIN. Pick something only you know, because anyone who gets the answer right can get in.</p>\n      <p>If you type a wrong PIN or a wrong answer five times in a row, the app makes you wait before you can try again. The wait starts at 30 seconds and grows up to 15 minutes. It's there to slow down anyone who's guessing.</p>\n      <p>If you forget both your PIN and your recovery answer, we can't get you back in, and we can't reset it for you. The only way past it is to clear Bluebook's data in your phone or browser settings. Notes you backed up by signing in can be restored afterwards, but anything that only lived on this device is gone. So pick a PIN and answer you'll remember, and keep backups.</p>\n      <p>One last thing: app lock is like a door lock for the app. It doesn't scramble the notes stored on your device. For extra privacy, keep your phone's own screen lock on too.</p>\n      <h3>Google sign-in &amp; sync</h3>\n      <p>Signing in is totally optional, and Google handles it, so we never see your Google password. We get your Google account ID and email address, and we keep them along with your sign-up date, your last sign-in date, the last time the app was active on your account (see \"Activity counts\" below), and a code that keeps you signed in (a session lasts up to 30 days). While you're signed in, your notes (including embedded images and voice notes), your favorites, your playlists (their names and the songs and videos you put in them), your theme choice and your \"All my notes\" switches (see \"All my notes\" below) are backed up to our servers so you can restore them on another device. Your Pro purchase (if you have one) and any ad view-credit balance (see \"In-app purchases\" below) are linked to your account too, so they come with you. Signing out stops syncing. Your backup stays put, so you can pick it up again when you sign back in, and deleting your account removes it, as described below. If an image in your backup isn't used by any note any more (for example, after you delete a note or swap an image), the nightly clean-up deletes it once it's more than 14 days old.</p>\n      <p>Your account is yours to keep or remove. You can delete it any time by tapping the account icon and choosing Delete account under Show more. That signs this device out and schedules your account for deletion in 30 days. The deletion happens during our nightly clean-up, so it can land up to a day after the 30 days are up. When it does, we permanently delete your account record, synced notes, images, voice notes and playlists, profile name and picture, subscriptions (the ones you made and the ones to you), records of the stories you've opened, your likes and follows (including the times we noted for them), running ads and their view statistics, your invite code and any invites you made or used, your ad access record, your alerts (including ones you deleted from your list), and any unspent ad view-credit balance. We also take down every page you published (we keep a copy of each page, along with its record, for about 30 more days, as described under \"Publishing a page\"). Until then, your published pages and stories stay online. Changed your mind? Sign back in with the same Google account during the 30 days and the deletion is cancelled, with full access restored. Every device where you're signed in gets signed out as part of the deletion (each one finds out the next time the app contacts our server, usually within about a minute). Deleting your account doesn't delete anything held by Google or RevenueCat. Their own policies cover that.</p>\n      <h3>In-app purchases</h3>\n      <p>Unlocking Pro and buying ad view-credit packages are both purchases made through Google Play Billing. RevenueCat, a third-party subscription service, handles them for us. RevenueCat gets the purchase details it needs to confirm what you bought, linked to an ID. Before you sign in, that's an anonymous ID RevenueCat makes for your install. Once you sign in, it's your Google account ID, which is what lets a purchase follow you to another device. After that, the two work differently. The app checks directly with RevenueCat (not through our servers) to see whether Pro is active. It keeps a saved copy of that answer on your device, and refreshes it from RevenueCat when the app launches and after a purchase or restore. Ad view-credits do go through our servers. They hear from RevenueCat (not from Google directly) that you bought views, and add the views to your account. We keep a list of your view credits: each purchase (for a particular ad, or added to your balance from Settings), each time views are put on an ad (with that ad's address), each refund or return, and each gift of free views for an invite, all with the time. Views returned to you stay in your balance, and you can put them on an ad without buying again. That doesn't involve Google Play or RevenueCat. If Google Play refunds a purchase, we take those views back. That list is deleted with your account. We never get your payment details, because Google handles those directly. See <a href=\"https://www.revenuecat.com/privacy\" target=\"_blank\" rel=\"noopener\">RevenueCat's own privacy policy</a> for how it handles what it receives.</p>\n      <h3>Publishing a page</h3>\n      <p>Publishing is always your choice, and it only happens when you tap Publish. We receive your page's content, its title, description and tags (if you've added them), when the note was created, and the address you choose, and we store them so the page can be shown at a public link. Anyone with that link can view the page. If you've given the note a category, we save that too. It's just your own private label, so it doesn't show on the page or on any card. We only send it back to you when you're signed in, so if you ever restore a page as a note, it goes back into the right category. You can publish without signing in, and then the page isn't linked to any account. If you later sign in and, using that page's private token on your device, turn on \"Show in stories\" or save an update to it, we link the page to your account from then on. It then shows up among your published pages, counts toward your account's page limit, and is taken down if you delete your account. We also give you a private token for each page. It's stored on your device, and we don't keep it in its original form. We only keep a scrambled version, just enough to check that it matches when you send it back to update or unpublish. Updating a published page sends the new content the same way. Unpublishing takes the page down, and if it was running as an ad, the ad stops too. We may keep a copy for about 30 days afterward (our clean-up runs nightly), in case of an abuse report or takedown request, and then delete it. If the page was reported as child sexual abuse material, we keep the copy for 18 months instead (see \"Reporting a published page\"). The page's own record is kept for the same time and then deleted. It holds the address, a scrambled form of the private token, the title, description, tags and category, and, if the page was linked to an account, that account's internal ID. That's why it stays even after the account itself is deleted. If we remove a page because of a takedown request or abuse report, its address is reserved permanently. To keep that reservation in place, we keep a small record for as long as the address stays reserved: the address, a scrambled form of the private token, the title, description, tags and category, and, if the page was linked to an account, that account's internal ID. This record stays even after the copy or the account is deleted, because deleting it would lift the reservation. Publishing also briefly counts requests from your IP address to limit spam. That count sits in a short-lived counter that disappears on its own after about a minute, and it isn't kept afterward or linked to your account or the page. Separately, to stop spam, we also count how often you like, subscribe, mark stories as seen, add an invite code or back up. That count is linked to your account and disappears within a couple of minutes.</p>\n      <h3>Using published pages and comments</h3>\n      <p>We may use the pages you've published, and the comments on them, to run, build, test and improve Bluebook and our other apps, including by using machine learning. This only covers published pages and their comments, which anyone who opens the page can already see. It doesn't cover notes that are only backed up to your account.</p>\n      <p>If you live somewhere with data protection laws, like the EU or the UK, we do this because we have a good reason to improve our apps (the law calls this a \"legitimate interest\"). You can say no any time. Choose \"No, keep out\" when we ask the first time you sign in, or change your choice any time in Settings under Privacy, and from then on we stop using your published pages, and the comments you write, for this. It covers everything on your account, old and new. Pages you published without signing in aren't linked to an account, so the switch can't reach them, but you can unpublish them. The page or comment itself stays where it is unless you unpublish or delete it.</p>\n      <p>There are limits to what we can undo. If we've already used a page or comment to build or train something, we may not be able to take it back out. And we can't control copies other people have already made, like a page someone saved or shared.</p>\n      <h3>Comments</h3>\n      <p>If a page's author turns on comments, people who are signed in can comment on it and reply to each other. For each comment we save what it says, when it was written, whether it's a reply, your account ID and your random author ID. Comments show up on the live page for anyone who opens it. Normally a comment shows your display name and profile picture, or \"Anonymous\" if you haven't set a display name. If you'd rather not be named, go to Settings, under Privacy, and set \"Comment as\" to Anonymous. Then your comments show as Anonymous, with no name or picture, and the alerts they send say \"Someone\" instead of your name. This choice is saved with your account, so it's the same on every device you sign in on. It covers all your comments, old and new. So if you switch back to your name and picture, they'll show on all your comments again. Changing your display name changes it on all of them too, unless you're commenting as Anonymous.</p>\n      <p>Anonymous only hides you from other people. We can still tell which account wrote each comment. That lets you delete your own comments, lets replies reach you, and lets us act on comments that break the terms. If you're the author of the page, your comments on it still show a tag saying they're from the author. We keep comments until you or the page's author deletes them, the page is unpublished, or your account is deleted.</p>\n            <h3>Polls</h3>\n      <p>A page's author can add a poll to a published page. A poll is a question people can vote on. The author can write their own answers, or pick Yes / No, or a rating from 1 to 5 or 1 to 10. Anyone who opens the page can vote. They don't need to sign in, and a vote isn't linked to an account.</p>\n      <p>When you vote, your device sends us the page's address, which poll it is, the answer or answers you picked, and a random code. Your device makes that code and keeps it in the browser's storage. It's how we know this device has already voted, so the poll can show your choice back to you. We only keep a scrambled version of the code, mixed with the page and poll it belongs to, so it can't be used to spot you on other pages. We save it with your answers and the time you voted. We also keep how many votes each answer got, in total and for each day, so the author can see totals. None of this is linked to a Google account, email address, name, or anything else that identifies you. Because the code belongs to a device, someone who clears their browser storage, or votes from another device, looks like a new voter. So a poll is a friendly guide to what people think, not an exact count. When you vote, we also briefly count requests from your IP address to stop spam, the same way we do when you publish. That count disappears on its own after about a minute, and it isn't kept or linked to anything.</p>\n      <p>What people see depends on what the page's author picks. They can show results after someone votes, always, or never. They can let people change their vote, set a close date, and close or reopen the poll whenever they like. The author only sees totals: how many people voted, how many votes each answer got, and, on a rating poll, the average rating. They never see who voted for what.</p>\n      <p>Votes are never part of the published page itself. We keep them until the author resets them, switches the poll to a different type (single choice, multiple choice, Yes / No, or rating), or changes a rating poll between 1 to 5 and 1 to 10 (all of these clear every vote). If the author takes away an answer, that answer's votes are cleared the next time they publish, and anyone who only picked it can vote again. If the page is unpublished or taken down, or its author's account is deleted, the poll stops working and we keep its votes for about 30 days (our clean-up runs nightly), then delete them. If the same poll is put back on the page within that time, its votes come back. The poll's question and answers are part of the page, so \"Using published pages and comments\" above covers them. Votes aren't part of that. Polls can't be used in ads.</p>\n      <h3>Publishing as an ad</h3>\n      <p>Want more people to see a page? From the Publish sheet's \"Publish as Ad\" tab, you can turn a page you've already published into an ad. Other people using the app see it as a full-screen ad before a note they open, whether it's from the stories strip, Subscribed, Liked, Media or Go to note. It isn't just for people who have the page's link, like a regular published page. Everyone sees ads, including people who've bought Pro, but never before their own notes. So that ads don't come too often, the app keeps a small count of the notes you've opened and the time of your last ad. It stays on your device and we never see it. You need to sign in to run an ad. Views are bought as described under \"In-app purchases\" above, and once the purchase is confirmed, we add those views to your account. We also save how many views an ad has used and its status (running, used up, or taken down). To tell you how many different people an ad reached, we save an anonymous ID that each device makes, keeps, and sends whenever it asks for an ad or a view is counted, whether or not the viewer is signed in. It isn't linked to a Google account, email address, or anything else that identifies someone. We use it to tell whether a repeat view of an ad came from a device we already counted, and for the activity counts described under \"Activity counts\" below. See \"Analytics\" below too. When you unpublish an ad, it stops being shown right away, though someone whose phone already loaded it might still see it once. Any views it had left go unused. That balance isn't returned to your account. The page itself and its normal link stay as they were, and taking the page down is a separate step from the Publish to Web tab. \"External images &amp; embeds\" below explains how images, video, audio and social posts inside an ad are loaded. Ads can only use images from Wikipedia or Wikimedia Commons, and video, audio and social posts added with the editor's own tools (YouTube, Spotify, Instagram, X, or Streamable). Voice notes can't be used in ads, because they're recorded on your device. Polls can't be used in ads either, because ads can't collect votes.</p>\n      <h3>Making sure ad views are real (Android)</h3>\n      <p>Some people try to fake ad views with scripts. To stop that, the Android app asks Google to confirm that it's the real app, installed from Google Play, on a real phone. When the app needs an ad, it sends Google's answer to our servers, along with a random code, the app's name and the same anonymous device ID described above. Our servers ask Google if the answer is good, and we don't keep it. If it is, we give the app a pass that lasts about a day, and the app shows that pass each time it asks for an ad. We keep the random code for about ten minutes, and the pass (linked to the device ID) for about a day. We use them only to limit how often one phone can ask for ads. None of this tells us who you are, and it isn't linked to your account.</p>\n      <h3>Ad access &amp; invites</h3>\n      <p>Some bigger ad packages have to be earned. To work out which packages you can start and how many ads you can run at once, our servers count these things, using the records described in this policy: your subscribers, published notes, stories, likes and comments you've received and given, accounts you follow, how many of the last 30 days your account was active, your running ads, and any strikes. A strike comes from an alert we sent you about a removal, pause or suspension. We keep those alerts for up to a year, but a strike only counts for 60 days, or until we excuse it. You see these counts as your progress. We use them to enforce the limits, and other people never see them.</p>\n      <p>Every signed-in account gets a random 8-character invite code, saved with the account. When someone adds a code, we save a record of who entered whose code, when it happened, and whether and why it stopped counting (the invited account was suspended or being deleted, or we removed it for abuse). A friend can add one code, in their first 14 days. You get an alert when a friend joins, but it doesn't say who. You only see totals: how many friends added your code and how many count right now, never who. An invite counts once your friend has published a note and been active on at least two days. If your friend chooses to subscribe at the same time, that's saved like any other subscription. When you share your code, it goes through your device's share sheet or clipboard, so the message is sent by the app you pick and we never see it. When an invite counts, we add 100 free views to your balance. We add it to the list of your view credits, together with the invited account's internal ID, so the same invite can't be rewarded twice. That entry stays in that list (and only there) until you delete your account, even if your friend's account is deleted first. If either account is deleted, the record of the invite itself is deleted.</p>\n      <h3>Reporting a published page</h3>\n      <p>Reports help keep Bluebook a good place for everyone. Anyone can report a published page from its public link. To stop spam, we count how many reports come from an IP address. That count lives in a short-lived counter that disappears on its own about a minute after the last report from that address. It's never saved as part of the report. We only keep the reason and details that were sent, which page it's about, and when. A report doesn't record who sent it. A report stays on file until someone reviews it, even if the page is unpublished or its author's account is deleted in the meantime. After it's handled, it's deleted. The exception is reports of child sexual abuse material. We keep those for 18 months, along with a copy of the reported page. The report's 18 months start when it's closed. The page copy's 18 months start when it was reported, or when it was most recently reported if it's reported again. The same period covers any other copy we hold of that page. We may also send a notification with the page's address, the reason and the details to our private alerts channel. We handle reports of child sexual abuse material the way the law requires, including passing them to the proper authority. We keep a short record of each one we pass on (the page's address, the date, the authority's reference for it, and a brief note) for 18 months from the latest. When we take an action (like a takedown, a dismissed report, or a restored page), we write down the action, the page's address, the time, and a short note such as the reason given. We keep that for about 13 months, as a record of what was done.</p>\n      <p>Pages running as ads work the same way. An ad and its published page are exactly the same thing at the same web address, so there's only one way to report either: go to that page's address and use the report link there. There's no separate process for ads.</p>\n      <p>An ad you see in the app is just the published page, so it has the same &ldquo;Report an issue&rdquo; link at the bottom as any other page. Scroll down to find it. If you run an ad, you can find its address on the Publish sheet for that note.</p>\n      <h3>Alerts</h3>\n      <p>We want you to know what's happening with your account and the app. When one of your pages is reported, or we remove or pause something of yours, or change your account's status, you'll get an automatic message (an alert) that says why. We also use alerts for good news and updates, like announcements, new features, a bigger ad package unlocking, a friend adding your invite code, planned maintenance, safety tips, or a change to this policy or our terms. They can go to every account or to specific ones, and they're saved, shown and deleted the same way as the others. Alerts show up under Alerts in your library, which only appears once your account has at least one. A number on it shows how many have arrived since you last looked at the list, and the list's title shows how many you have in total. We save the text of each alert (which can name the page or item it's about), when it was sent, and when you deleted it. We also save one marker on your account for the newest alert you've been shown, so the count follows you across your devices. Deleting an alert only removes it from your list. We keep the record, including deleted ones, for up to a year so we can review what was sent to an account. An alert never includes who reported, or the details they wrote, because we don't pass those on. If you delete your account, your alerts and that marker are deleted too.</p>\n      <h3>Voice notes</h3>\n      <p>When you record a voice note, the app asks your device for permission to use the microphone. It only records after you tap record, and it stops when you tap stop, after 5 minutes, or if you leave the app. The recording is saved inside the note on your device, just like a photo. If you're signed in, it's backed up to your account along with your other notes, and it's deleted if you delete your account. If you publish the note, the recording becomes part of the published page, so anyone with the link can listen. Voice notes can't be used in ads. We don't listen to your recordings or turn them into text. The one exception is a note you publish: its page, recording included, may be used as described under \"Using published pages and comments\" above. Recordings that only live in your notes or your backup aren't part of that. When you play a voice note, it plays right on your device.</p>\n      <h3>External images &amp; embeds</h3>\n      <p>Images you add to a page by URL are loaded straight from their source when the page is built. Instagram, X, Streamable, YouTube and Spotify embeds load straight from those services. We have nothing to do with these third-party hosts, with one exception: when you paste an Instagram share link or an X (t.co) short link using the editor's own tools, our server follows the link just to find out which post it points to. It doesn't read the page. It also counts requests from your IP address in a short-lived counter that disappears on its own after about a minute, and that isn't kept afterward or linked to your account. A page published as an ad can only use images linked directly from Wikipedia or Wikimedia Commons, and can't contain images uploaded from your device or voice notes. We check this automatically before an ad can go live or be updated.</p>\n      <h3>Linked pages</h3>\n      <p>This section is about links inside the app. In preview, tapping a link in a page shows its address in a sheet with a copy option. The app doesn't open or load the linked page, except when the link is the full address of a published note: then it opens that note in the app's story viewer, the same as pasting it in the search box and tapping GO. Nothing is fetched, and we can't see what links a page contains. A published page works a bit differently, depending on how you're viewing it. If someone opens its public web address directly, outside the app, they're looking at a plain web page in their own browser, so links inside it are ordinary clickable links that open like any other link on the web. Inside the app, opening a story or a note you found through search shows that same published page in the app's own built-in viewer (see \"Stories, subscriptions &amp; likes\" below), so you don't leave the app to see it. A link you tap inside that viewer opens in your own browser, which takes you out of the app, unless it's the full address of another published note, which opens in the viewer instead. The app doesn't load the linked page itself, and we have nothing to do with that site, but like any site you open in a browser, it can see your IP address. If the app can't open the link, it copies the address instead.</p>\n      <h3>Stories, subscriptions &amp; likes</h3>\n      <p>From a published note's Publish sheet, you can turn on \"Show in stories\" (you need to sign in). That adds the note to a stories strip that other people using the app can see, not only people who have the link. It's similar to Publish as Ad, but without purchased views. Our servers save the note's web address, title, description and tags (if you've added them), when the note was created, and up to three preview images from the note's published page (plus how many images the note has, so a feed card can show how many more there are), along with your account ID. Your story shows the title. The Subscribed feed of anyone who subscribes to you shows the title, description, tags, how long ago the note was created, and how many likes it has. Preview images that come from your device are copied to our servers, and they can be loaded without a sign-in check while the story is showing. A preview image added by URL isn't copied, so viewers' devices load it straight from its source when they see your story or feed card, and that host can see their IP address. If you turn the toggle off within the first 24 hours, or unpublish the note at any time, we delete the saved copies, including the saved description and tags. Other people's devices never get your Google account ID or email. Instead, each account has a separate random author ID that means nothing outside the app. It's sent with your stories, so your picture and display name can go with them and a Subscribe tap can reach the right account. We make it ourselves, it isn't made from your Google account, and it's deleted with your account. To tell you apart from other authors, viewers see your display name, picture, or the note's title. A story can appear in the strip for 24 hours from when you turn on \"Show in stories\" (editing the note doesn't restart that clock). After that, it leaves the strip and your Stories tab. The strip isn't a list of every story. It shows a selection of other people's stories that reshuffles every few hours, so a story still within its 24 hours may or may not be shown to a given viewer. Your own live stories always lead your own strip, and stories from accounts a viewer already follows show up in their Subscribed feed instead of the strip. A story stays in the Subscribed feed of people who follow you (from when they followed you onward) for 7 days from when you turned on \"Show in stories\", or until you unpublish the note, whichever comes first. After that it leaves the feed, but the published page itself stays online. After the first 24 hours the toggle turns itself off. That just tells you the story has left the strip and your Stories tab. It stays in your followers' feeds for the rest of the 7 days. If you turn the toggle off yourself within the first 24 hours, the story disappears from the strip and from your followers' feeds.</p>\n      <p>A display name and profile picture are both optional. If you set a display name, it's shown on your stories and, to anyone who subscribes to you, on your notes in their Subscribed feed. If you leave it blank, viewers just see the note's title in both places. A display name can be up to 30 characters. If you set a profile picture, it shows on your stories, as the ring around your avatar in the stories strip, and next to your name on your comments (see \"Comments\" below). It doesn't show on your notes in the Subscribed feed. You get to pick what your ring shows. In Settings, under Privacy, tap \"Story picture\" and choose your profile picture (that's the default), the first image in your note, or never your picture. If you pick the note's first image, the ring shows it when the note has one. If not, it falls back to your picture, and then to a letter. If you pick never, the ring shows the note's first image, or a letter if there isn't one, and your picture isn't used in the strip. Your choice is saved with your account, so it works on every device, and it's sent along with your stories so other people's apps follow it. It only changes what the strip shows. It doesn't delete your picture, and it doesn't stop your picture from loading from the address below. A picture you upload is stored on our servers and served from a web address based on your random author ID. That address isn't behind a sign-in check, but it only serves your picture while you have at least one story showing, or at least one comment showing your name (or to you, when you're signed in). So anyone who has your author ID, for example from seeing one of your stories or comments, can load it during that time, and no one else can. Once you have no stories or named comments showing, the picture is no longer shown to others. If you remove the picture, it's deleted from our servers. With no picture, or if your choice means it isn't used, the story ring uses the note's own image if it has one, and only then an initial letter, taken from your display name (or the note's title if you haven't set one). That initial is never taken from your account email, which is never sent to other viewers at all.</p>\n      <p>A signed-in account can subscribe to (follow) another account from that account's story. We save who follows whom so we can build your Subscribed feed, show whether you're already following someone, and keep your follows on every device you sign in on. You can see how many accounts follow you as a total, never who, and how many accounts you follow. The app also keeps a copy of who you follow on your device, so it can show the Subscribe/Subscribed button without asking our servers each time. We also record, under your account, which stories you've opened, so a story you've already seen doesn't keep grabbing your attention in the strip. Searching your Subscribed feed happens on your device, within the stories already loaded. What you type is never sent to us. A signed-in account can also like a published note. We record, under your account, which notes you've liked so the heart shows correctly across your devices. For each note you like or unlike, and each account you follow or unfollow, we also note the time of your most recent action. That way, taps made on different devices (or offline and sent later) are applied in the right order. That note stays after you unlike or unfollow, and is removed once the like or follow is gone and the note is more than 30 days old, or when your account is deleted. Each published note's own like count shows on its card wherever that card appears: your Published and Stories tabs, and the Subscribed feed or Liked tab of anyone who sees the note, but never who liked it. You can also see one total on your account screen: the number of likes across all your published notes. If you unpublish a note, the likes it received are removed, so both that note's count and the combined total go down. When a published note that isn't showing as a story appears as a card, either in its author's Published tab or in someone's Liked tab, we may copy up to three preview images from that page to our servers. Like story preview images, these copies can be loaded without a sign-in check, and they're deleted when the note is unpublished or its author's account is deleted.</p>\n      <h3>All my notes</h3>\n      <p>In Settings, the \"All my notes\" section has four switches that change lots of your published pages at once, so you don't have to do them one by one in the Publish sheet: \"Always show in stories\", \"Always show comments\", \"Hide comments on all pages\" and \"Disable comments on all pages\". You need to be signed in to use them. When you turn one on, the app changes every page you've already published, and every page you publish after that. When you turn one off, it just stops changing pages. Your pages keep whatever they're set to at that moment. If you later change a single page's own switches in its Publish sheet, that page's choice wins.</p>\n      <p>Here's what that means for your data. The three comment switches send a request to our servers, and our servers update the comments setting on every live page linked to your account, even pages that aren't on the device you're holding. It's the same setting you'd get from the Publish sheet, and nothing extra is saved about it. \"Always show comments\" and \"Hide comments on all pages\" are opposites, so turning one on turns the other off. \"Always show in stories\" works one page at a time, exactly like tapping \"Show in stories\" on each page yourself, so everything described under \"Stories, subscriptions &amp; likes\" above applies to each page it adds.</p>\n      <p>The switches themselves (on or off for each of the four, plus the time you last changed them) are saved on your device for your account, and they're backed up with your notes and theme, so they follow you to your other devices. If you change them on two devices, the newest change wins. When another device finds out that \"Always show in stories\" was turned on, that device's published pages join stories too. Nothing is saved while you're signed out. If you delete your account, these switches are deleted along with the rest of your backup.</p>\n      <h3>Third-party requests &amp; server logs</h3>\n      <p>Using the app makes a few requests to other companies, which can see your IP address, like any website you visit. A script library (three.js) is loaded from Cloudflare's cdnjs when the app opens. Google's sign-in code is loaded from Google when you sign in. The app sometimes asks Google (gstatic.com) for a tiny blank page, just to check whether you're online. And if you paste a Spotify link using the editor's own tools, the app asks Spotify (open.spotify.com) for that link's embed details. Requests to our servers run on Cloudflare, which processes them and may keep standard request logs (like the time, the address requested, and your IP address) that we can use to run and fix the service. We don't use them for analytics or tracking.</p>\n      <h3>Activity counts</h3>\n      <p>We'd like to know roughly how many people use the app, and how many are using it right now, so our servers note when the app is open. While it's open, the app contacts our server when it launches, when you come back to it, and about every four minutes, sending the same anonymous device ID described under \"Publishing as an ad\" above. If you're signed in, this (and any other request you make while signed in) saves only the time your account was last active, on your account. If you're not signed in, the server saves the device ID with the times it was first and last seen (plus the daily log described below), and nothing else. It isn't linked to a name, email address or Google account, and if you later sign in on that device, the signed-out record is deleted. We use these records for private, overall totals (like total, new and currently active users and devices), to look up an account's last activity when we're running the service, and, for signed-in accounts, to count recent active days toward ad access and invites (see \"Ad access &amp; invites\"). They're never shown to other people, shared, or used for advertising. The last-activity record is deleted about 90 days after the last activity (an account's is also deleted with the account). Separately, so usage can be charted across weeks, months and years, the server keeps a minimal daily log. For each day an account or device was active, it holds one entry with just that date and the account or device ID, with no name, email or content. We use these entries for those overall charts and for the active-day counts in \"Ad access &amp; invites\", and they're removed automatically after 800 days (about 26 months). They aren't removed early when you delete your account or sign in on a device that was signed out. There's no setting to turn this off, because we don't collect anything beyond this. If you clear the app's storage, you get a fresh anonymous ID from then on.</p>\n      <h3>Analytics</h3>\n      <p>We do not collect usage tracking or crash reports from this app, and do not track what you do inside it. The only usage figures it keeps are the two uses of the anonymous device ID described above: counting an ad's unique viewers (see \"Publishing as an ad\"), and the activity counts (see \"Activity counts\").</p>\n      <h3>Keeping things safe</h3>\n      <p>We work to keep what's on our servers safe, but no app or website can be 100% secure, so we can't promise nothing bad will ever happen. Anything you publish is public, so please don't put private things in a published page.</p>\n      <h3>Children</h3>\n      <p>Bluebook isn't meant for children under 13, or older where the rules where you live say so. We don't knowingly collect information from children that young. If a child under that age has made an account, they or their parent or guardian can delete it by tapping the account icon and choosing Delete account under Show more.</p>\n      <h3>Your rights</h3>\n      <p>Depending on where you live, you may have the right to ask to see the information we hold about you, fix it, delete it, get a copy of it, or object to how we use it, and to complain to your local data protection authority. You can do some of this yourself in the app, like deleting your account (see \"Google sign-in &amp; sync\" above). For anything else, see Contact below.</p>\n      <h3>Where your information goes</h3>\n      <p>Our servers, and the companies that help us run Bluebook (like Cloudflare and Google), may be in other countries, so your information may be handled outside the country where you live.</p>\n      <h3>Changes to this policy</h3>\n      <p>We may update this policy from time to time. When we do, we'll change the date at the top, and we may also send you an alert. If you keep using the app after a change, that means you're OK with it.</p>\n      <h3>Contact</h3>\n      <p>Questions about this policy? We're happy to help at <a href=\"mailto:essentialsoftware.support@gmail.com\">essentialsoftware.support@gmail.com</a>.</p>\n    ", "terms": "      <p><em>Effective 23 October 2026</em></p>\n      <p>Welcome to <strong>Bluebook</strong>! It&rsquo;s published by Essential Software (&ldquo;we&rdquo;, &ldquo;us&rdquo;, &ldquo;our&rdquo;). By using it, you agree to these terms, which are here to keep the app fair and safe for everyone. We've written them in plain language.</p>\n      <h3>Who Can Use Bluebook</h3>\n      <p>You need to be at least 13 to use Bluebook, or older if the rules where you live say so. If you're under 18, please read these terms with a parent or guardian and make sure they're OK with you using the app.</p>\n      <h3>Responsible Use</h3>\n      <p>Please use Bluebook kindly and lawfully. You agree to use it for lawful purposes only, and not to create, store, or export content that is illegal, harmful, threatening, abusive, untrue and damaging to someone's reputation, or that breaks someone else's rights. This applies with extra weight to anything you publish (see below).</p>\n      <h3>Your Content</h3>\n      <p>Pages you build are stored on your device. If you sign in with Google, they're also backed up to our servers so you can restore them on another device. Your \"All my notes\" switches from Settings are backed up the same way. Without an account, your content lives only on your device: we have no copy and can't recover it if it's lost. Signing in, or keeping your own backups, is how you protect it.</p>\n      <h3>Your Account</h3>\n      <p>Signing in is optional and handled by Google. Keep your Google account secure. Anyone with access to it can access your synced notes, Pro purchase, and ad view credits through this app. We record when your account was last active, and count active devices, only to run and understand the service; see the Privacy Policy's \"Activity counts\" section.</p>\n      <h3>Published Content</h3>\n      <p>A published page is stored on our servers and can be viewed by anyone with the link. You're responsible for what you publish and for having the rights to it. We may remove a published page if it breaks these terms, gets a valid takedown request, or is reported and found to be abusive. A page you publish while signed out isn't linked to an account; if you later sign in and use its private token to show it in stories or save an update, it becomes part of your account, counts toward your account's page limit, and is taken down if you delete your account. Unpublish it yourself and its address frees up right away for reuse. If we remove it instead, for a takedown or abuse report, the address stays permanently reserved and can't be reclaimed or republished. You still own what you publish. By publishing a page, you give us permission to host it and show it to people. You also give us permission to use it to run, build, test and improve Bluebook and our other apps, including by using machine learning. You can opt out of that any time, and the Privacy Policy's \"Using published pages and comments\" section explains how. This permission is free, works anywhere in the world, and covers copying, resizing, reformatting and showing your page as needed, including by companies that help us run Bluebook. It still covers anything we've already done with your page after you unpublish it or delete your account. You promise you have the right to give us this permission.</p>\n      <h3>Reports, Alerts &amp; Suspension</h3>\n      <p>Anyone can report a published page. When one of your pages is reported, or we remove or pause something of yours (a profile picture, display name, page, story or ad), or change the status of your account, we may send you an automatic message with the reason, so you know what happened and why. These messages show up under Alerts in your library. We may also use Alerts to share announcements and updates about the app, like new features, maintenance, or changes to these terms. A profile picture that looks like it's pretending to be someone else may be removed. <strong>To keep the app safe for everyone, lots of reports about your content, or repeated rule-breaking, can lead to your account being suspended. When we remove or pause pages, stories, ads, profile pictures or display names, and when we suspend accounts, those count as strikes on your account for 60 days (unless we excuse one). Strikes affect which ad packages you can start (see Ad Access &amp; Invites below).</strong> A suspended account is signed out everywhere and can't sign in. Alerts are for your information, and you can delete them from your own list. We keep a record of the alerts we've sent to an account, including deleted ones, for up to a year, so we can run and moderate the service.</p>\n      <h3>Advertising (Publish as Ad)</h3>\n      <p>You can turn a page you've already published into an ad, and buy a set number of views through Google Play Billing (handled for us by RevenueCat; see the Privacy Policy's \"In-app purchases\" section). To be allowed as an ad, a page must: have no added text or captions beyond blank lines; keep the required attribution notice in place, unedited, and easy to see at its original size; have no more than two images; have no voice notes (those are recorded on your device); have no polls (ads can't collect votes); and use only images linked directly from Wikipedia or Wikimedia Commons (no images uploaded from your device). A page can also have video, audio, and social-post embeds added with the editor's own tools. YouTube, Spotify, Instagram, X and Streamable are the allowed sources, with one embed per platform at most. Embeds added any other way aren't allowed. Ads still follow the Responsible Use section above. They also can't contain sexual or adult content, or use images, embeds, attribution or branding to pretend to be a person, brand or organization, or to mislead viewers about who or what the ad is from. We check these rules automatically before an ad can go live or be updated. We may refuse or take down an ad that no longer follows them, or that breaks these terms. An ad and its page are the same thing, so reporting one reports the other.</p>\n      <p>A running ad is shown to other people using this app, full-screen, before a note they open. It isn't only for people who have its link. Everyone sees ads, including people who've bought Pro, but not before every note, because the app spaces them out. People can skip an ad once a short countdown finishes, or go back at any time. We can't promise an ad will get any particular number of views in a given time, that the ad service will always be available, or any particular result from an ad being shown.</p>\n      <p>A <strong>view</strong> is counted as soon as the ad appears on screen, even if the person goes back before the countdown ends. Every view counts: a repeat view from the same person or device still counts and is still taken from your view balance. Views aren't limited to first-time viewers. Bluebook also shows a separate <strong>unique viewers</strong> number next to your ad's view count, just for your information. It's worked out from an anonymous ID made and stored on each device, which tells us whether a device has already been counted for a given ad (and, separately, is used for the activity counts in the Privacy Policy). It isn't linked to a Google account or any other identity, and it's sent whether or not you're signed in. Because it identifies a device rather than a person, someone using two devices counts as two unique viewers, and reinstalling the app or clearing its storage makes that device count as new from then on. The unique viewers number doesn't change your view balance or how views are taken from it.</p>\n      <p>If Google Play refunds a view purchase, we take those views back out of your balance. If that leaves your balance below zero, your running ads stop, and you can't start a new ad until your balance covers it again.</p>\n      <p>Purchased views are a one-time purchase through Google Play that gets used up. For anything about the purchase itself, see Google Play's own refund policy. Separately, if we fail to deliver a view-credit balance you paid for, or take down an ad by mistake after approving it, we'll decide whether to credit or refund the affected views. That's separate from, and doesn't replace, Google Play's own refund process for the purchase itself. If you unpublish an ad, it stops being shown and any views it had left go unused (so check your balance first). Those views aren't returned to your account or moved to another ad, and any unspent view-credit balance also goes unused if your account is deleted. Taking down the ad doesn't affect the published page, which stays live until you unpublish it separately. Views we return to your account (for example, a refund of an ad's unused views) stay in your balance, and you can put any amount of them on one of your ads from the Publish as Ad tab without buying again.</p>\n      <h3>Comments</h3>\n      <p>If you turn on \"Show comments button\" in a note's Publish sheet, signed-in people can comment on it and reply to each other. A comment is saved with what it says and when it was written, and it shows up on the live page for anyone who opens it. Normally it shows the commenter's display name and profile picture (or \"Anonymous\" if they haven't set a display name). If you'd rather not be named, you can set \"Comment as\" to Anonymous in Settings, and your comments will show with no name or picture. That choice is saved with your account, so it's the same on every device you sign in on, and it covers all your comments, old and new. You can change it whenever you like. Anonymous only hides you from other people. Your comments are still linked to your account, and everything in these terms still applies to them. Comments count toward ad access like likes do. The commenter or the note's author can delete a comment, which also removes its replies. Turning off \"Show comments button\" hides them. Turning off \"Allow new comments\" keeps the ones already there but stops people from adding new comments or replies. Unpublishing the note or deleting an account removes them. You still own your comments. By posting one, you give us permission to use it in the same ways as published pages, as described in the Privacy Policy's \"Using published pages and comments\" section, and you promise you have the right to give us that permission. You can also change these for all your pages at once from Settings (see \"All My Notes\" below).</p>\n      <h3>Polls</h3>\n      <p>You can add a poll to a page you publish. A poll is a question that visitors can vote on, without signing in. You can write your own answers (up to six), or pick Yes / No, or a rating from 1 to 5 or 1 to 10. If you add one, you're responsible for it, just like anything else you publish, and the Responsible Use section above applies to its question and answers. Please don't use a poll to trick or pressure people, or try to push its results up or down with automated tools or by getting around the one-vote limit.</p>\n      <p>You only get totals: how many people voted, how many votes each answer got, and, for a rating poll, the average rating. You never see who voted for what. Poll results are a friendly guide, not an official count. A poll saves one vote for each device, so someone who clears their browser storage or uses another device could vote again. We can't promise the numbers are exact. You can set a close date, close or reopen a poll, and reset its votes. Resetting, taking away an answer, switching to a different type of poll, and changing a rating poll between 1 to 5 and 1 to 10 all clear votes, and that can't be undone. If you unpublish the page, the poll stops working and its votes are deleted after about 30 days. We may remove a poll, or the page it's on, if it breaks these terms. Polls can't be used in ads. See the Privacy Policy's \"Polls\" section for what's recorded when someone votes.</p>\n      <h3>Stories, Subscriptions &amp; Likes</h3>\n      <p>Turning on \"Show in stories\" for a published note shows it to other people using the app as a story, along with its title, description, tags and preview images. It also lets them subscribe to your account, whether or not they have the note's link. You're responsible for what you show in your stories, including a note's title, description and tags, just like anything else you publish, and the Responsible Use section above applies. We may remove a note from stories, or suspend your ability to use stories or subscriptions, for the same reasons we can act on any other published content. Your display name and profile picture are optional. If you add them, they show on your stories, on your comments (unless you comment as Anonymous), and to your subscribers. In Settings, \"Story picture\" lets you choose whether your story ring shows your profile picture, the first image in your note, or never your picture. That choice is saved with your account. They don't have to be your real name or photo, but they can't pretend to be another person, account or brand, or mislead viewers about who's posting.</p>\n      <p>A signed-in account can also like a published note. Likes are a simple way to say thanks. As its author, you can see each note's own like count on its card in your Published and Stories tabs, and anyone who sees the note in their Subscribed feed or Liked tab can see it too. Nobody sees who liked it. Likes on a note are removed if it's unpublished or its author's account is deleted. Please don't misuse likes, like using multiple accounts or automated tools to push a note's count up or down. We may remove likes, or suspend your ability to like, for the same reasons we can act on any other use of the app that breaks these terms. See the Privacy Policy's \"Stories, subscriptions &amp; likes\" section for what's recorded about likes.</p>\n      <h3>All My Notes (Settings)</h3>\n      <p>In Settings, \"All my notes\" gives you four shortcuts that change all your published pages at once: \"Always show in stories\", \"Always show comments\", \"Hide comments on all pages\" and \"Disable comments on all pages\". They only work when you're signed in. Turning one on changes every page you've already published and every page you publish after that. Turning one off just stops it from changing pages. It doesn't undo anything, so your pages keep their current settings until you change them. \"Always show comments\" and \"Hide comments on all pages\" are opposites, so turning one on turns the other off. If you change one page's own switches in its Publish sheet later, that page's choice wins.</p>\n      <p>These shortcuts are saved with your account and backed up with your notes, so they follow you to your other devices. When one is on, it's the same as tapping that switch yourself on each page, so everything else in these terms still applies. You're responsible for what shows up in stories and comments on all of your pages, including older ones, and the Responsible Use section applies. Before you turn on \"Always show in stories\", remember that it puts every page you've published (and every new one) in front of other people using the app, not only people who have the link. \"Disable comments on all pages\" means visitors can't add new comments or replies. They'll see a note that you turned them off, and the comments already there stay. We can still remove or pause pages or stories for the reasons in these terms, even when one of these shortcuts is on.</p>\n      <h3>Ad Access &amp; Invites</h3>\n      <p>Bigger ad packages are earned, not only bought. Everyone who's signed in can use the 1,000-view package. Larger packages, and running more ads at once, unlock as your account grows in the app. We look at subscribers, published notes, likes you've received, likes you give to other notes, accounts you follow, days you've been active, stories, and friends you've invited. Every running ad also needs at least five published notes behind it. The Publish as Ad tab shows your progress toward each requirement. We may change the requirements or packages in the future, but ads that are already running aren't affected. A strike (see Reports, Alerts &amp; Suspension) keeps larger packages locked until it expires after 60 days. One strike limits you to the 5,000-view package, and two or more limit you to the 1,000-view package. A limit only stops new ads from starting, and you'll get an alert when it lifts. Views you bought for a package that is limited or still locked stay in your balance until you can use them.</p>\n      <p>Every signed-in account has an invite code it can share. A new account can add one friend's code, once, in its first 14 days. You can't use your own code, and two accounts can't invite each other. When someone adds your code, you get an alert, and they can choose to subscribe to you at the same time (they're asked first). An invite counts toward your ad access once your friend has published a note and been active on at least two days. For packages from 5,000 views up, each invite that counts is worth three subscribers, for up to five invites. When an invite counts, we also add 100 free views to your balance, for up to five friends. Free views work like any other views in your balance: you can put them on any of your ads from the Publish as Ad tab without buying a package, but they can't be cashed out or handed to someone else. Your friend doesn't get anything. If we cancel an invite because of abuse, we take its free views back out of your balance, and return them if we restore it. Please only invite real people. Making or using extra accounts (or asking others to) to push up invites, subscribers, likes or any other number used here isn't allowed. If that happens, we may stop counting invites or any of these numbers, limit your packages, or suspend accounts. An invite also stops counting while the invited account is suspended or being deleted, and counts again if that ends.</p>\n      <h3>Purchases &amp; Eligibility</h3>\n      <p>You can buy a view package for a particular note when you publish it as an ad, or add views to your balance from Settings to put on any of your ads later. Views in your balance aren't assigned to a note until you use them.</p>\n      <p>All buying of view packages goes through Google Play Billing (RevenueCat handles it for us). Any age or account requirements for buying are set and enforced by Google Play, not by us. By buying a view package, you confirm that Google Play's own terms allow you to make purchases on the account you're using.</p>\n      <h3>Third-Party Content</h3>\n      <p>Images, video, and audio you embed by URL are loaded straight from the source you give us. You're responsible for having the right to use anything you embed. The same goes for voice notes you record: they're your responsibility, and you need permission from anyone whose voice is in them. Images in an ad are limited as described above. The required attribution notice is there because third-party logos, trademarks and brand names may show up in an ad's content or images. You're still responsible for having the right to use whatever you include, and the notice doesn't give you any rights by itself.</p>\n      <h3>No Promises &amp; Limits on Our Responsibility</h3>\n      <p>We work hard to make Bluebook good, but we can't promise it'll be perfect. It's provided \"as is\" and \"as available\", which means we don't promise it'll always work, be free of bugs, or never lose anything. Please keep your own backups of notes that matter to you. As far as the law allows, we're not responsible for knock-on losses, like lost notes, lost data, lost profits or lost chances, or for anything other people post, publish, comment or do. Some places don't allow these limits, so they only apply as far as the law lets them, and nothing here limits anything the law says we can't limit.</p>\n      <h3>The Fine Print</h3>\n      <p>These terms and the Privacy Policy are the whole agreement between you and us about Bluebook. If part of these terms can't be enforced, the rest still counts. If we don't enforce something right away, it doesn't mean we've given up the right to later. We may hand over our rights and duties under these terms to someone else, for example if Bluebook is sold or taken over by another company. You can't do that without our OK.</p>\n      <h3>Changes to These Terms</h3>\n      <p>We may update these terms from time to time. If you keep using the app after changes are posted, you're accepting the revised terms.</p>\n      <h3>Contact</h3>\n      <p>Questions about these terms? We're happy to help at <a href=\"mailto:essentialsoftware.support@gmail.com\">essentialsoftware.support@gmail.com</a>.</p>\n    "};
+const LEGAL_DEFAULTS = {"privacy": "      <p><em>Effective 24 October 2026</em></p>\n      <p><strong>Bluebook</strong> is published by Essential Software (&ldquo;we&rdquo;, &ldquo;us&rdquo;, and &ldquo;our&rdquo; in this policy), and we're glad you're here. This page explains in plain language what the app stores, where it lives, and what leaves your device.</p>\n      <h3>On-device storage</h3>\n      <p>Your pages, drafts, images, favourites, playlists, preferences and app settings all stay on your device. There's one exception: when you're signed in, we keep track of which stories you've opened on our servers, under your account (see \"Stories, subscriptions &amp; likes\" below). For each account signed in on the device, the app also keeps a copy of which notes you've liked and which accounts you follow (signing out clears the follow copy). It keeps a short queue of any likes or follows you tapped while offline that haven't been sent yet. It also keeps a small number that tells it how far your device's clock is off from our servers, so those taps get the right time. If you sign in with Google, your notes, along with your favorites, playlists, theme choice and your \"All my notes\" switches from Settings, are also backed up to our servers (see below). Those switches are kept on your device separately for each account, so one account's choices never touch another account's pages, even on a shared phone.</p>\n      <h3>App lock</h3>\n      <p>App lock is optional. If you turn it on, Bluebook asks for a PIN or password whenever you open the app fresh or refresh the page, and again when you come back after being away for more than 30 seconds, so other people can't peek at your notes.</p>\n      <p>Your PIN or password is never saved the way you typed it. The app turns it into a scrambled code (called a hash) and keeps only that code, on your device. When you type it later, the app scrambles what you typed and checks whether the two codes match. Nothing about your lock is sent to us or saved to your account, so we can't see it, reset it or recover it for you.</p>\n      <p>When you set it up, you also pick a recovery question and write an answer. The question is kept as plain text on your device so the app can show it to you if you forget your PIN. The answer is scrambled the same way as your PIN. Pick something only you know, because anyone who gets the answer right can get in.</p>\n      <p>If you type a wrong PIN or a wrong answer five times in a row, the app makes you wait before you can try again. The wait starts at 30 seconds and grows up to 15 minutes. It's there to slow down anyone who's guessing.</p>\n      <p>If you forget both your PIN and your recovery answer, we can't get you back in, and we can't reset it for you. The only way past it is to clear Bluebook's data in your phone or browser settings. Notes you backed up by signing in can be restored afterwards, but anything that only lived on this device is gone. So pick a PIN and answer you'll remember, and keep backups.</p>\n      <p>One last thing: app lock is like a door lock for the app. It doesn't scramble the notes stored on your device. For extra privacy, keep your phone's own screen lock on too.</p>\n      <h3>Google sign-in &amp; sync</h3>\n      <p>Signing in is totally optional, and Google handles it, so we never see your Google password. We get your Google account ID and email address, and we keep them along with your sign-up date, your last sign-in date, the last time the app was active on your account (see \"Activity counts\" below), and a code that keeps you signed in (a session lasts up to 30 days). While you're signed in, your notes (including embedded images and voice notes), your favorites, your playlists (their names and the songs and videos you put in them), your theme choice and your \"All my notes\" switches (see \"All my notes\" below) are backed up to our servers so you can restore them on another device. Your Pro purchase (if you have one) and any ad view-credit balance (see \"In-app purchases\" below) are linked to your account too, so they come with you. Signing out stops syncing. Your backup stays put, so you can pick it up again when you sign back in, and deleting your account removes it, as described below. If an image in your backup isn't used by any note any more (for example, after you delete a note or swap an image), the nightly clean-up deletes it once it's more than 14 days old.</p>\n      <p>Your account is yours to keep or remove. You can delete it any time by tapping the account icon and choosing Delete account under Show more. That signs this device out and schedules your account for deletion in 30 days. The deletion happens during our nightly clean-up, so it can land up to a day after the 30 days are up. When it does, we permanently delete your account record, synced notes, images, voice notes and playlists, profile name and picture, subscriptions (the ones you made and the ones to you), records of the stories you've opened, your likes and follows (including the times we noted for them), running ads and their view statistics, your invite code and any invites you made or used, your ad access record, your alerts (including ones you deleted from your list), and any unspent ad view-credit balance. We also take down every page you published (we keep a copy of each page, along with its record, for about 30 more days, as described under \"Publishing a page\"). Until then, your published pages and stories stay online. Changed your mind? Sign back in with the same Google account during the 30 days and the deletion is cancelled, with full access restored. Every device where you're signed in gets signed out as part of the deletion (each one finds out the next time the app contacts our server, usually within about a minute). Deleting your account doesn't delete anything held by Google or RevenueCat. Their own policies cover that.</p>\n      <h3>In-app purchases</h3>\n      <p>Unlocking Pro and buying ad view-credit packages are both purchases made through Google Play Billing. RevenueCat, a third-party subscription service, handles them for us. RevenueCat gets the purchase details it needs to confirm what you bought, linked to an ID. Before you sign in, that's an anonymous ID RevenueCat makes for your install. Once you sign in, it's your Google account ID, which is what lets a purchase follow you to another device. After that, the two work differently. The app checks directly with RevenueCat (not through our servers) to see whether Pro is active. It keeps a saved copy of that answer on your device, and refreshes it from RevenueCat when the app launches and after a purchase or restore. Ad view-credits do go through our servers. They hear from RevenueCat (not from Google directly) that you bought views, and add the views to your account. We keep a list of your view credits: each purchase (for a particular ad, or added to your balance from Settings), each time views are put on an ad (with that ad's address), each refund or return, and each gift of free views for an invite, all with the time. Views returned to you stay in your balance, and you can put them on an ad without buying again. That doesn't involve Google Play or RevenueCat. If Google Play refunds a purchase, we take those views back. That list is deleted with your account. We never get your payment details, because Google handles those directly. See <a href=\"https://www.revenuecat.com/privacy\" target=\"_blank\" rel=\"noopener\">RevenueCat's own privacy policy</a> for how it handles what it receives.</p>\n      <h3>Publishing a page</h3>\n      <p>Publishing is always your choice, and it only happens when you tap Publish. We receive your page's content, its title, description and tags (if you've added them), when the note was created, and the address you choose, and we store them so the page can be shown at a public link. Anyone with that link can view the page. If you've given the note a category, we save that too. It's just your own private label, so it doesn't show on the page or on any card. We only send it back to you when you're signed in, so if you ever restore a page as a note, it goes back into the right category. You can publish without signing in, and then the page isn't linked to any account. If you later sign in and, using that page's private token on your device, turn on \"Show in stories\" or save an update to it, we link the page to your account from then on. It then shows up among your published pages, counts toward your account's page limit, and is taken down if you delete your account. We also give you a private token for each page. It's stored on your device, and we don't keep it in its original form. We only keep a scrambled version, just enough to check that it matches when you send it back to update or unpublish. Updating a published page sends the new content the same way. Unpublishing takes the page down, and if it was running as an ad, the ad stops too. We may keep a copy for about 30 days afterward (our clean-up runs nightly), in case of an abuse report or takedown request, and then delete it. If the page was reported as child sexual abuse material, we keep the copy for 18 months instead (see \"Reporting a published page\"). The page's own record is kept for the same time and then deleted. It holds the address, a scrambled form of the private token, the title, description, tags and category, and, if the page was linked to an account, that account's internal ID. That's why it stays even after the account itself is deleted. If we remove a page because of a takedown request or abuse report, its address is reserved permanently. To keep that reservation in place, we keep a small record for as long as the address stays reserved: the address, a scrambled form of the private token, the title, description, tags and category, and, if the page was linked to an account, that account's internal ID. This record stays even after the copy or the account is deleted, because deleting it would lift the reservation. Publishing also briefly counts requests from your IP address to limit spam. That count sits in a short-lived counter that disappears on its own after about a minute, and it isn't kept afterward or linked to your account or the page. Separately, to stop spam, we also count how often you like, subscribe, mark stories as seen, add an invite code or back up. That count is linked to your account and disappears within a couple of minutes.</p>\n      <h3>Using published pages and comments</h3>\n      <p>We may use the pages you've published, and the comments on them, to run, build, test and improve Bluebook and our other apps, including by using machine learning. This only covers published pages and their comments, which anyone who opens the page can already see. It doesn't cover notes that are only backed up to your account.</p>\n      <p>If you live somewhere with data protection laws, like the EU or the UK, we do this because we have a good reason to improve our apps (the law calls this a \"legitimate interest\"). You can say no any time. Choose \"No, keep out\" when we ask the first time you sign in, or change your choice any time in Settings under Privacy, and from then on we stop using your published pages, and the comments you write, for this. It covers everything on your account, old and new. Pages you published without signing in aren't linked to an account, so the switch can't reach them, but you can unpublish them. The page or comment itself stays where it is unless you unpublish or delete it.</p>\n      <p>There are limits to what we can undo. If we've already used a page or comment to build or train something, we may not be able to take it back out. And we can't control copies other people have already made, like a page someone saved or shared.</p>\n      <h3>Comments</h3>\n      <p>If a page's author turns on comments, people who are signed in can comment on it and reply to each other. For each comment we save what it says, when it was written, whether it's a reply, your account ID and your random author ID. Comments show up on the live page for anyone who opens it. Normally a comment shows your display name and profile picture, or \"Anonymous\" if you haven't set a display name. If you'd rather not be named, go to Settings, under Privacy, and set \"Comment as\" to Anonymous. Then your comments show as Anonymous, with no name or picture, and the alerts they send say \"Someone\" instead of your name. This choice is saved with your account, so it's the same on every device you sign in on. It covers all your comments, old and new. So if you switch back to your name and picture, they'll show on all your comments again. Changing your display name changes it on all of them too, unless you're commenting as Anonymous.</p>\n      <p>Anonymous only hides you from other people. We can still tell which account wrote each comment. That lets you delete your own comments, lets replies reach you, and lets us act on comments that break the terms. If you're the author of the page, your comments on it still show a tag saying they're from the author. We keep comments until you or the page's author deletes them, the page is unpublished, or your account is deleted.</p>\n            <h3>Polls</h3>\n      <p>A page's author can add a poll to a published page. A poll is a question people can vote on. The author can write their own answers, or pick Yes / No, or a rating from 1 to 5 or 1 to 10. Anyone who opens the page can vote. They don't need to sign in, and a vote isn't linked to an account.</p>\n      <p>When you vote, your device sends us the page's address, which poll it is, the answer or answers you picked, and a random code. Your device makes that code and keeps it in the browser's storage. It's how we know this device has already voted, so the poll can show your choice back to you. We only keep a scrambled version of the code, mixed with the page and poll it belongs to, so it can't be used to spot you on other pages. We save it with your answers and the time you voted. We also keep how many votes each answer got, in total and for each day, so the author can see totals. None of this is linked to a Google account, email address, name, or anything else that identifies you. Because the code belongs to a device, someone who clears their browser storage, or votes from another device, looks like a new voter. So a poll is a friendly guide to what people think, not an exact count. When you vote, we also briefly count requests from your IP address to stop spam, the same way we do when you publish. That count disappears on its own after about a minute, and it isn't kept or linked to anything.</p>\n      <p>What people see depends on what the page's author picks. They can show results after someone votes, always, or never. They can let people change their vote, set a close date, and close or reopen the poll whenever they like. The author only sees totals: how many people voted, how many votes each answer got, and, on a rating poll, the average rating. They never see who voted for what.</p>\n      <p>Votes are never part of the published page itself. We keep them until the author resets them, switches the poll to a different type (single choice, multiple choice, Yes / No, or rating), or changes a rating poll between 1 to 5 and 1 to 10 (all of these clear every vote). If the author takes away an answer, that answer's votes are cleared the next time they publish, and anyone who only picked it can vote again. If the page is unpublished or taken down, or its author's account is deleted, the poll stops working and we keep its votes for about 30 days (our clean-up runs nightly), then delete them. If the same poll is put back on the page within that time, its votes come back. The poll's question and answers are part of the page, so \"Using published pages and comments\" above covers them. Votes aren't part of that. Polls can't be used in ads.</p>\n      <h3>Text boxes</h3>\n      <p>A page's author can add a text box to a published page. A text box is either a message box, where people write one message, or a form with a few fields, like a name, an email address, and a message. Whatever people type is sent to the page's author. Anyone who opens the page can send one. They don't need to sign in, and a message isn't linked to an account unless the sender chooses “Send as me” (explained below).</p>\n      <p>When you send something, your device sends us the page's address, which text box it is, and what you typed into each field. We save that with the time you sent it. We don't save a device code, and we don't link it to a Google account, name, or anything else, unless you type it yourself or you choose “Send as me” (see the next paragraph). That means whatever you type, like your name or email address, is saved and the page's author can read it, so only type what you're happy for them to see. Please don't send passwords, payment card numbers, ID numbers, or other sensitive details through a text box. If you're signed in to the app, you'll see a “Send as me” switch, and it's off until you turn it on. If you turn it on, we also save your display name, whether you have a profile picture, and your public author ID with that message, and the page's author sees your name and picture next to it. If you leave it off, none of that is saved. Send as me uses the same “Comment as” choice in Settings, so it isn't available if that's set to Anonymous or you haven't set a display name. If you later change your display name, messages you sent as yourself show the new one. If you set your account to appear as Anonymous or clear your display name, your name and picture are hidden on those messages, and they show again if you switch back or set a name. While they're hidden, we keep your public author ID on the message so that can happen, and the page's author can't see it. If you delete your account, you're taken off those messages completely. The message itself stays with the page's author, who can delete it. When you send, we also briefly count requests from your IP address to stop spam, the same way we do when you publish. That count disappears on its own after about a minute, and it isn't kept or linked to your message.</p>\n      <p>The page's author reads what people send inside the app, and only they can delete a message. If they're signed in, we also send them an alert when a new message arrives. The alert says which page it's on, and the sender's name if they sent it as themselves, but not what the message says. An alert is saved as it was written, so a later name change or switch to Anonymous doesn't change it. Other visitors never see messages. The author is responsible for what they do with what you send them, so if you want a message deleted, ask the author.</p>\n      <p>Messages are never part of the published page itself. We keep them until the author deletes them, one at a time or all at once. A text box holds up to 5,000 messages, and after that it stops taking new ones until the author deletes some. If the text box is taken off the page, the page is unpublished or taken down, or its author's account is deleted, the text box stops working and we keep its messages for about 30 days (our clean-up runs nightly), then delete them. If the same text box is put back on the page within that time, its messages come back. The text box's title and field labels are part of the page, so \"Using published pages and comments\" above covers them. Messages aren't part of that. Text boxes can't be used in ads.</p>\n      <h3>Payments</h3>\n      <p>A page's author can add a payments block to a published page. It lets visitors send them money, like a tip or a bit of support, without leaving the page. To do this, the author pastes in a Stripe Buy Button from their own Stripe account or, once it's available, connects their own Stripe account. Stripe is a company that handles online payments. Anyone who opens the page can pay if they want to. They don't need to sign in.</p>\n      <p>Some pages use a Stripe Buy Button instead. On those pages your browser loads Stripe's code and button as soon as the page opens, even if you never pay, so Stripe can see your IP address and some details about your device, like on any site that uses Stripe. When you pay, you pay on Stripe. We don't see or save that payment, and the page only holds the author's public Stripe button details. The author sees the payment in their own Stripe account, not through us.</p>\n      <p>If you pay, you type your card details into a box that Stripe shows inside the page. Your card details go straight to Stripe. They never pass through our servers, so we never see them and we never save them. To start a payment, we tell Stripe the amount you picked, the currency, and which page and block it's for. Stripe may ask you for other things too, like your email address for a receipt, and it looks after those under its own rules. See <a href=\"https://stripe.com/privacy\" target=\"_blank\" rel=\"noopener\">Stripe's own privacy policy</a>. Stripe may tell us a few details when your payment finishes, but we only keep what's listed in the next paragraph.</p>\n      <p>When a payment finishes, we save the page's address, which payments block it was, the amount, the currency, the time, and Stripe's reference numbers for that payment. If some or all of it is refunded, we save how much was given back. We don't save your name, email address, card details, device code or Google account, and we don't link the payment to you. The page's author sees a list of amounts, times and refunds in the app, plus the totals. They don't see who paid in the app. But the money goes into their own Stripe account, and Stripe may show them more about who paid there. That's between them and Stripe, so only pay people you trust.</p>\n      <p>If you're an author and you connect Stripe (an option that isn't open yet), we save your Stripe account's ID next to your Bluebook account, along with whether that Stripe account is ready to take payments and when you connected it. Stripe checks who you are and pays you out. We never see your ID documents or your bank details, and we never hold your money. It goes straight from the visitor to your Stripe account. We also save your block's settings, like the amounts you picked, the currency, and whether payments are paused. If you delete your Bluebook account, we remove the link to your Stripe account. The Stripe account itself stays yours, and Stripe's own policy covers what it keeps.</p>\n      <p>When a page loads its payments block, or you start a payment, we briefly count requests from your IP address to stop spam, the same way we do when you publish. That count disappears on its own after about a minute, and it isn't kept or linked to anything. We also keep a count for each payments block so it doesn't get swamped, and that disappears within an hour.</p>\n      <p>Payments are never part of the published page itself. If the payments block is taken off the page, the page is unpublished or taken down, or its author's account is deleted, the block stops working and we keep its settings for about 30 days (our clean-up runs nightly), then delete them. We keep the small payment records (the amount, currency, time and reference numbers) after that, because they're the author's payment history and they don't hold your name, email address or card details. The block's title and words are part of the page, so \"Using published pages and comments\" above covers them. Payment records aren't part of that.</p>\n      <h3>Publishing as an ad</h3>\n      <p>Want more people to see a page? From the Publish sheet's \"Publish as Ad\" tab, you can turn a page you've already published into an ad. Other people using the app see it as a full-screen ad before a note they open, whether it's from the stories strip, Subscribed, Liked, Media or Go to note. It isn't just for people who have the page's link, like a regular published page. Everyone sees ads, including people who've bought Pro, but never before their own notes. So that ads don't come too often, the app keeps a small count of the notes you've opened and the time of your last ad. It stays on your device and we never see it. You need to sign in to run an ad. Views are bought as described under \"In-app purchases\" above, and once the purchase is confirmed, we add those views to your account. We also save how many views an ad has used and its status (running, used up, or taken down). To tell you how many different people an ad reached, we save an anonymous ID that each device makes, keeps, and sends whenever it asks for an ad or a view is counted, whether or not the viewer is signed in. It isn't linked to a Google account, email address, or anything else that identifies someone. We use it to tell whether a repeat view of an ad came from a device we already counted, and for the activity counts described under \"Activity counts\" below. See \"Analytics\" below too. When you unpublish an ad, it stops being shown right away, though someone whose phone already loaded it might still see it once. Any views it had left go unused. That balance isn't returned to your account. The page itself and its normal link stay as they were, and taking the page down is a separate step from the Publish to Web tab. \"External images &amp; embeds\" below explains how images, video, audio and social posts inside an ad are loaded. Ads can only use images from Wikipedia or Wikimedia Commons, and video, audio and social posts added with the editor's own tools (YouTube, Spotify, Instagram, X, or Streamable). Voice notes can't be used in ads, because they're recorded on your device. Polls can't be used in ads either, because ads can't collect votes.</p>\n      <h3>Making sure ad views are real (Android)</h3>\n      <p>Some people try to fake ad views with scripts. To stop that, the Android app asks Google to confirm that it's the real app, installed from Google Play, on a real phone. When the app needs an ad, it sends Google's answer to our servers, along with a random code, the app's name and the same anonymous device ID described above. Our servers ask Google if the answer is good, and we don't keep it. If it is, we give the app a pass that lasts about a day, and the app shows that pass each time it asks for an ad. We keep the random code for about ten minutes, and the pass (linked to the device ID) for about a day. We use them only to limit how often one phone can ask for ads. None of this tells us who you are, and it isn't linked to your account.</p>\n      <h3>Ad access &amp; invites</h3>\n      <p>Some bigger ad packages have to be earned. To work out which packages you can start and how many ads you can run at once, our servers count these things, using the records described in this policy: your subscribers, published notes, stories, likes and comments you've received and given, accounts you follow, how many of the last 30 days your account was active, your running ads, and any strikes. A strike comes from an alert we sent you about a removal, pause or suspension. We keep those alerts for up to a year, but a strike only counts for 60 days, or until we excuse it. You see these counts as your progress. We use them to enforce the limits, and other people never see them.</p>\n      <p>Every signed-in account gets a random 8-character invite code, saved with the account. When someone adds a code, we save a record of who entered whose code, when it happened, and whether and why it stopped counting (the invited account was suspended or being deleted, or we removed it for abuse). A friend can add one code, in their first 14 days. You get an alert when a friend joins, but it doesn't say who. You only see totals: how many friends added your code and how many count right now, never who. An invite counts once your friend has published a note and been active on at least two days. If your friend chooses to subscribe at the same time, that's saved like any other subscription. When you share your code, it goes through your device's share sheet or clipboard, so the message is sent by the app you pick and we never see it. When an invite counts, we add 100 free views to your balance. We add it to the list of your view credits, together with the invited account's internal ID, so the same invite can't be rewarded twice. That entry stays in that list (and only there) until you delete your account, even if your friend's account is deleted first. If either account is deleted, the record of the invite itself is deleted.</p>\n      <h3>Reporting a published page</h3>\n      <p>Reports help keep Bluebook a good place for everyone. Anyone can report a published page from its public link. To stop spam, we count how many reports come from an IP address. That count lives in a short-lived counter that disappears on its own about a minute after the last report from that address. It's never saved as part of the report. We only keep the reason and details that were sent, which page it's about, and when. A report doesn't record who sent it. A report stays on file until someone reviews it, even if the page is unpublished or its author's account is deleted in the meantime. After it's handled, it's deleted. The exception is reports of child sexual abuse material. We keep those for 18 months, along with a copy of the reported page. The report's 18 months start when it's closed. The page copy's 18 months start when it was reported, or when it was most recently reported if it's reported again. The same period covers any other copy we hold of that page. We may also send a notification with the page's address, the reason and the details to our private alerts channel. We handle reports of child sexual abuse material the way the law requires, including passing them to the proper authority. We keep a short record of each one we pass on (the page's address, the date, the authority's reference for it, and a brief note) for 18 months from the latest. When we take an action (like a takedown, a dismissed report, or a restored page), we write down the action, the page's address, the time, and a short note such as the reason given. We keep that for about 13 months, as a record of what was done.</p>\n      <p>Pages running as ads work the same way. An ad and its published page are exactly the same thing at the same web address, so there's only one way to report either: go to that page's address and use the report link there. There's no separate process for ads.</p>\n      <p>An ad you see in the app is just the published page, so it has the same &ldquo;Report an issue&rdquo; link at the bottom as any other page. Scroll down to find it. If you run an ad, you can find its address on the Publish sheet for that note.</p>\n      <h3>Alerts</h3>\n      <p>We want you to know what's happening with your account and the app. When one of your pages is reported, or we remove or pause something of yours, or change your account's status, you'll get an automatic message (an alert) that says why. We also use alerts for good news and updates, like announcements, new features, a bigger ad package unlocking, a friend adding your invite code, planned maintenance, safety tips, or a change to this policy or our terms. They can go to every account or to specific ones, and they're saved, shown and deleted the same way as the others. Alerts show up under Alerts in your library, which only appears once your account has at least one. A number on it shows how many have arrived since you last looked at the list, and the list's title shows how many you have in total. We save the text of each alert (which can name the page or item it's about), when it was sent, and when you deleted it. We also save one marker on your account for the newest alert you've been shown, so the count follows you across your devices. Deleting an alert only removes it from your list. We keep the record, including deleted ones, for up to a year so we can review what was sent to an account. An alert never includes who reported, or the details they wrote, because we don't pass those on. If you delete your account, your alerts and that marker are deleted too.</p>\n      <h3>Voice notes</h3>\n      <p>When you record a voice note, the app asks your device for permission to use the microphone. It only records after you tap record, and it stops when you tap stop, after 5 minutes, or if you leave the app. The recording is saved inside the note on your device, just like a photo. If you're signed in, it's backed up to your account along with your other notes, and it's deleted if you delete your account. If you publish the note, the recording becomes part of the published page, so anyone with the link can listen. Voice notes can't be used in ads. We don't listen to your recordings or turn them into text. The one exception is a note you publish: its page, recording included, may be used as described under \"Using published pages and comments\" above. Recordings that only live in your notes or your backup aren't part of that. When you play a voice note, it plays right on your device.</p>\n      <h3>External images &amp; embeds</h3>\n      <p>Images you add to a page by URL are loaded straight from their source when the page is built. Instagram, X, Streamable, YouTube and Spotify embeds load straight from those services. We have nothing to do with these third-party hosts, with one exception: when you paste an Instagram share link or an X (t.co) short link using the editor's own tools, our server follows the link just to find out which post it points to. It doesn't read the page. It also counts requests from your IP address in a short-lived counter that disappears on its own after about a minute, and that isn't kept afterward or linked to your account. A page published as an ad can only use images linked directly from Wikipedia or Wikimedia Commons, and can't contain images uploaded from your device or voice notes. We check this automatically before an ad can go live or be updated.</p>\n      <h3>Linked pages</h3>\n      <p>This section is about links inside the app. In preview, tapping a link in a page shows its address in a sheet with a copy option. The app doesn't open or load the linked page, except when the link is the full address of a published note: then it opens that note in the app's story viewer, the same as pasting it in the search box and tapping GO. Nothing is fetched, and we can't see what links a page contains. A published page works a bit differently, depending on how you're viewing it. If someone opens its public web address directly, outside the app, they're looking at a plain web page in their own browser, so links inside it are ordinary clickable links that open like any other link on the web. Inside the app, opening a story or a note you found through search shows that same published page in the app's own built-in viewer (see \"Stories, subscriptions &amp; likes\" below), so you don't leave the app to see it. A link you tap inside that viewer opens in your own browser, which takes you out of the app, unless it's the full address of another published note, which opens in the viewer instead. The app doesn't load the linked page itself, and we have nothing to do with that site, but like any site you open in a browser, it can see your IP address. If the app can't open the link, it copies the address instead.</p>\n      <h3>Stories, subscriptions &amp; likes</h3>\n      <p>From a published note's Publish sheet, you can turn on \"Show in stories\" (you need to sign in). That adds the note to a stories strip that other people using the app can see, not only people who have the link. It's similar to Publish as Ad, but without purchased views. Our servers save the note's web address, title, description and tags (if you've added them), when the note was created, and up to three preview images from the note's published page (plus how many images the note has, so a feed card can show how many more there are), along with your account ID. Your story shows the title. The Subscribed feed of anyone who subscribes to you shows the title, description, tags, how long ago the note was created, and how many likes it has. Preview images that come from your device are copied to our servers, and they can be loaded without a sign-in check while the story is showing. A preview image added by URL isn't copied, so viewers' devices load it straight from its source when they see your story or feed card, and that host can see their IP address. If you turn the toggle off within the first 24 hours, or unpublish the note at any time, we delete the saved copies, including the saved description and tags. Other people's devices never get your Google account ID or email. Instead, each account has a separate random author ID that means nothing outside the app. It's sent with your stories, so your picture and display name can go with them and a Subscribe tap can reach the right account. We make it ourselves, it isn't made from your Google account, and it's deleted with your account. To tell you apart from other authors, viewers see your display name, picture, or the note's title. A story can appear in the strip for 24 hours from when you turn on \"Show in stories\" (editing the note doesn't restart that clock). After that, it leaves the strip and your Stories tab. The strip isn't a list of every story. It shows a selection of other people's stories that reshuffles every few hours, so a story still within its 24 hours may or may not be shown to a given viewer. Your own live stories always lead your own strip, and stories from accounts a viewer already follows show up in their Subscribed feed instead of the strip. A story stays in the Subscribed feed of people who follow you (from when they followed you onward) for 7 days from when you turned on \"Show in stories\", or until you unpublish the note, whichever comes first. After that it leaves the feed, but the published page itself stays online. After the first 24 hours the toggle turns itself off. That just tells you the story has left the strip and your Stories tab. It stays in your followers' feeds for the rest of the 7 days. If you turn the toggle off yourself within the first 24 hours, the story disappears from the strip and from your followers' feeds.</p>\n      <p>A display name and profile picture are both optional. If you set a display name, it's shown on your stories and, to anyone who subscribes to you, on your notes in their Subscribed feed. If you leave it blank, viewers just see the note's title in both places. A display name can be up to 30 characters. If you set a profile picture, it shows on your stories, as the ring around your avatar in the stories strip, and next to your name on your comments (see \"Comments\" below) and on text box messages you send as yourself (see \"Text boxes\" below). It doesn't show on your notes in the Subscribed feed. You get to pick what your ring shows. In Settings, under Privacy, tap \"Story picture\" and choose your profile picture (that's the default), the first image in your note, or never your picture. If you pick the note's first image, the ring shows it when the note has one. If not, it falls back to your picture, and then to a letter. If you pick never, the ring shows the note's first image, or a letter if there isn't one, and your picture isn't used in the strip. Your choice is saved with your account, so it works on every device, and it's sent along with your stories so other people's apps follow it. It only changes what the strip shows. It doesn't delete your picture, and it doesn't stop your picture from loading from the address below. A picture you upload is stored on our servers and served from a web address based on your random author ID. That address isn't behind a sign-in check, but it only serves your picture while you have at least one story showing, or at least one comment or text box message showing your name (or to you, when you're signed in). So anyone who has your author ID, for example from seeing one of your stories or comments, can load it during that time, and no one else can. Once you have no stories, named comments or named text box messages showing, the picture is no longer shown to others. If you remove the picture, it's deleted from our servers. With no picture, or if your choice means it isn't used, the story ring uses the note's own image if it has one, and only then an initial letter, taken from your display name (or the note's title if you haven't set one). That initial is never taken from your account email, which is never sent to other viewers at all.</p>\n      <p>A signed-in account can subscribe to (follow) another account from that account's story. We save who follows whom so we can build your Subscribed feed, show whether you're already following someone, and keep your follows on every device you sign in on. You can see how many accounts follow you as a total, never who, and how many accounts you follow. The app also keeps a copy of who you follow on your device, so it can show the Subscribe/Subscribed button without asking our servers each time. We also record, under your account, which stories you've opened, so a story you've already seen doesn't keep grabbing your attention in the strip. Searching your Subscribed feed happens on your device, within the stories already loaded. What you type is never sent to us. A signed-in account can also like a published note. We record, under your account, which notes you've liked so the heart shows correctly across your devices. For each note you like or unlike, and each account you follow or unfollow, we also note the time of your most recent action. That way, taps made on different devices (or offline and sent later) are applied in the right order. That note stays after you unlike or unfollow, and is removed once the like or follow is gone and the note is more than 30 days old, or when your account is deleted. Each published note's own like count shows on its card wherever that card appears: your Published and Stories tabs, and the Subscribed feed or Liked tab of anyone who sees the note, but never who liked it. You can also see one total on your account screen: the number of likes across all your published notes. If you unpublish a note, the likes it received are removed, so both that note's count and the combined total go down. When a published note that isn't showing as a story appears as a card, either in its author's Published tab or in someone's Liked tab, we may copy up to three preview images from that page to our servers. Like story preview images, these copies can be loaded without a sign-in check, and they're deleted when the note is unpublished or its author's account is deleted.</p>\n      <h3>All my notes</h3>\n      <p>In Settings, the \"All my notes\" section has four switches that change lots of your published pages at once, so you don't have to do them one by one in the Publish sheet: \"Always show in stories\", \"Always show comments\", \"Hide comments on all pages\" and \"Disable comments on all pages\". You need to be signed in to use them. When you turn one on, the app changes every page you've already published, and every page you publish after that. When you turn one off, it just stops changing pages. Your pages keep whatever they're set to at that moment. If you later change a single page's own switches in its Publish sheet, that page's choice wins.</p>\n      <p>Here's what that means for your data. The three comment switches send a request to our servers, and our servers update the comments setting on every live page linked to your account, even pages that aren't on the device you're holding. It's the same setting you'd get from the Publish sheet, and nothing extra is saved about it. \"Always show comments\" and \"Hide comments on all pages\" are opposites, so turning one on turns the other off. \"Always show in stories\" works one page at a time, exactly like tapping \"Show in stories\" on each page yourself, so everything described under \"Stories, subscriptions &amp; likes\" above applies to each page it adds.</p>\n      <p>The switches themselves (on or off for each of the four, plus the time you last changed them) are saved on your device for your account, and they're backed up with your notes and theme, so they follow you to your other devices. If you change them on two devices, the newest change wins. When another device finds out that \"Always show in stories\" was turned on, that device's published pages join stories too. Nothing is saved while you're signed out. If you delete your account, these switches are deleted along with the rest of your backup.</p>\n      <h3>Third-party requests &amp; server logs</h3>\n      <p>Using the app makes a few requests to other companies, which can see your IP address, like any website you visit. A script library (three.js) is loaded from Cloudflare's cdnjs when the app opens. A published page with a Stripe Buy Button loads Stripe's code when it opens (see Payments). Google's sign-in code is loaded from Google when you sign in. The app sometimes asks Google (gstatic.com) for a tiny blank page, just to check whether you're online. And if you paste a Spotify link using the editor's own tools, the app asks Spotify (open.spotify.com) for that link's embed details. Requests to our servers run on Cloudflare, which processes them and may keep standard request logs (like the time, the address requested, and your IP address) that we can use to run and fix the service. We don't use them for analytics or tracking.</p>\n      <h3>Activity counts</h3>\n      <p>We'd like to know roughly how many people use the app, and how many are using it right now, so our servers note when the app is open. While it's open, the app contacts our server when it launches, when you come back to it, and about every four minutes, sending the same anonymous device ID described under \"Publishing as an ad\" above. If you're signed in, this (and any other request you make while signed in) saves only the time your account was last active, on your account. If you're not signed in, the server saves the device ID with the times it was first and last seen (plus the daily log described below), and nothing else. It isn't linked to a name, email address or Google account, and if you later sign in on that device, the signed-out record is deleted. We use these records for private, overall totals (like total, new and currently active users and devices), to look up an account's last activity when we're running the service, and, for signed-in accounts, to count recent active days toward ad access and invites (see \"Ad access &amp; invites\"). They're never shown to other people, shared, or used for advertising. The last-activity record is deleted about 90 days after the last activity (an account's is also deleted with the account). Separately, so usage can be charted across weeks, months and years, the server keeps a minimal daily log. For each day an account or device was active, it holds one entry with just that date and the account or device ID, with no name, email or content. We use these entries for those overall charts and for the active-day counts in \"Ad access &amp; invites\", and they're removed automatically after 800 days (about 26 months). They aren't removed early when you delete your account or sign in on a device that was signed out. There's no setting to turn this off, because we don't collect anything beyond this. If you clear the app's storage, you get a fresh anonymous ID from then on.</p>\n      <h3>Analytics</h3>\n      <p>We do not collect usage tracking or crash reports from this app, and do not track what you do inside it. The only usage figures it keeps are the two uses of the anonymous device ID described above: counting an ad's unique viewers (see \"Publishing as an ad\"), and the activity counts (see \"Activity counts\").</p>\n      <h3>Keeping things safe</h3>\n      <p>We work to keep what's on our servers safe, but no app or website can be 100% secure, so we can't promise nothing bad will ever happen. Anything you publish is public, so please don't put private things in a published page.</p>\n      <h3>Children</h3>\n      <p>Bluebook isn't meant for children under 13, or older where the rules where you live say so. We don't knowingly collect information from children that young. If a child under that age has made an account, they or their parent or guardian can delete it by tapping the account icon and choosing Delete account under Show more.</p>\n      <h3>Your rights</h3>\n      <p>Depending on where you live, you may have the right to ask to see the information we hold about you, fix it, delete it, get a copy of it, or object to how we use it, and to complain to your local data protection authority. You can do some of this yourself in the app, like deleting your account (see \"Google sign-in &amp; sync\" above). For anything else, see Contact below.</p>\n      <h3>Where your information goes</h3>\n      <p>Our servers, and the companies that help us run Bluebook (like Cloudflare and Google), may be in other countries, so your information may be handled outside the country where you live.</p>\n      <h3>Changes to this policy</h3>\n      <p>We may update this policy from time to time. When we do, we'll change the date at the top, and we may also send you an alert. If you keep using the app after a change, that means you're OK with it.</p>\n      <h3>Contact</h3>\n      <p>Questions about this policy? We're happy to help at <a href=\"mailto:essentialsoftware.support@gmail.com\">essentialsoftware.support@gmail.com</a>.</p>\n    ", "terms": "      <p><em>Effective 24 October 2026</em></p>\n      <p>Welcome to <strong>Bluebook</strong>! It&rsquo;s published by Essential Software (&ldquo;we&rdquo;, &ldquo;us&rdquo;, &ldquo;our&rdquo;). By using it, you agree to these terms, which are here to keep the app fair and safe for everyone. We've written them in plain language.</p>\n      <h3>Who Can Use Bluebook</h3>\n      <p>You need to be at least 13 to use Bluebook, or older if the rules where you live say so. If you're under 18, please read these terms with a parent or guardian and make sure they're OK with you using the app.</p>\n      <h3>Responsible Use</h3>\n      <p>Please use Bluebook kindly and lawfully. You agree to use it for lawful purposes only, and not to create, store, or export content that is illegal, harmful, threatening, abusive, untrue and damaging to someone's reputation, or that breaks someone else's rights. This applies with extra weight to anything you publish (see below).</p>\n      <h3>Your Content</h3>\n      <p>Pages you build are stored on your device. If you sign in with Google, they're also backed up to our servers so you can restore them on another device. Your \"All my notes\" switches from Settings are backed up the same way. Without an account, your content lives only on your device: we have no copy and can't recover it if it's lost. Signing in, or keeping your own backups, is how you protect it.</p>\n      <h3>Your Account</h3>\n      <p>Signing in is optional and handled by Google. Keep your Google account secure. Anyone with access to it can access your synced notes, Pro purchase, and ad view credits through this app. We record when your account was last active, and count active devices, only to run and understand the service; see the Privacy Policy's \"Activity counts\" section.</p>\n      <h3>Published Content</h3>\n      <p>A published page is stored on our servers and can be viewed by anyone with the link. You're responsible for what you publish and for having the rights to it. We may remove a published page if it breaks these terms, gets a valid takedown request, or is reported and found to be abusive. A page you publish while signed out isn't linked to an account; if you later sign in and use its private token to show it in stories or save an update, it becomes part of your account, counts toward your account's page limit, and is taken down if you delete your account. Unpublish it yourself and its address frees up right away for reuse. If we remove it instead, for a takedown or abuse report, the address stays permanently reserved and can't be reclaimed or republished. You still own what you publish. By publishing a page, you give us permission to host it and show it to people. You also give us permission to use it to run, build, test and improve Bluebook and our other apps, including by using machine learning. You can opt out of that any time, and the Privacy Policy's \"Using published pages and comments\" section explains how. This permission is free, works anywhere in the world, and covers copying, resizing, reformatting and showing your page as needed, including by companies that help us run Bluebook. It still covers anything we've already done with your page after you unpublish it or delete your account. You promise you have the right to give us this permission.</p>\n      <h3>Reports, Alerts &amp; Suspension</h3>\n      <p>Anyone can report a published page. When one of your pages is reported, or we remove or pause something of yours (a profile picture, display name, page, story or ad), or change the status of your account, we may send you an automatic message with the reason, so you know what happened and why. These messages show up under Alerts in your library. We may also use Alerts to share announcements and updates about the app, like new features, maintenance, or changes to these terms. A profile picture that looks like it's pretending to be someone else may be removed. <strong>To keep the app safe for everyone, lots of reports about your content, or repeated rule-breaking, can lead to your account being suspended. When we remove or pause pages, stories, ads, profile pictures or display names, and when we suspend accounts, those count as strikes on your account for 60 days (unless we excuse one). Strikes affect which ad packages you can start (see Ad Access &amp; Invites below).</strong> A suspended account is signed out everywhere and can't sign in. Alerts are for your information, and you can delete them from your own list. We keep a record of the alerts we've sent to an account, including deleted ones, for up to a year, so we can run and moderate the service.</p>\n      <h3>Advertising (Publish as Ad)</h3>\n      <p>You can turn a page you've already published into an ad, and buy a set number of views through Google Play Billing (handled for us by RevenueCat; see the Privacy Policy's \"In-app purchases\" section). To be allowed as an ad, a page must: have no added text or captions beyond blank lines; keep the required attribution notice in place, unedited, and easy to see at its original size; have no more than two images; have no voice notes (those are recorded on your device); have no polls (ads can't collect votes); and use only images linked directly from Wikipedia or Wikimedia Commons (no images uploaded from your device). A page can also have video, audio, and social-post embeds added with the editor's own tools. YouTube, Spotify, Instagram, X and Streamable are the allowed sources, with one embed per platform at most. Embeds added any other way aren't allowed. Ads still follow the Responsible Use section above. They also can't contain sexual or adult content, or use images, embeds, attribution or branding to pretend to be a person, brand or organization, or to mislead viewers about who or what the ad is from. We check these rules automatically before an ad can go live or be updated. We may refuse or take down an ad that no longer follows them, or that breaks these terms. An ad and its page are the same thing, so reporting one reports the other.</p>\n      <p>A running ad is shown to other people using this app, full-screen, before a note they open. It isn't only for people who have its link. Everyone sees ads, including people who've bought Pro, but not before every note, because the app spaces them out. People can skip an ad once a short countdown finishes, or go back at any time. We can't promise an ad will get any particular number of views in a given time, that the ad service will always be available, or any particular result from an ad being shown.</p>\n      <p>A <strong>view</strong> is counted as soon as the ad appears on screen, even if the person goes back before the countdown ends. Every view counts: a repeat view from the same person or device still counts and is still taken from your view balance. Views aren't limited to first-time viewers. Bluebook also shows a separate <strong>unique viewers</strong> number next to your ad's view count, just for your information. It's worked out from an anonymous ID made and stored on each device, which tells us whether a device has already been counted for a given ad (and, separately, is used for the activity counts in the Privacy Policy). It isn't linked to a Google account or any other identity, and it's sent whether or not you're signed in. Because it identifies a device rather than a person, someone using two devices counts as two unique viewers, and reinstalling the app or clearing its storage makes that device count as new from then on. The unique viewers number doesn't change your view balance or how views are taken from it.</p>\n      <p>If Google Play refunds a view purchase, we take those views back out of your balance. If that leaves your balance below zero, your running ads stop, and you can't start a new ad until your balance covers it again.</p>\n      <p>Purchased views are a one-time purchase through Google Play that gets used up. For anything about the purchase itself, see Google Play's own refund policy. Separately, if we fail to deliver a view-credit balance you paid for, or take down an ad by mistake after approving it, we'll decide whether to credit or refund the affected views. That's separate from, and doesn't replace, Google Play's own refund process for the purchase itself. If you unpublish an ad, it stops being shown and any views it had left go unused (so check your balance first). Those views aren't returned to your account or moved to another ad, and any unspent view-credit balance also goes unused if your account is deleted. Taking down the ad doesn't affect the published page, which stays live until you unpublish it separately. Views we return to your account (for example, a refund of an ad's unused views) stay in your balance, and you can put any amount of them on one of your ads from the Publish as Ad tab without buying again.</p>\n      <h3>Comments</h3>\n      <p>If you turn on \"Show comments button\" in a note's Publish sheet, signed-in people can comment on it and reply to each other. A comment is saved with what it says and when it was written, and it shows up on the live page for anyone who opens it. Normally it shows the commenter's display name and profile picture (or \"Anonymous\" if they haven't set a display name). If you'd rather not be named, you can set \"Comment as\" to Anonymous in Settings, and your comments will show with no name or picture. That choice is saved with your account, so it's the same on every device you sign in on, and it covers all your comments, old and new. You can change it whenever you like. Anonymous only hides you from other people. Your comments are still linked to your account, and everything in these terms still applies to them. Comments count toward ad access like likes do. The commenter or the note's author can delete a comment, which also removes its replies. Turning off \"Show comments button\" hides them. Turning off \"Allow new comments\" keeps the ones already there but stops people from adding new comments or replies. Unpublishing the note or deleting an account removes them. You still own your comments. By posting one, you give us permission to use it in the same ways as published pages, as described in the Privacy Policy's \"Using published pages and comments\" section, and you promise you have the right to give us that permission. You can also change these for all your pages at once from Settings (see \"All My Notes\" below).</p>\n      <h3>Polls</h3>\n      <p>You can add a poll to a page you publish. A poll is a question that visitors can vote on, without signing in. You can write your own answers (up to 30), or pick Yes / No, or a rating from 1 to 5 or 1 to 10. If you add one, you're responsible for it, just like anything else you publish, and the Responsible Use section above applies to its question and answers. Please don't use a poll to trick or pressure people, or try to push its results up or down with automated tools or by getting around the one-vote limit.</p>\n      <p>You only get totals: how many people voted, how many votes each answer got, and, for a rating poll, the average rating. You never see who voted for what. Poll results are a friendly guide, not an official count. A poll saves one vote for each device, so someone who clears their browser storage or uses another device could vote again. We can't promise the numbers are exact. You can set a close date, close or reopen a poll, and reset its votes. Resetting, taking away an answer, switching to a different type of poll, and changing a rating poll between 1 to 5 and 1 to 10 all clear votes, and that can't be undone. If you unpublish the page, the poll stops working and its votes are deleted after about 30 days. We can't take down a poll on its own, only the page it's on, so we may take down that whole page if it breaks these terms. Polls can't be used in ads. See the Privacy Policy's \"Polls\" section for what's recorded when someone votes.</p>\n      <h3>Text boxes</h3>\n      <p>You can add a text box to a page you publish. A text box is a message box or a form that visitors can fill in and send to you, without signing in. You choose the fields (up to 30). If you add one, you're responsible for it, just like anything else you publish, and the Responsible Use section above applies to its title and field labels. Please don't use a text box to ask people for passwords, payment card numbers, ID numbers, or other sensitive details, and don't use one to collect people's details in a way that tricks them or breaks the privacy laws that apply to you.</p>\n      <p>Messages come to you in the app. Some people choose to send as themselves, and then you'll see their display name and picture next to the message. Use that only to deal with the message, and don't share it or collect it for anything else. If they later change their display name, or switch to Anonymous or delete their account, what you see on the message changes with it. You're responsible for what you do with what people send you, including keeping it safe and deleting it when you no longer need it. Please don't use it to harass, spam, or pressure anyone. A message might not always arrive, for example if someone loses their connection or a limit is hit, so don't rely on a text box for anything urgent or important. A text box keeps up to 5,000 messages. After that it stops taking new ones until you delete some. We'll send you an alert when it's almost full and when it fills up, and anyone who tries to send while it's full sees that it's full. You can close or reopen a text box, delete messages one at a time, or delete them all. Deleting can't be undone. If you unpublish the page, the text box stops working and its messages are deleted after about 30 days. We can't take down a text box on its own, only the page it's on, so we may take down that whole page if it breaks these terms. Text boxes can't be used in ads. See the Privacy Policy's \"Text boxes\" section for what's recorded when someone sends a message.</p>\n      <h3>Payments</h3>\n      <p>You can add a payments block to a page you publish. It lets visitors pay you, like a tip or a bit of support, without leaving your page. To take payments, you need your own Stripe account. For a Stripe Buy Button, you paste in the embed code Stripe gives you, and never a secret key. Paying inside the page by connecting Stripe is coming soon and needs you to sign in. If you add a payments block, you're responsible for it, just like anything else you publish, and the Responsible Use section above applies to its title and words. Please only ask for money for things you're allowed to ask for, follow Stripe's terms and the laws where you live (like rules about taxes, refunds and who can take payments), and don't use a payments block to trick, scam or pressure anyone, or to pretend to be a person, charity or brand you're not. Stripe decides whether your account can take payments, and it can limit or close it. We can't change that.</p>\n      <p>Money goes straight from the visitor to your Stripe account. We never hold it, send it on or pay it out, and we aren't part of the deal between you and the person paying. Stripe takes its own fees, and those are between you and Stripe. If we ever add a fee of our own, we'll tell you before it starts. Receipts, refunds, disputes and chargebacks are for you, the visitor and Stripe to sort out. For payments inside the page, when a refund or dispute happens, the list in the app updates to show it, though that can take a moment. For a Stripe Buy Button, payments, refunds and disputes show up only in your Stripe account.</p>\n      <p>You can pick up to 6 preset amounts, and choose whether visitors can type their own amount within limits you set. A single payment can be up to 10,000 in the currency you pick: US dollars, euros, pounds, Canadian dollars or Australian dollars. You can pause payments and turn them back on whenever you like. The list in the app is built from notices Stripe sends us. It's there to help you and isn't your official record. A payment might show up late, or in rare cases not at all, so check your Stripe account for the real numbers. We can't promise payments will always work, or that anyone will pay. If you unpublish the page, the block stops working and its settings are deleted after about 30 days. We keep small payment records (the amount, currency, time and reference numbers), as the Privacy Policy explains. We can't take down a payments block on its own, only the page it's on, so we may take down that whole page if it breaks these terms. See the Privacy Policy's \"Payments\" section for what's recorded when someone pays.</p>\n      <p>If you're the one paying, you're paying the page's author, not us. Only pay people you trust, and ask them about refunds. We don't promise what they'll do with the money.</p>\n      <h3>Stories, Subscriptions &amp; Likes</h3>\n      <p>Turning on \"Show in stories\" for a published note shows it to other people using the app as a story, along with its title, description, tags and preview images. It also lets them subscribe to your account, whether or not they have the note's link. You're responsible for what you show in your stories, including a note's title, description and tags, just like anything else you publish, and the Responsible Use section above applies. We may remove a note from stories, or suspend your ability to use stories or subscriptions, for the same reasons we can act on any other published content. Your display name and profile picture are optional. If you add them, they show on your stories, on your comments and on text box messages you send as yourself (unless you comment as Anonymous), and to your subscribers. In Settings, \"Story picture\" lets you choose whether your story ring shows your profile picture, the first image in your note, or never your picture. That choice is saved with your account. They don't have to be your real name or photo, but they can't pretend to be another person, account or brand, or mislead viewers about who's posting.</p>\n      <p>A signed-in account can also like a published note. Likes are a simple way to say thanks. As its author, you can see each note's own like count on its card in your Published and Stories tabs, and anyone who sees the note in their Subscribed feed or Liked tab can see it too. Nobody sees who liked it. Likes on a note are removed if it's unpublished or its author's account is deleted. Please don't misuse likes, like using multiple accounts or automated tools to push a note's count up or down. We may remove likes, or suspend your ability to like, for the same reasons we can act on any other use of the app that breaks these terms. See the Privacy Policy's \"Stories, subscriptions &amp; likes\" section for what's recorded about likes.</p>\n      <h3>All My Notes (Settings)</h3>\n      <p>In Settings, \"All my notes\" gives you four shortcuts that change all your published pages at once: \"Always show in stories\", \"Always show comments\", \"Hide comments on all pages\" and \"Disable comments on all pages\". They only work when you're signed in. Turning one on changes every page you've already published and every page you publish after that. Turning one off just stops it from changing pages. It doesn't undo anything, so your pages keep their current settings until you change them. \"Always show comments\" and \"Hide comments on all pages\" are opposites, so turning one on turns the other off. If you change one page's own switches in its Publish sheet later, that page's choice wins.</p>\n      <p>These shortcuts are saved with your account and backed up with your notes, so they follow you to your other devices. When one is on, it's the same as tapping that switch yourself on each page, so everything else in these terms still applies. You're responsible for what shows up in stories and comments on all of your pages, including older ones, and the Responsible Use section applies. Before you turn on \"Always show in stories\", remember that it puts every page you've published (and every new one) in front of other people using the app, not only people who have the link. \"Disable comments on all pages\" means visitors can't add new comments or replies. They'll see a note that you turned them off, and the comments already there stay. We can still remove or pause pages or stories for the reasons in these terms, even when one of these shortcuts is on.</p>\n      <h3>Ad Access &amp; Invites</h3>\n      <p>Bigger ad packages are earned, not only bought. Everyone who's signed in can use the 1,000-view package. Larger packages, and running more ads at once, unlock as your account grows in the app. We look at subscribers, published notes, likes you've received, likes you give to other notes, accounts you follow, days you've been active, stories, and friends you've invited. Every running ad also needs at least five published notes behind it. The Publish as Ad tab shows your progress toward each requirement. We may change the requirements or packages in the future, but ads that are already running aren't affected. A strike (see Reports, Alerts &amp; Suspension) keeps larger packages locked until it expires after 60 days. One strike limits you to the 5,000-view package, and two or more limit you to the 1,000-view package. A limit only stops new ads from starting, and you'll get an alert when it lifts. Views you bought for a package that is limited or still locked stay in your balance until you can use them.</p>\n      <p>Every signed-in account has an invite code it can share. A new account can add one friend's code, once, in its first 14 days. You can't use your own code, and two accounts can't invite each other. When someone adds your code, you get an alert, and they can choose to subscribe to you at the same time (they're asked first). An invite counts toward your ad access once your friend has published a note and been active on at least two days. For packages from 5,000 views up, each invite that counts is worth three subscribers, for up to five invites. When an invite counts, we also add 100 free views to your balance, for up to five friends. Free views work like any other views in your balance: you can put them on any of your ads from the Publish as Ad tab without buying a package, but they can't be cashed out or handed to someone else. Your friend doesn't get anything. If we cancel an invite because of abuse, we take its free views back out of your balance, and return them if we restore it. Please only invite real people. Making or using extra accounts (or asking others to) to push up invites, subscribers, likes or any other number used here isn't allowed. If that happens, we may stop counting invites or any of these numbers, limit your packages, or suspend accounts. An invite also stops counting while the invited account is suspended or being deleted, and counts again if that ends.</p>\n      <h3>Purchases &amp; Eligibility</h3>\n      <p>You can buy a view package for a particular note when you publish it as an ad, or add views to your balance from Settings to put on any of your ads later. Views in your balance aren't assigned to a note until you use them.</p>\n      <p>All buying of view packages goes through Google Play Billing (RevenueCat handles it for us). Any age or account requirements for buying are set and enforced by Google Play, not by us. By buying a view package, you confirm that Google Play's own terms allow you to make purchases on the account you're using.</p>\n      <h3>Third-Party Content</h3>\n      <p>Images, video, and audio you embed by URL are loaded straight from the source you give us. You're responsible for having the right to use anything you embed. The same goes for voice notes you record: they're your responsibility, and you need permission from anyone whose voice is in them. Images in an ad are limited as described above. The required attribution notice is there because third-party logos, trademarks and brand names may show up in an ad's content or images. You're still responsible for having the right to use whatever you include, and the notice doesn't give you any rights by itself.</p>\n      <h3>No Promises &amp; Limits on Our Responsibility</h3>\n      <p>We work hard to make Bluebook good, but we can't promise it'll be perfect. It's provided \"as is\" and \"as available\", which means we don't promise it'll always work, be free of bugs, or never lose anything. Please keep your own backups of notes that matter to you. As far as the law allows, we're not responsible for knock-on losses, like lost notes, lost data, lost profits or lost chances, or for anything other people post, publish, comment or do. Some places don't allow these limits, so they only apply as far as the law lets them, and nothing here limits anything the law says we can't limit.</p>\n      <h3>The Fine Print</h3>\n      <p>These terms and the Privacy Policy are the whole agreement between you and us about Bluebook. If part of these terms can't be enforced, the rest still counts. If we don't enforce something right away, it doesn't mean we've given up the right to later. We may hand over our rights and duties under these terms to someone else, for example if Bluebook is sold or taken over by another company. You can't do that without our OK.</p>\n      <h3>Changes to These Terms</h3>\n      <p>We may update these terms from time to time. If you keep using the app after changes are posted, you're accepting the revised terms.</p>\n      <h3>Contact</h3>\n      <p>Questions about these terms? We're happy to help at <a href=\"mailto:essentialsoftware.support@gmail.com\">essentialsoftware.support@gmail.com</a>.</p>\n    "};
 // Only this markup is accepted: headings, paragraphs, lists, bold/italic, line breaks and links. Anything else is refused, not
 // stripped, so what is published is exactly what was reviewed. Links may only use http, https or mailto.
 const LEGAL_TAGS = new Set(['h2', 'h3', 'h4', 'p', 'ul', 'ol', 'li', 'strong', 'b', 'em', 'i', 'br', 'a']);
@@ -11211,7 +11264,7 @@ const POLL_ID_RE = /^[a-z0-9_]{6,24}$/;
 const POLL_OPT_RE = /^[a-z0-9]{1,12}$/;
 const POLL_TOK_RE = /^[A-Za-z0-9_-]{16,64}$/;
 const POLL_MAX_PER_PAGE = 20;
-const POLL_MAX_OPTS = 6;
+const POLL_MAX_OPTS = 30;
 const POLL_DAILY_DAYS = 120;
 let pollsReady = null;
 function ensurePolls(env) {
@@ -11263,6 +11316,7 @@ function extractPolls(html) {
     if (!a.id || !POLL_ID_RE.test(a.id) || seen.has(a.id)) continue;
     const cfg = normalizePollCfg(a);
     if (!cfg) continue;
+    cfg.name = blockName(html, m.index + m[0].length, 'blk-pl-q'); // the question
     seen.add(a.id); out.push({ id: a.id, cfg });
   }
   return out;
@@ -11515,7 +11569,868 @@ async function handlePollOwner(env, request) {
   return json({ ok: true, polls });
 }
 
+/* ---------------- Text boxes ---------------- */
+// Text box block (data-type="textbox") on published pages: a message box (one space to write in) or a form (up to TB_MAX_FIELDS fields of many types)
+// that visitors send to the page's author. Like polls, the server learns each box's definition from the published HTML itself
+// (syncTextboxes reads the block's data-tb-* attributes at publish time), so the server, not the visitor's browser, decides which
+// fields exist, which are required and whether the box is closed. Messages are anonymous: nothing identifies the sender except what
+// they type. No device code is kept and the IP address is only counted for rate limiting (rlHit), never stored with a message.
+//   textbox_defs (slug, box_id) -> cfg JSON, closed_at (owner closed it), deleted_at (soft delete; purged after SOFT_DELETE_RETENTION_MS)
+//   textbox_msgs (id, slug, box_id, body, created_at); body = JSON { fieldId: text }
+// Routes: POST /textbox/state, POST /textbox/send (visitors, per-IP and per-box limited), POST /textbox/owner (owner token or owner session).
+// The author reads messages in the editor (Text box > Messages tab); a signed-in owner also gets an alert (kind 'message', at most one an
+// hour per page) that carries no message text. Alert ref 'l:<slug>' takes the app to the note's card.
+const TB_ID_RE = /^[a-z0-9_]{6,24}$/;
+const TB_FIELD_RE = /^[a-z0-9]{1,12}$/;
+const TB_MSG_ID_RE = /^[a-f0-9]{20}$/;
+const TB_CURSOR_RE = /^\d{10,14}:[a-f0-9]{20}$/;
+const TB_OFFSET_RE = /^o\d{1,6}$/;
+const TB_SORT_RE = /^(new|old|(asc|desc):[a-z0-9]{1,12})$/;
+const TB_MAX_PER_PAGE = 50;
+const TB_MAX_FIELDS = 30;
+const TB_MAX_OPTS = 30;            // options on one dropdown / choice / checkbox field
+const TB_OPT_RE = /^[a-z0-9]{1,12}$/;
+const TB_TYPES = new Set(['s', 'l', 'e', 'n', 'p', 'u', 'd', 't', 'c', 'r', 'k', 'y']); // short, long, email, number, phone, link, date, time, dropdown, choice, checkboxes, tick box
+const TB_CHOICE = new Set(['c', 'r', 'k']);
+const TB_MAX_MSGS = 5000;          // stored messages per box; a full box stops taking new ones until the author deletes some
+const TB_MAX_BYTES = 120000;       // one message, all fields together
+const TB_PAGE = 50;                // messages per page in the owner list
+const TB_BOX_PER_HOUR = 300;       // sends one box accepts per hour, whoever they come from
+const TB_ALERT_GAP_MS = 60 * 60 * 1000;
+const TB_WARN_AT = Math.floor(TB_MAX_MSGS * 0.9); // the author is warned when a box reaches 90% of its message cap
+const TB_FULL_ALERT_GAP_MS = 24 * 60 * 60 * 1000; // 'someone was turned away' alerts: at most one a day per box
+const TB_BUSY_ALERT_GAP_MS = 6 * 60 * 60 * 1000;  // 'getting too many sends' alerts: at most one every six hours per box
+const TB_DEF_ML = { s: 200, l: 2000, e: 254, n: 40, p: 40, u: 500, d: 10, t: 5 }; // default length per type; short and long can be raised by the author up to TB_CAP_ML
+const TB_CAP_ML = { s: 1000, l: 10000 };
+let textboxesReady = null;
+function ensureTextboxes(env) {
+  if (!textboxesReady) {
+    textboxesReady = env.ADS_DB.batch([
+      env.ADS_DB.prepare('CREATE TABLE IF NOT EXISTS textbox_defs (slug TEXT NOT NULL, box_id TEXT NOT NULL, cfg TEXT NOT NULL, closed_at INTEGER, deleted_at INTEGER, updated_at INTEGER NOT NULL, PRIMARY KEY (slug, box_id)) WITHOUT ROWID'),
+      env.ADS_DB.prepare('CREATE TABLE IF NOT EXISTS textbox_msgs (id TEXT PRIMARY KEY, slug TEXT NOT NULL, box_id TEXT NOT NULL, body TEXT NOT NULL, created_at INTEGER NOT NULL)'),
+      env.ADS_DB.prepare('CREATE INDEX IF NOT EXISTS textbox_msgs_box_time ON textbox_msgs (slug, box_id, created_at, id)'),
+      env.ADS_DB.prepare('CREATE INDEX IF NOT EXISTS textbox_defs_deleted ON textbox_defs (deleted_at)')
+    ])
+      // full_at: set while the box is at its message cap, so the page-load check can say 'full' without counting 5,000 rows. SQLite has no
+      // ADD COLUMN IF NOT EXISTS, so a duplicate-column error is expected after the first run.
+      .then(() => addColumnOnce(env, 'ALTER TABLE textbox_defs ADD COLUMN full_at INTEGER'))
+      // sender_*: only filled when a signed-in visitor chose "Send as me". sender_id is the opaque author id (never the account itself), sender_name the
+      // display name at the time, sender_pic whether they had a profile picture. They follow the account's name changes; going Anonymous or clearing the name hides them (the id stays), and they are unlinked for good when the account is deleted.
+      .then(() => addColumnOnce(env, 'ALTER TABLE textbox_msgs ADD COLUMN sender_id TEXT'))
+      .then(() => addColumnOnce(env, 'ALTER TABLE textbox_msgs ADD COLUMN sender_name TEXT'))
+      .then(() => addColumnOnce(env, 'ALTER TABLE textbox_msgs ADD COLUMN sender_pic INTEGER'))
+      .then(() => env.ADS_DB.prepare('CREATE INDEX IF NOT EXISTS textbox_msgs_sender ON textbox_msgs (sender_id)').run())
+      .catch((e) => { textboxesReady = null; throw e; });
+  }
+  return textboxesReady;
+}
+function textboxAttrs(tag) {
+  const a = {};
+  const re = /\sdata-tb-([a-z]+)\s*=\s*(?:"([^"]*)"|'([^']*)')/g;
+  let m;
+  while ((m = re.exec(tag))) a[m[1]] = m[2] !== undefined ? m[2] : m[3];
+  return a;
+}
+// The block's data-tb-* attributes -> a validated config, or null if it isn't a usable text box.
+// data-tb-fields is "id:type:required:opt1.opt2:maxlength,..." (see TB_TYPES; options only on dropdown / choice / checkboxes, maxlength only on
+// short and long). A message box has exactly one field, 'm'.
+function tbMaxLen(t, raw) {
+  const n = parseInt(raw, 10);
+  if (t !== 's' && t !== 'l') return TB_DEF_ML[t] || 200;
+  return n >= 1 ? Math.min(n, TB_CAP_ML[t]) : TB_DEF_ML[t];
+}
+function normalizeTextboxCfg(a) {
+  const m = a.m === 'form' ? 'form' : 'msg';
+  let fields = [];
+  for (const part of String(a.fields || '').split(',')) {
+    const p = part.split(':');
+    if (p.length < 2 || !TB_FIELD_RE.test(p[0]) || fields.some((f) => f.id === p[0]) || !TB_TYPES.has(p[1])) continue;
+    const opts = [];
+    if (TB_CHOICE.has(p[1])) { for (const x of String(p[3] || '').split('.')) if (TB_OPT_RE.test(x) && opts.indexOf(x) < 0 && opts.length < TB_MAX_OPTS) opts.push(x); if (!opts.length) continue; }
+    fields.push({ id: p[0], t: p[1], req: p[2] === '1', opts, ml: tbMaxLen(p[1], p[4]) });
+  }
+  if (m === 'msg') { const mf = fields.filter((f) => f.id === 'm' && f.t === 'l')[0]; fields = [{ id: 'm', t: 'l', req: true, opts: [], ml: mf ? mf.ml : TB_DEF_ML.l }]; }
+  if (!fields.length || fields.length > TB_MAX_FIELDS) return null;
+  return { m, fields, close: /^\d{10,14}$/.test(a.close || '') ? Number(a.close) : 0 };
+}
+// The visible name of a poll / text box block, read from the published HTML right after the block's opening tag (the server only ever
+// parsed that tag's data-* attributes before, so it had no name for the block). Looks for the first element with class `cls` before the
+// next block starts; returns '' when there is none or it is empty. Used to say WHICH box or poll an alert is about.
+function blockName(html, from, ...classes) {
+  const next = html.indexOf('data-type=', from); // from = just past the block's own opening tag
+  const win = html.slice(from, next > 0 ? Math.min(next, from + 30000) : from + 30000);
+  for (const cls of classes) {
+    const m = new RegExp('<([a-zA-Z][a-zA-Z0-9]*)\\s[^>]*class\\s*=\\s*["\'][^"\']*\\b' + cls + '\\b[^"\']*["\'][^>]*>([\\s\\S]*?)<\\/\\1>', 'i').exec(win);
+    if (!m) continue;
+    const t = m[2].replace(/<[^>]*>/g, '').replace(/&nbsp;/g, ' ').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#0?39;|&apos;/g, "'").replace(/&amp;/g, '&').replace(/[\u0000-\u001f\u007f\u2028\u2029\u202a-\u202e\u2066-\u2069]/g, ' ').replace(/\s+/g, ' ').trim();
+    if (t) return t.length > 40 ? t.slice(0, 39) + '\u2026' : t;
+  }
+  return '';
+}
+function extractTextboxes(html) {
+  const out = [], seen = new Set();
+  const re = /<[a-zA-Z][^>]*?\sdata-type\s*=\s*["']textbox["'][^>]*>/g;
+  let m;
+  while ((m = re.exec(html)) && out.length < TB_MAX_PER_PAGE) {
+    const a = textboxAttrs(m[0]);
+    if (!a.id || !TB_ID_RE.test(a.id) || seen.has(a.id)) continue;
+    const cfg = normalizeTextboxCfg(a);
+    if (!cfg) continue;
+    cfg.name = blockName(html, m.index + m[0].length, 'blk-tb-q', 'blk-tb-fl'); // title, else the first field's label
+    seen.add(a.id); out.push({ id: a.id, cfg });
+  }
+  return out;
+}
+// Brings textbox_defs in line with a just-published page: new boxes are added, ones still on the page are revived and updated, ones
+// that left the page are soft-deleted. Messages are never touched here: a removed field only stops being shown or asked for.
+async function syncTextboxes(env, slug, html) {
+  await ensureTextboxes(env);
+  const found = extractTextboxes(html);
+  const now = Date.now();
+  const { results: old } = await env.ADS_DB.prepare('SELECT box_id FROM textbox_defs WHERE slug = ?').bind(slug).all();
+  const stmts = [];
+  for (const b of found) {
+    stmts.push(env.ADS_DB.prepare('INSERT INTO textbox_defs (slug, box_id, cfg, closed_at, deleted_at, updated_at) VALUES (?1, ?2, ?3, NULL, NULL, ?4) ON CONFLICT(slug, box_id) DO UPDATE SET cfg = ?3, deleted_at = NULL, updated_at = ?4').bind(slug, b.id, JSON.stringify(b.cfg), now));
+  }
+  const keep = new Set(found.map((b) => b.id));
+  for (const r of (old || [])) {
+    if (!keep.has(r.box_id)) stmts.push(env.ADS_DB.prepare('UPDATE textbox_defs SET deleted_at = ?3 WHERE slug = ?1 AND box_id = ?2 AND deleted_at IS NULL').bind(slug, r.box_id, now));
+  }
+  if (stmts.length) await env.ADS_DB.batch(stmts);
+  return found.length;
+}
+// Publish/update hook. A page whose sync fails is repaired on the first send or look (healTextboxes), so this never fails a publish.
+async function syncTextboxesSafe(env, slug, html) {
+  try { await syncTextboxes(env, slug, html); } catch (e) { console.log('textbox sync failed: ' + (e && e.message)); }
+}
+async function softDeleteTextboxes(env, slug, now) {
+  try { await ensureTextboxes(env); await env.ADS_DB.prepare('UPDATE textbox_defs SET deleted_at = ? WHERE slug = ? AND deleted_at IS NULL').bind(now, slug).run(); }
+  catch (e) { console.log('textbox soft-delete failed: ' + (e && e.message)); }
+}
+async function pruneTextboxes(env) {
+  try {
+    await ensureTextboxes(env);
+    const { results } = await env.ADS_DB.prepare('SELECT slug, box_id FROM textbox_defs WHERE deleted_at IS NOT NULL AND deleted_at < ? LIMIT 200').bind(Date.now() - SOFT_DELETE_RETENTION_MS).all();
+    for (const r of (results || [])) {
+      await env.ADS_DB.batch([
+        env.ADS_DB.prepare('DELETE FROM textbox_msgs WHERE slug = ? AND box_id = ?').bind(r.slug, r.box_id),
+        env.ADS_DB.prepare('DELETE FROM textbox_defs WHERE slug = ? AND box_id = ?').bind(r.slug, r.box_id)
+      ]);
+    }
+    return (results || []).length;
+  } catch (e) { /* housekeeping only; swallow */ }
+  return 0;
+}
+// Rebuilds a slug's text box definitions from its stored page (at most once a minute per slug).
+async function healTextboxes(env, slug) {
+  if (!(await rlHit(env, 'ratelimit:tbheal:' + slug, 1, 60)).ok) return;
+  try {
+    const obj = await env.NOTES_BUCKET.get(slug + '.html');
+    if (obj) await syncTextboxes(env, slug, await obj.text());
+  } catch (e) { console.log('textbox heal failed: ' + (e && e.message)); }
+}
+async function loadTextboxDef(env, slug, boxId) {
+  await ensureTextboxes(env);
+  const q = () => env.ADS_DB.prepare('SELECT cfg, closed_at, deleted_at, full_at FROM textbox_defs WHERE slug = ? AND box_id = ?').bind(slug, boxId).first();
+  let row = await q();
+  if (!row || row.deleted_at) { await healTextboxes(env, slug); row = await q(); }
+  if (!row || row.deleted_at) return null;
+  let cfg;
+  try { cfg = JSON.parse(row.cfg); } catch (e) { return null; }
+  return { cfg, closedAt: row.closed_at || 0, fullAt: row.full_at || 0 };
+}
+function textboxClosed(def, now) { return !!def.closedAt || (def.cfg.close > 0 && def.cfg.close <= now); }
+// Marks a box as at its cap (on) or open again (off). Only a hint for the page-load check; the send path always counts for real.
+async function textboxSetFull(env, slug, box, on) {
+  try { await env.ADS_DB.prepare('UPDATE textbox_defs SET full_at = ? WHERE slug = ? AND box_id = ?').bind(on ? Date.now() : null, slug, box).run(); }
+  catch (e) { console.log('textbox full flag failed: ' + (e && e.message)); }
+}
+function tbNum(n) { return Number(n).toLocaleString('en-US'); }
+// 'text box \u201cContact me\u201d on \u201cMy page\u201d' (or 'text box on ...' when the box has no name)
+function tbWhere(def, meta, slug) {
+  const n = def && def.cfg && typeof def.cfg.name === 'string' ? def.cfg.name : '';
+  return 'text box ' + (n ? '\u201c' + n + '\u201d ' : '') + 'on ' + alertNoteName(meta, slug);
+}
+async function textboxReadBody(request) {
+  let body;
+  try { body = await request.json(); } catch (e) { return null; }
+  if (!body || typeof body !== 'object') return null;
+  if (!validSlug(body.slug) || typeof body.box !== 'string' || !TB_ID_RE.test(body.box)) return null;
+  return body;
+}
+function cleanTextboxValue(raw, t, ml) {
+  let v = typeof raw === 'string' ? raw : '';
+  v = v.replace(/\r\n?/g, '\n').replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f\u2028\u2029\u202a-\u202e\u2066-\u2069]/g, '');
+  v = t === 'l' ? v.replace(/\n{3,}/g, '\n\n') : v.replace(/\n+/g, ' ');
+  return v.trim().slice(0, ml || TB_DEF_ML[t] || 200);
+}
+// One field's answer -> { val } (val '' / [] when left empty) or { err }. Choice fields only accept the option ids the page defines.
+function checkTextboxField(f, raw) {
+  const t = f.t;
+  if (t === 'k') {
+    const arr = Array.isArray(raw) ? raw : (typeof raw === 'string' && raw ? raw.split(',') : []);
+    const out = [];
+    for (const x of arr) { if (typeof x !== 'string') continue; if (f.opts.indexOf(x) < 0) return { err: 'please pick from the options' }; if (out.indexOf(x) < 0) out.push(x); }
+    return { val: out };
+  }
+  if (t === 'c' || t === 'r') {
+    const x = typeof raw === 'string' ? raw : '';
+    if (x && f.opts.indexOf(x) < 0) return { err: 'please pick from the options' };
+    return { val: x };
+  }
+  if (t === 'y') return { val: raw === '1' || raw === true ? '1' : '' };
+  const val = cleanTextboxValue(raw, t, f.ml);
+  if (!val) return { val: '' };
+  if (t === 'e' && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(val)) return { err: 'that email address doesn\u2019t look right' };
+  if (t === 'n' && !/^-?\d{1,15}(\.\d{1,10})?$/.test(val)) return { err: 'that number doesn\u2019t look right' };
+  if (t === 'p' && !/^\+?[0-9 ()\-.]{3,30}$/.test(val)) return { err: 'that phone number doesn\u2019t look right' };
+  if (t === 'u' && !/^https?:\/\/[^\s]{3,480}$/i.test(val)) return { err: 'that link doesn\u2019t look right' };
+  if (t === 'd') { const d = /^(\d{4})-(\d{2})-(\d{2})$/.exec(val); const dt = d && new Date(Date.UTC(+d[1], +d[2] - 1, +d[3])); if (!dt || dt.getUTCMonth() !== +d[2] - 1) return { err: 'that date doesn\u2019t look right' }; }
+  if (t === 't' && !/^([01]\d|2[0-3]):[0-5]\d$/.test(val)) return { err: 'that time doesn\u2019t look right' };
+  return { val };
+}
+// POST /textbox/state { slug, box } -> whether the box is taking messages right now.
+async function handleTextboxState(env, request) {
+  if (!(await checkAdIpRateLimit(env, request, 'tbstate', 120))) return textError(429, 'too many requests, slow down');
+  const body = await textboxReadBody(request);
+  if (!body) return textError(400, 'invalid request');
+  if (!(await pollLivePage(env, body.slug))) return textError(404, 'this box isn\u2019t available');
+  const def = await loadTextboxDef(env, body.slug, body.box);
+  if (!def) return textError(404, 'this box isn\u2019t available');
+  return json({ ok: true, closed: textboxClosed(def, Date.now()), full: !!def.fullAt });
+}
+// POST /textbox/send { slug, box, v: { fieldId: text }, hp }. hp is a hidden field a person never fills: a request that has it filled
+// gets a success answer and nothing is kept. Fields the box doesn't have are ignored; required fields and email format are checked here.
+async function handleTextboxSend(env, request) {
+  if (!(await checkAdIpRateLimit(env, request, 'tbsend', 5))) return textError(429, 'too many messages, slow down');
+  const body = await textboxReadBody(request);
+  if (!body || !body.v || typeof body.v !== 'object' || Array.isArray(body.v)) return textError(400, 'invalid request');
+  if (typeof body.hp === 'string' && body.hp !== '') return json({ ok: true });
+  const { slug, box } = body;
+  const meta = await pollLivePage(env, slug);
+  if (!meta) return textError(404, 'this box isn\u2019t available');
+  const def = await loadTextboxDef(env, slug, box);
+  if (!def) return textError(404, 'this box isn\u2019t available');
+  if (textboxClosed(def, Date.now())) return json({ ok: false, closed: true, error: 'this box is closed' }, 409);
+  // "Send as me": only when the visitor is signed in (the app sends their session) and chose it. Same name rule as comments: an account set to
+  // appear as Anonymous, or with no display name, can't send as itself. What is kept is the opaque author id, the name and a picture flag, never the account.
+  let sender = null, asSub = null;
+  if (body.asMe === true) {
+    const sub = await requireSession(env, request);
+    if (!sub) return json({ ok: false, error: 'sign in to send as yourself' }, 401);
+    asSub = sub; // the per-account limit is checked below, once the message itself has passed its checks
+    const user = await getUser(env, sub);
+    if (user && user.suspended) return json({ ok: false, suspended: true, error: 'this account can\u2019t send messages right now' }, 403);
+    const nm = commentAsOf(user) === 'anonymous' ? null : commentDisplayName(user);
+    if (!nm) return json({ ok: false, needName: true, error: 'to send as yourself, set a display name in your account and show it on comments' }, 400);
+    const aid = await authorIdFor(env, sub);
+    if (!aid) return textError(500, 'couldn\u2019t send, try again');
+    sender = { id: aid, name: nm, pic: user && user.hasProfileImage ? 1 : 0 };
+  }
+  const vals = {}, missing = [];
+  let any = false;
+  for (const f of def.cfg.fields) {
+    const r = checkTextboxField(f, body.v[f.id]);
+    if (r.err) return json({ ok: false, error: r.err, fields: [f.id] }, 400);
+    const empty = Array.isArray(r.val) ? !r.val.length : !r.val;
+    if (!empty) { vals[f.id] = r.val; any = true; }
+    else if (f.req) missing.push(f.id);
+  }
+  if (missing.length) return json({ ok: false, error: 'please fill in the required fields', fields: missing }, 400);
+  if (!any) return json({ ok: false, error: 'write something first' }, 400);
+  if (JSON.stringify(vals).length > TB_MAX_BYTES) return json({ ok: false, error: 'that message is too long' }, 413);
+  if (!(await rlHit(env, 'ratelimit:tbbox:' + slug + ':' + box, TB_BOX_PER_HOUR, 3600)).ok) {
+    await createAlert(env, meta.ownerSub, 'box_busy', 'Your ' + tbWhere(def, meta, slug) + ' is getting more than ' + tbNum(TB_BOX_PER_HOUR) + ' messages an hour, so it is turning some people away for now. Those messages are not saved. It starts taking them again by itself.', { ref: 'tbb:' + slug + ':' + box, dedupeMs: TB_BUSY_ALERT_GAP_MS });
+    return textError(429, 'this box is getting a lot of messages, try again later');
+  }
+  if (asSub) { const limited = await accountRateLimitResponse(env, asSub, 'textbox'); if (limited) return limited; }
+  await ensureTextboxes(env);
+  const cnt = await env.ADS_DB.prepare('SELECT COUNT(*) AS n FROM textbox_msgs WHERE slug = ? AND box_id = ?').bind(slug, box).first();
+  const had = cnt ? cnt.n : 0;
+  const where = tbWhere(def, meta, slug);
+  if (had >= TB_MAX_MSGS) {
+    // Full: the visitor is told, the author is told that someone was turned away (once a day per box), and the page-load check starts saying 'full'.
+    if (!def.fullAt) await textboxSetFull(env, slug, box, true);
+    await createAlert(env, meta.ownerSub, 'box_full', 'Someone tried to send a message to your ' + where + ', but it is full (' + tbNum(TB_MAX_MSGS) + ' messages), so it was not saved. Delete some messages in the text box\u2019s Messages tab so it can take new ones.', { ref: 'tbr:' + slug + ':' + box, dedupeMs: TB_FULL_ALERT_GAP_MS });
+    return json({ ok: false, full: true, error: 'this box is full and isn\u2019t taking messages right now' }, 409);
+  }
+  const id = crypto.randomUUID().replace(/-/g, '').slice(0, 20);
+  await env.ADS_DB.prepare('INSERT INTO textbox_msgs (id, slug, box_id, body, created_at, sender_id, sender_name, sender_pic) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').bind(id, slug, box, JSON.stringify(vals), Date.now(), sender ? sender.id : null, sender ? sender.name : null, sender ? sender.pic : null).run();
+  const now = had + 1;
+  if (now >= TB_MAX_MSGS) {
+    await textboxSetFull(env, slug, box, true);
+    await createAlert(env, meta.ownerSub, 'box_full', 'Your ' + where + ' just filled up (' + tbNum(TB_MAX_MSGS) + ' messages) and has stopped taking new ones. Delete some messages in the text box\u2019s Messages tab to open it up again.', { ref: 'tbf:' + slug + ':' + box, dedupeMs: TB_ALERT_GAP_MS });
+  } else {
+    if (def.fullAt) await textboxSetFull(env, slug, box, false); // flag was stale: the box has room again
+    if (had < TB_WARN_AT && now >= TB_WARN_AT) await createAlert(env, meta.ownerSub, 'box_nearly_full', 'Your ' + where + ' is almost full: ' + tbNum(now) + ' of ' + tbNum(TB_MAX_MSGS) + ' messages. Delete some in the text box\u2019s Messages tab so it keeps taking new ones.', { ref: 'tbw:' + slug + ':' + box, dedupeMs: TB_ALERT_GAP_MS });
+  }
+  await createAlert(env, meta.ownerSub, 'message', (sender ? alertSafe(sender.name, COMMENT_NAME_MAX) || 'Someone' : 'Someone') + ' sent a message to your ' + where + '. Open the note, then the text box\u2019s Messages tab to read it.', { ref: 'l:' + slug, dedupeMs: TB_ALERT_GAP_MS });
+  return json({ ok: true });
+}
+// POST /textbox/owner { slug, token, op, box?, id?, cursor? }: ops list (every box on the page with its total, plus one page of the
+// requested box's messages, newest first), delete (one message), clear (every message of a box), close, reopen.
+// Authorised by the page's owner token, or by the signed-in session that owns the page.
+async function handleTextboxOwner(env, request) {
+  if (!(await checkAdIpRateLimit(env, request, 'tbown', 60))) return textError(429, 'too many requests, slow down');
+  let body;
+  try { body = await request.json(); } catch (e) { return textError(400, 'invalid request'); }
+  if (!body || !validSlug(body.slug)) return textError(400, 'invalid slug');
+  const slug = body.slug;
+  const meta = await getMeta(env, slug);
+  if (!meta || meta.deletedAt) return textError(404, 'not found');
+  let ok = false;
+  if (typeof body.token === 'string' && body.token && timingSafeEqual(await sha256Hex(body.token), meta.tokenHash)) ok = true;
+  else if (meta.ownerSub) { const sub = await requireSession(env, request); ok = !!sub && sub === meta.ownerSub; }
+  if (!ok) return textError(403, 'invalid token');
+  await ensureTextboxes(env);
+  const op = body.op;
+  const box = typeof body.box === 'string' && TB_ID_RE.test(body.box) ? body.box : '';
+  if (op === 'delete' || op === 'clear' || op === 'close' || op === 'reopen') {
+    if (!box) return textError(400, 'invalid box');
+    const live = await env.ADS_DB.prepare('SELECT 1 AS x FROM textbox_defs WHERE slug = ? AND box_id = ? AND deleted_at IS NULL').bind(slug, box).first();
+    if (!live) return textError(404, 'box not found');
+    if (op === 'delete') {
+      if (typeof body.id !== 'string' || !TB_MSG_ID_RE.test(body.id)) return textError(400, 'invalid message');
+      await env.ADS_DB.prepare('DELETE FROM textbox_msgs WHERE slug = ? AND box_id = ? AND id = ?').bind(slug, box, body.id).run();
+      await textboxSetFull(env, slug, box, false); // one fewer than the cap is no longer full
+    } else if (op === 'clear') {
+      await env.ADS_DB.prepare('DELETE FROM textbox_msgs WHERE slug = ? AND box_id = ?').bind(slug, box).run();
+      await textboxSetFull(env, slug, box, false);
+    } else {
+      await env.ADS_DB.prepare('UPDATE textbox_defs SET closed_at = ? WHERE slug = ? AND box_id = ?').bind(op === 'close' ? Date.now() : null, slug, box).run();
+    }
+  } else if (op !== 'list') return textError(400, 'invalid op');
+  const qDefs = () => env.ADS_DB.prepare('SELECT box_id, cfg, closed_at FROM textbox_defs WHERE slug = ? AND deleted_at IS NULL ORDER BY box_id').bind(slug).all();
+  let defs = (await qDefs()).results || [];
+  if (!defs.length) { await healTextboxes(env, slug); defs = (await qDefs()).results || []; }
+  const totals = (await env.ADS_DB.prepare('SELECT box_id, COUNT(*) AS n FROM textbox_msgs WHERE slug = ? GROUP BY box_id').bind(slug).all()).results || [];
+  const now = Date.now();
+  const boxes = [];
+  for (const d of defs) {
+    let cfg; try { cfg = JSON.parse(d.cfg); } catch (e) { continue; }
+    const t = totals.filter((r) => r.box_id === d.box_id)[0];
+    boxes.push({ id: d.box_id, m: cfg.m, fields: cfg.fields, closesAt: cfg.close || 0, closedByOwner: !!d.closed_at, closed: textboxClosed({ cfg, closedAt: d.closed_at || 0 }, now), total: t ? t.n : 0, max: TB_MAX_MSGS, full: !!t && t.n >= TB_MAX_MSGS });
+  }
+  const out = { ok: true, boxes };
+  if (box && boxes.some((b) => b.id === box)) {
+    // Sort: 'new' / 'old' by time (keyset cursor), or 'asc:<fieldId>' / 'desc:<fieldId>' by one field's answer (offset cursor 'o<n>').
+    // Numbers sort as numbers, dropdown / choice by the author's option order, everything else as text; messages with no answer come last.
+    const bx = boxes.filter((b) => b.id === box)[0];
+    let sort = typeof body.sort === 'string' && TB_SORT_RE.test(body.sort) ? body.sort : 'new';
+    let ex = '', ea = [];
+    if (sort !== 'new' && sort !== 'old') {
+      const fid = sort.slice(sort.indexOf(':') + 1), f = (bx.fields || []).filter((x) => x.id === fid)[0];
+      if (!f || f.t === 'k' || f.t === 'y') sort = 'new';
+      else if (f.t === 'n') { ex = 'CAST(json_extract(body, ?) AS REAL)'; ea = ['$.' + fid]; }
+      else if (f.t === 'c' || f.t === 'r') { ex = 'CASE json_extract(body, ?)' + (f.opts || []).filter((o) => TB_OPT_RE.test(o)).map((o, k) => " WHEN '" + o + "' THEN " + k).join('') + ' END'; ea = ['$.' + fid]; } // option ids are [a-z0-9] only, so they are inlined (D1 allows 100 bound values per query)
+      else { ex = 'json_extract(body, ?) COLLATE NOCASE'; ea = ['$.' + fid]; }
+    }
+    let rows;
+    if (ex) {
+      const off = op === 'list' && typeof body.cursor === 'string' && TB_OFFSET_RE.test(body.cursor) ? Number(body.cursor.slice(1)) : 0;
+      const dir = sort.slice(0, 4) === 'desc' ? 'DESC' : 'ASC';
+      const q = 'SELECT id, body, created_at, sender_id, sender_name, sender_pic FROM textbox_msgs WHERE slug = ? AND box_id = ? ORDER BY ((' + ex + ') IS NULL), (' + ex + ') ' + dir + ', created_at DESC, id DESC LIMIT ? OFFSET ?';
+      rows = ((await env.ADS_DB.prepare(q).bind(slug, box, ...ea, ...ea, TB_PAGE + 1, off).all()).results) || [];
+      out.next = rows.length > TB_PAGE ? 'o' + (off + TB_PAGE) : null;
+    } else {
+      const asc = sort === 'old';
+      let cond = '', args = [slug, box];
+      if (op === 'list' && typeof body.cursor === 'string' && TB_CURSOR_RE.test(body.cursor)) {
+        const i = body.cursor.indexOf(':');
+        cond = asc ? ' AND (created_at > ? OR (created_at = ? AND id > ?))' : ' AND (created_at < ? OR (created_at = ? AND id < ?))';
+        args = args.concat([Number(body.cursor.slice(0, i)), Number(body.cursor.slice(0, i)), body.cursor.slice(i + 1)]);
+      }
+      rows = ((await env.ADS_DB.prepare('SELECT id, body, created_at, sender_id, sender_name, sender_pic FROM textbox_msgs WHERE slug = ? AND box_id = ?' + cond + (asc ? ' ORDER BY created_at ASC, id ASC LIMIT ?' : ' ORDER BY created_at DESC, id DESC LIMIT ?')).bind(...args, TB_PAGE + 1).all()).results) || [];
+      const lastRow = rows.slice(0, TB_PAGE).pop();
+      out.next = rows.length > TB_PAGE && lastRow ? lastRow.created_at + ':' + lastRow.id : null;
+    }
+    const take = rows.slice(0, TB_PAGE);
+    out.messages = take.map((r) => { let v = {}; try { v = JSON.parse(r.body) || {}; } catch (e) { /* shown empty */ } return { id: r.id, at: r.created_at, v, ...(r.sender_name ? { from: { id: r.sender_id, name: r.sender_name, pic: !!r.sender_pic } } : {}) }; });
+  }
+  return json(out);
+}
+
 /* ---------------- Router ---------------- */
+
+/* ---------------- Payments: Stripe Connect, checkout shown inside the page ---------------- */
+// A Payments block (data-type="pay", data-py-m="card") lets visitors pay without leaving the page. Each author connects their OWN Stripe
+// account (Standard Connect); money is charged on that account (direct charge) and never held here. This Worker only creates the Checkout
+// Session on the author's account, and records finished payments from Stripe's signed webhook so the author can see totals in the editor.
+// Card details go straight from the visitor's browser to Stripe (embedded Checkout); nothing sensitive reaches or is stored by this Worker.
+// Secrets (wrangler secret put): STRIPE_SECRET_KEY, STRIPE_PUBLISHABLE_KEY, STRIPE_WEBHOOK_SECRET (the "Connected accounts" endpoint's secret).
+// Optional vars: PAY_FEE_BPS (platform fee in basis points, default 0), STRIPE_API_VERSION (default 2024-06-20).
+// Switch: in-page payments are "coming soon" until PY_CONNECT_LIVE (below) or the variable PAY_CONNECT_LIVE=1 is set; Stripe Buy Button pages don't use any of this.
+// Routes: POST /pay/state, POST /pay/checkout (visitors), POST /pay/owner, POST /pay/connect, POST /pay/account (author), GET /pay/return,
+// POST /webhooks/stripe (Stripe).
+const PY_ID_RE = /^[a-z0-9_]{6,24}$/;
+const PY_CURRENCIES = new Set(['usd', 'eur', 'gbp', 'cad', 'aud']); // two-decimal currencies only: amounts go to Stripe in cents
+const PY_MAX_PER_PAGE = 10;
+const PY_MAX_AMOUNT = 10000;   // largest single payment, in whole currency units
+const PY_MAX_PRESETS = 6;
+const PY_RECENT = 20;          // recent payments shown to the author
+const PY_SIG_TOLERANCE_S = 300;
+const PY_BOX_PER_HOUR = 120;   // checkout sessions one block will open an hour, whoever asks
+const PY_API_VERSION = '2024-06-20';
+// Paying inside the page (Connect: connect, checkout) is not open yet. The editor shows it as "coming soon"; this is the matching switch on this side,
+// so it can't be used even by calling the routes directly. To open it: set this to true, or set the variable PAY_CONNECT_LIVE=1 on the Worker.
+const PY_CONNECT_LIVE = false;
+function payConnectLive(env) { return PY_CONNECT_LIVE || (env && env.PAY_CONNECT_LIVE === '1'); }
+let paymentsReady = null;
+function ensurePayments(env) {
+  if (!paymentsReady) {
+    paymentsReady = env.ADS_DB.batch([
+      env.ADS_DB.prepare('CREATE TABLE IF NOT EXISTS pay_accounts (sub TEXT PRIMARY KEY, acct TEXT NOT NULL, ready INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL)'),
+      env.ADS_DB.prepare('CREATE UNIQUE INDEX IF NOT EXISTS pay_accounts_acct ON pay_accounts (acct)'),
+      env.ADS_DB.prepare('CREATE TABLE IF NOT EXISTS pay_defs (slug TEXT NOT NULL, box_id TEXT NOT NULL, cfg TEXT NOT NULL, closed_at INTEGER, deleted_at INTEGER, updated_at INTEGER NOT NULL, PRIMARY KEY (slug, box_id)) WITHOUT ROWID'),
+      env.ADS_DB.prepare('CREATE INDEX IF NOT EXISTS pay_defs_deleted ON pay_defs (deleted_at)'),
+      env.ADS_DB.prepare('CREATE TABLE IF NOT EXISTS pay_payments (id TEXT PRIMARY KEY, slug TEXT NOT NULL, box_id TEXT NOT NULL, amount INTEGER NOT NULL, currency TEXT NOT NULL, created_at INTEGER NOT NULL)'),
+      env.ADS_DB.prepare('CREATE INDEX IF NOT EXISTS pay_payments_box ON pay_payments (slug, box_id, created_at)')
+    ]).then(async () => {
+      // refund tracking: pi = the payment intent (what refund/dispute events carry), refunded = cents given back
+      for (const q of ['ALTER TABLE pay_payments ADD COLUMN pi TEXT', 'ALTER TABLE pay_payments ADD COLUMN refunded INTEGER NOT NULL DEFAULT 0']) {
+        try { await env.ADS_DB.prepare(q).run(); } catch (e) { if (!/duplicate column/i.test(String(e && e.message))) throw e; }
+      }
+      await env.ADS_DB.prepare('CREATE INDEX IF NOT EXISTS pay_payments_pi ON pay_payments (pi)').run();
+      await env.ADS_DB.prepare('CREATE INDEX IF NOT EXISTS pay_payments_amt ON pay_payments (slug, box_id, amount, created_at)').run();
+    }).catch((e) => { paymentsReady = null; throw e; });
+  }
+  return paymentsReady;
+}
+function payAttrs(tag) {
+  const a = {};
+  const re = /\sdata-py-([a-z]+)\s*=\s*(?:"([^"]*)"|'([^']*)')/g;
+  let m;
+  while ((m = re.exec(tag))) a[m[1]] = m[2] !== undefined ? m[2] : m[3];
+  return a;
+}
+// The block's data-py-* attributes -> a validated config, or null when it isn't an in-page payment block (a plain payment link needs nothing here).
+function normalizePayCfg(a) {
+  if (a.m !== 'card') return null;
+  const cur = PY_CURRENCIES.has(a.cur) ? a.cur : 'usd';
+  const amts = [];
+  for (const x of String(a.amts || '').split(',')) {
+    const n = Number(x);
+    if (Number.isInteger(n) && n >= 1 && n <= PY_MAX_AMOUNT && amts.indexOf(n) < 0 && amts.length < PY_MAX_PRESETS) amts.push(n);
+  }
+  const custom = a.custom !== '0';
+  let min = parseInt(a.min, 10); if (!(min >= 1)) min = 1;
+  let max = parseInt(a.max, 10); if (!(max >= min)) max = Math.max(min, 500);
+  max = Math.min(max, PY_MAX_AMOUNT); min = Math.min(min, max);
+  if (!custom && !amts.length) return null;
+  return { cur, amts, custom, min, max };
+}
+function extractPays(html) {
+  const out = [], seen = new Set();
+  const re = /<[a-zA-Z][^>]*?\sdata-type\s*=\s*["']pay["'][^>]*>/g;
+  let m;
+  while ((m = re.exec(html)) && out.length < PY_MAX_PER_PAGE) {
+    const a = payAttrs(m[0]);
+    if (!a.id || !PY_ID_RE.test(a.id) || seen.has(a.id)) continue;
+    const cfg = normalizePayCfg(a);
+    if (!cfg) continue;
+    cfg.name = blockName(html, m.index + m[0].length, 'blk-py-q');
+    seen.add(a.id); out.push({ id: a.id, cfg });
+  }
+  return out;
+}
+// A Stripe Buy Button block (data-py-m="buy") only needs the page to be allowed to load Stripe's button. Nothing is recorded for it.
+function hasBuyButton(html) {
+  const re = /<[a-zA-Z][^>]*?\sdata-type\s*=\s*["']pay["'][^>]*>/g;
+  let m, n = 0;
+  while ((m = re.exec(html)) && n < 50) {
+    n++;
+    const a = payAttrs(m[0]);
+    if (a.m === 'buy' && /^buy_btn_[A-Za-z0-9]{10,40}$/.test(a.bb || '') && /^pk_(live|test)_[A-Za-z0-9]{20,300}$/.test(a.pk || '')) return true;
+  }
+  return false;
+}
+async function syncPays(env, slug, html) {
+  await ensurePayments(env);
+  const found = extractPays(html);
+  const buy = hasBuyButton(html);
+  const now = Date.now();
+  const { results: old } = await env.ADS_DB.prepare('SELECT box_id FROM pay_defs WHERE slug = ?').bind(slug).all();
+  const stmts = [];
+  for (const b of found) {
+    stmts.push(env.ADS_DB.prepare('INSERT INTO pay_defs (slug, box_id, cfg, closed_at, deleted_at, updated_at) VALUES (?1, ?2, ?3, NULL, NULL, ?4) ON CONFLICT(slug, box_id) DO UPDATE SET cfg = ?3, deleted_at = NULL, updated_at = ?4').bind(slug, b.id, JSON.stringify(b.cfg), now));
+  }
+  const keep = new Set(found.map((b) => b.id));
+  for (const r of (old || [])) {
+    if (!keep.has(r.box_id)) stmts.push(env.ADS_DB.prepare('UPDATE pay_defs SET deleted_at = ?3 WHERE slug = ?1 AND box_id = ?2 AND deleted_at IS NULL').bind(slug, r.box_id, now));
+  }
+  if (stmts.length) await env.ADS_DB.batch(stmts);
+  // meta.hasPay tells handleServe to let this page (and only this page) load Stripe's script and frames.
+  const meta = await getMeta(env, slug);
+  const want = found.length > 0 || buy;
+  if (meta && !!meta.hasPay !== want) { meta.hasPay = want; await putMeta(env, slug, meta); }
+  return found.length;
+}
+async function syncPaysSafe(env, slug, html) {
+  try { await syncPays(env, slug, html); } catch (e) { console.log('pay sync failed: ' + (e && e.message)); }
+}
+async function softDeletePays(env, slug, now) {
+  try { await ensurePayments(env); await env.ADS_DB.prepare('UPDATE pay_defs SET deleted_at = ? WHERE slug = ? AND deleted_at IS NULL').bind(now, slug).run(); }
+  catch (e) { console.log('pay soft-delete failed: ' + (e && e.message)); }
+}
+async function prunePays(env) {
+  try {
+    await ensurePayments(env);
+    const { results } = await env.ADS_DB.prepare('SELECT slug, box_id FROM pay_defs WHERE deleted_at IS NOT NULL AND deleted_at < ? LIMIT 200').bind(Date.now() - SOFT_DELETE_RETENTION_MS).all();
+    for (const r of (results || [])) {
+      // pay_payments rows are kept: they're the author's payment history and hold no personal data
+      await env.ADS_DB.prepare('DELETE FROM pay_defs WHERE slug = ? AND box_id = ?').bind(r.slug, r.box_id).run();
+    }
+    return (results || []).length;
+  } catch (e) { /* housekeeping only; swallow */ }
+  return 0;
+}
+async function healPays(env, slug) {
+  if (!(await rlHit(env, 'ratelimit:payheal:' + slug, 1, 60)).ok) return;
+  try {
+    const obj = await env.NOTES_BUCKET.get(slug + '.html');
+    if (obj) await syncPays(env, slug, await obj.text());
+  } catch (e) { console.log('pay heal failed: ' + (e && e.message)); }
+}
+async function loadPayDef(env, slug, boxId) {
+  await ensurePayments(env);
+  const q = () => env.ADS_DB.prepare('SELECT cfg, closed_at, deleted_at FROM pay_defs WHERE slug = ? AND box_id = ?').bind(slug, boxId).first();
+  let row = await q();
+  if (!row || row.deleted_at) { await healPays(env, slug); row = await q(); }
+  if (!row || row.deleted_at) return null;
+  let cfg;
+  try { cfg = JSON.parse(row.cfg); } catch (e) { return null; }
+  return { cfg, closedAt: row.closed_at || 0 };
+}
+async function payReadBody(request) {
+  let body;
+  try { body = await request.json(); } catch (e) { return null; }
+  if (!body || typeof body !== 'object') return null;
+  if (!validSlug(body.slug) || typeof body.box !== 'string' || !PY_ID_RE.test(body.box)) return null;
+  return body;
+}
+// ---- Stripe API ----
+function stripeForm(obj, prefix, out) {
+  out = out || [];
+  for (const k of Object.keys(obj)) {
+    const v = obj[k];
+    if (v === undefined || v === null) continue;
+    const key = prefix ? prefix + '[' + k + ']' : k;
+    if (typeof v === 'object') stripeForm(v, key, out); else out.push(encodeURIComponent(key) + '=' + encodeURIComponent(String(v)));
+  }
+  return out;
+}
+async function stripeCall(env, method, path, params, acct, idem) {
+  if (!env.STRIPE_SECRET_KEY) throw new Error('payments are not configured');
+  const headers = { 'Authorization': 'Bearer ' + env.STRIPE_SECRET_KEY, 'Stripe-Version': env.STRIPE_API_VERSION || PY_API_VERSION };
+  if (acct) headers['Stripe-Account'] = acct;
+  if (idem) headers['Idempotency-Key'] = idem;
+  let url = 'https://api.stripe.com' + path, body;
+  if (method === 'GET') { const q = params ? stripeForm(params).join('&') : ''; if (q) url += '?' + q; }
+  else { headers['Content-Type'] = 'application/x-www-form-urlencoded'; body = stripeForm(params || {}).join('&'); }
+  const res = await fetch(url, { method, headers, body });
+  let d = null; try { d = await res.json(); } catch (e) {}
+  if (!res.ok) {
+    console.log('stripe ' + method + ' ' + path + ' -> ' + res.status + ' ' + ((d && d.error && (d.error.code || d.error.type)) || ''));
+    const err = new Error((d && d.error && d.error.message) || 'stripe error');
+    err.status = res.status;
+    err.code = (d && d.error && (d.error.code || d.error.type)) || '';
+    throw err;
+  }
+  return d;
+}
+async function hmacHex(secret, msg) {
+  const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const sig = new Uint8Array(await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(msg)));
+  let h = '';
+  for (let i = 0; i < sig.length; i++) h += (sig[i] < 16 ? '0' : '') + sig[i].toString(16);
+  return h;
+}
+async function payAccountRow(env, sub) {
+  await ensurePayments(env);
+  return env.ADS_DB.prepare('SELECT acct, ready FROM pay_accounts WHERE sub = ?').bind(sub).first();
+}
+// Asks Stripe whether the author's account can take charges, and remembers the answer.
+async function payAccountStatus(env, sub) {
+  const row = await payAccountRow(env, sub);
+  if (!row) return { connected: false, ready: false };
+  let ready = !!row.ready;
+  try {
+    const a = await stripeCall(env, 'GET', '/v1/accounts/' + encodeURIComponent(row.acct));
+    ready = !!(a.charges_enabled && a.details_submitted);
+    if (ready !== !!row.ready) await env.ADS_DB.prepare('UPDATE pay_accounts SET ready = ? WHERE sub = ?').bind(ready ? 1 : 0, sub).run();
+  } catch (e) {
+    // Keep the remembered answer, but say it couldn't be confirmed so the app doesn't present it as current. The row is never deleted here:
+    // a rejected lookup can also mean a restricted API key, and dropping the link would wipe every author's connection.
+    console.log('pay account lookup failed: ' + ((e && e.status) || 'network') + ' ' + ((e && e.code) || '') + ' ' + ((e && e.message) || ''));
+    return { connected: true, ready, unverified: true };
+  }
+  return { connected: true, ready };
+}
+// POST /pay/connect (signed in): creates the author's Stripe account if needed and returns the Stripe-hosted onboarding link.
+async function handlePayConnect(env, request) {
+  if (!(await checkAdIpRateLimit(env, request, 'payconn', 20))) return textError(429, 'too many requests, slow down');
+  const sub = await requireSession(env, request);
+  if (!sub) return textError(401, 'sign-in required');
+  if (!payConnectLive(env)) return textError(503, 'Paying inside a page is coming soon. It isn\u2019t open yet.');
+  if (!env.STRIPE_SECRET_KEY) return textError(503, 'Payments aren\u2019t set up yet.');
+  if (!env.STRIPE_WEBHOOK_SECRET) {
+    // Without the webhook secret a connected author's payments would never be recorded, so don't let anyone connect into that.
+    console.log('pay connect refused: STRIPE_WEBHOOK_SECRET is not set (payments would not be recorded)');
+    return textError(503, 'Payments aren\u2019t fully set up yet, so Stripe can\u2019t be connected.');
+  }
+  let stage = 'db';
+  try {
+    let row = await payAccountRow(env, sub);
+    if (!row) {
+      stage = 'stripe';
+      const acc = await stripeCall(env, 'POST', '/v1/accounts', { type: 'standard' }, null, 'payacct:' + sub);
+      stage = 'db';
+      await env.ADS_DB.prepare('INSERT OR IGNORE INTO pay_accounts (sub, acct, ready, created_at) VALUES (?1, ?2, 0, ?3)').bind(sub, acc.id, Date.now()).run();
+      row = await payAccountRow(env, sub);
+    }
+    stage = 'stripe';
+    const base = new URL(request.url).origin;
+    const link = await stripeCall(env, 'POST', '/v1/account_links', { account: row.acct, refresh_url: base + '/pay/return?r=1', return_url: base + '/pay/return', type: 'account_onboarding' });
+    return json({ ok: true, url: link.url });
+  } catch (e) {
+    const st = e && e.status;
+    console.log('pay connect failed at ' + stage + ': ' + (st || 'no status') + ' ' + ((e && e.code) || '') + ' ' + ((e && e.message) || ''));
+    if (stage === 'db') return textError(500, 'Something went wrong on our side saving your Stripe setup. Try again.');
+    if (!st) return textError(502, 'Couldn\u2019t reach Stripe. Try again.');
+    if (st === 429) return textError(502, 'Stripe is busy right now. Try again in a minute.');
+    if ((st === 400 || st === 403) && /connect/i.test((e && e.message) || '')) return textError(502, 'Stripe Connect isn\u2019t turned on for this app\u2019s Stripe account yet.');
+    if (st === 401 || st === 403) return textError(502, 'Stripe turned the request down. The app\u2019s Stripe keys need attention.');
+    return textError(502, 'Stripe couldn\u2019t start the setup. Try again later.');
+  }
+}
+// POST /pay/account (signed in): { connected, ready }
+async function handlePayAccount(env, request) {
+  if (!(await checkAdIpRateLimit(env, request, 'payacct', 60))) return textError(429, 'too many requests, slow down');
+  const sub = await requireSession(env, request);
+  if (!sub) return textError(401, 'sign-in required');
+  return json({ ok: true, data: await payAccountStatus(env, sub) });
+}
+// GET /pay/return: where Stripe sends the author after onboarding. The app finds out from /pay/account; this page just says to go back.
+// Stripe sends the author to /pay/return?r=1 (the refresh URL) when the onboarding link expired or was already used, and to /pay/return when they finished.
+function handlePayReturn(request) {
+  let expired = false;
+  try { expired = new URL(request.url).searchParams.get('r') === '1'; } catch (e) {}
+  const head = expired ? 'That Stripe link has expired' : 'You can go back to the app';
+  const sub = expired ? 'Go back to the app and tap Finish Stripe setup (or Connect Stripe) to get a new link.' : 'Open the note and tap Payments to check that Stripe is connected.';
+  const html = '<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Stripe</title>' +
+    '<body style="font:16px/1.5 -apple-system,Segoe UI,Roboto,sans-serif;margin:0;display:flex;min-height:100vh;align-items:center;justify-content:center;text-align:center;padding:24px;color:#1c1c1a">' +
+    '<div><h1 style="font-size:1.3rem;margin:0 0 .5rem">' + head + '</h1><p style="margin:0;opacity:.7">' + sub + '</p></div>';
+  return new Response(html, { headers: { 'Content-Type': 'text/html; charset=utf-8', 'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'", 'Cache-Control': 'no-store' } });
+}
+async function payOwnerReady(env, meta) {
+  if (!meta || meta.deletedAt || !meta.ownerSub) return false;
+  const row = await payAccountRow(env, meta.ownerSub);
+  return !!(row && row.ready);
+}
+// POST /pay/state { slug, box } -> whether this block can take a payment right now, and its amounts.
+async function handlePayState(env, request) {
+  if (!(await checkAdIpRateLimit(env, request, 'paystate', 120))) return textError(429, 'too many requests, slow down');
+  const body = await payReadBody(request);
+  if (!body) return textError(400, 'invalid request');
+  const meta = await getMeta(env, body.slug);
+  if (!meta || meta.deletedAt) return textError(404, 'not found');
+  const def = await loadPayDef(env, body.slug, body.box);
+  if (!def) return textError(404, 'not found');
+  const c = def.cfg;
+  const ready = await payOwnerReady(env, meta);
+  const live = payConnectLive(env);
+  const open = live && ready && !def.closedAt;
+  return json({ ok: true, open, why: open ? '' : (!live ? 'soon' : def.closedAt ? 'closed' : 'unavailable'), cur: c.cur, amts: c.amts, custom: c.custom, min: c.min, max: c.max });
+}
+// POST /pay/checkout { slug, box, amount } -> a Checkout Session on the author's Stripe account, for the page to show inside itself.
+// The amount is checked against what the page's author allowed (a preset, or a custom amount within their limits); nothing else is trusted.
+async function handlePayCheckout(env, request) {
+  if (!(await checkAdIpRateLimit(env, request, 'paychk', 20))) return textError(429, 'too many requests, slow down');
+  const body = await payReadBody(request);
+  if (!body) return textError(400, 'invalid request');
+  if (!payConnectLive(env)) return textError(503, 'Paying inside this page isn\u2019t available yet.');
+  if (!env.STRIPE_SECRET_KEY || !env.STRIPE_PUBLISHABLE_KEY) return textError(503, 'Payments aren\u2019t available right now.');
+  if (!env.STRIPE_WEBHOOK_SECRET) console.log('WARNING: STRIPE_WEBHOOK_SECRET is not set; this payment will reach the author but will not be recorded');
+  const meta = await getMeta(env, body.slug);
+  if (!meta || meta.deletedAt) return textError(404, 'not found');
+  const def = await loadPayDef(env, body.slug, body.box);
+  if (!def) return textError(404, 'not found');
+  if (def.closedAt) return textError(409, 'This page isn\u2019t taking payments right now.');
+  const c = def.cfg, n = body.amount;
+  if (typeof n !== 'number' || !Number.isInteger(n) || !(c.amts.indexOf(n) >= 0 || (c.custom && n >= c.min && n <= c.max))) return textError(400, 'That amount isn\u2019t allowed.');
+  if (!meta.ownerSub) return textError(409, 'This page isn\u2019t taking payments right now.');
+  const row = await payAccountRow(env, meta.ownerSub);
+  if (!row || !row.ready) return textError(409, 'This page isn\u2019t taking payments right now.');
+  const boxKey = 'ratelimit:paybox:' + body.slug + ':' + body.box;
+  if (!(await rlHit(env, boxKey, PY_BOX_PER_HOUR, 3600)).ok) return textError(429, 'Lots of people are paying right now. Try again in a little while.');
+  const cents = n * 100;
+  const params = {
+    mode: 'payment', ui_mode: 'embedded', redirect_on_completion: 'never',
+    line_items: { 0: { quantity: 1, price_data: { currency: c.cur, unit_amount: cents, product_data: { name: String(c.name || 'Support').replace(/[\u0000-\u001f\u007f]/g, ' ').slice(0, 120) || 'Support' } } } },
+    metadata: { slug: body.slug, box: body.box }
+  };
+  const bps = parseInt(env.PAY_FEE_BPS || '0', 10);
+  if (bps > 0 && bps <= 3000) { const fee = Math.floor(cents * bps / 10000); if (fee > 0) params.payment_intent_data = { application_fee_amount: fee }; }
+  try {
+    const sess = await stripeCall(env, 'POST', '/v1/checkout/sessions', params, row.acct);
+    if (!sess || typeof sess.client_secret !== 'string') { await rlRelease(env, boxKey); return textError(502, 'Couldn\u2019t start the payment. Try again.'); }
+    return json({ ok: true, clientSecret: sess.client_secret, publishableKey: env.STRIPE_PUBLISHABLE_KEY, account: row.acct });
+  } catch (e) { await rlRelease(env, boxKey); return textError(502, 'Couldn\u2019t start the payment. Try again.'); }
+}
+const PY_PAGE = 20;       // payments per page in the author's list
+// Each sort walks its keys in ONE direction, so a row-value comparison on those keys is the cursor (keyset paging: stable while new payments arrive,
+// and no OFFSET scans). Largest / smallest use the gross amount, which never changes after the payment is recorded.
+const PY_SORTS = {
+  'new': { keys: ['created_at', 'id'], dir: 'DESC' },
+  'old': { keys: ['created_at', 'id'], dir: 'ASC' },
+  'big': { keys: ['amount', 'created_at', 'id'], dir: 'DESC' },
+  'small': { keys: ['amount', 'created_at', 'id'], dir: 'ASC' }
+};
+// cursor text -> the bound values, [] for the first page, null when it is malformed (it is only ever echoed back from a previous page)
+function payCursorParse(cursor, keys) {
+  if (cursor === undefined || cursor === null || cursor === '') return [];
+  if (typeof cursor !== 'string' || cursor.length > 300) return null;
+  const parts = cursor.split(':');
+  if (parts.length !== keys.length) return null;
+  const out = [];
+  for (let i = 0; i < keys.length; i++) {
+    if (keys[i] === 'id') { if (!/^[A-Za-z0-9_]{1,200}$/.test(parts[i])) return null; out.push(parts[i]); }
+    else { if (!/^[0-9]{1,15}$/.test(parts[i])) return null; out.push(Number(parts[i])); }
+  }
+  return out;
+}
+// One page of a block's payments, or null for a bad sort / filter / cursor.
+async function payPage(env, slug, box, sortKey, filt, cursor) {
+  const sk = sortKey === undefined || sortKey === null || sortKey === '' ? 'new' : sortKey;
+  if (typeof sk !== 'string' || !Object.prototype.hasOwnProperty.call(PY_SORTS, sk)) return null;
+  const f = filt === undefined || filt === null || filt === '' ? 'all' : filt;
+  if (f !== 'all' && f !== 'refunded') return null;
+  const S = PY_SORTS[sk];
+  const cur = payCursorParse(cursor, S.keys);
+  if (!cur) return null;
+  let sql = 'SELECT id, amount, refunded, currency, created_at FROM pay_payments WHERE slug = ? AND box_id = ?';
+  const args = [slug, box];
+  if (f === 'refunded') sql += ' AND refunded > 0';
+  if (cur.length) {
+    sql += ' AND (' + S.keys.join(', ') + ') ' + (S.dir === 'DESC' ? '<' : '>') + ' (' + S.keys.map(() => '?').join(', ') + ')';
+    for (const v of cur) args.push(v);
+  }
+  sql += ' ORDER BY ' + S.keys.map((k) => k + ' ' + S.dir).join(', ') + ' LIMIT ' + (PY_PAGE + 1);
+  const { results } = await env.ADS_DB.prepare(sql).bind(...args).all();
+  const rows = results || [];
+  const more = rows.length > PY_PAGE;
+  const kept = more ? rows.slice(0, PY_PAGE) : rows;
+  const last = kept[kept.length - 1];
+  return {
+    payments: kept.map((r) => ({ id: r.id, amount: r.amount, refunded: r.refunded || 0, cur: r.currency, at: r.created_at })),
+    next: more && last ? S.keys.map((k) => String(last[k])).join(':') : null
+  };
+}
+// POST /pay/owner { slug, token?, op, box?, sort?, f?, cursor? }: ops list, payments (one page), close, reopen. Same owner check as /textbox/owner.
+async function handlePayOwner(env, request) {
+  if (!(await checkAdIpRateLimit(env, request, 'payown', 60))) return textError(429, 'too many requests, slow down');
+  let body;
+  try { body = await request.json(); } catch (e) { return textError(400, 'invalid request'); }
+  if (!body || !validSlug(body.slug)) return textError(400, 'invalid slug');
+  const slug = body.slug;
+  const meta = await getMeta(env, slug);
+  if (!meta || meta.deletedAt) return textError(404, 'not found');
+  let ok = false, sub = null;
+  if (typeof body.token === 'string' && body.token && timingSafeEqual(await sha256Hex(body.token), meta.tokenHash)) ok = true;
+  else if (meta.ownerSub) { sub = await requireSession(env, request); ok = !!sub && sub === meta.ownerSub; }
+  if (!ok) return textError(403, 'invalid token');
+  await ensurePayments(env);
+  const op = body.op;
+  const box = typeof body.box === 'string' && PY_ID_RE.test(body.box) ? body.box : '';
+  if (op === 'close' || op === 'reopen') {
+    if (!box) return textError(400, 'invalid box');
+    const live = await env.ADS_DB.prepare('SELECT 1 AS x FROM pay_defs WHERE slug = ? AND box_id = ? AND deleted_at IS NULL').bind(slug, box).first();
+    if (!live) return textError(404, 'box not found');
+    await env.ADS_DB.prepare('UPDATE pay_defs SET closed_at = ? WHERE slug = ? AND box_id = ?').bind(op === 'close' ? Date.now() : null, slug, box).run();
+  } else if (op !== 'list' && op !== 'payments') return textError(400, 'invalid op');
+  let page = null;
+  if (op === 'payments') {
+    if (!box) return textError(400, 'invalid box');
+    const live = await env.ADS_DB.prepare('SELECT 1 AS x FROM pay_defs WHERE slug = ? AND box_id = ? AND deleted_at IS NULL').bind(slug, box).first();
+    if (!live) return textError(404, 'box not found');
+    page = await payPage(env, slug, box, body.sort, body.f, body.cursor);
+    if (!page) return textError(400, 'invalid request');
+  }
+  const qDefs = () => env.ADS_DB.prepare('SELECT box_id, cfg, closed_at FROM pay_defs WHERE slug = ? AND deleted_at IS NULL ORDER BY box_id').bind(slug).all();
+  let defs = (await qDefs()).results || [];
+  if (!defs.length) { await healPays(env, slug); defs = (await qDefs()).results || []; }
+  const totals = (await env.ADS_DB.prepare('SELECT box_id, currency, COUNT(*) AS g, COUNT(CASE WHEN refunded < amount THEN 1 END) AS n, SUM(amount - refunded) AS s, SUM(refunded) AS r FROM pay_payments WHERE slug = ? GROUP BY box_id, currency').bind(slug).all()).results || [];
+  const recent = op === 'payments' ? [] : (await env.ADS_DB.prepare('SELECT box_id, amount - refunded AS amount, currency, created_at FROM pay_payments WHERE slug = ? AND refunded < amount ORDER BY created_at DESC LIMIT ' + PY_RECENT).bind(slug).all()).results || [];
+  const boxes = [];
+  for (const d of defs) {
+    let cfg; try { cfg = JSON.parse(d.cfg); } catch (e) { continue; }
+    const t = totals.filter((r) => r.box_id === d.box_id);
+    boxes.push({
+      id: d.box_id, name: typeof cfg.name === 'string' ? cfg.name : '', cur: cfg.cur, closed: !!d.closed_at,
+      count: t.reduce((a, r) => a + r.n, 0),
+      total: t.reduce((a, r) => a + r.g, 0), // every recorded payment, refunded ones included
+      totals: t.map((r) => ({ cur: r.currency, n: r.n, amount: r.s || 0, refunded: r.r || 0 })),
+      recent: recent.filter((r) => r.box_id === d.box_id).map((r) => ({ cur: r.currency, amount: r.amount, at: r.created_at }))
+    });
+  }
+  // a page published without an account can't take payments; paging through the list doesn't ask Stripe anything
+  const account = sub && op !== 'payments' ? await payAccountStatus(env, sub) : null;
+  const out = { boxes, account, canConnect: !!meta.ownerSub };
+  if (page) { out.payments = page.payments; out.next = page.next; }
+  return json({ ok: true, data: out });
+}
+// POST /webhooks/stripe: signed by Stripe (Connect endpoint, "events on connected accounts"). Records paid sessions and keeps account readiness current.
+async function handleStripeWebhook(env, request) {
+  if (!env.STRIPE_WEBHOOK_SECRET) return textError(503, 'not configured');
+  const raw = await request.text();
+  const header = request.headers.get('Stripe-Signature') || '';
+  let t = '';
+  const sigs = [];
+  for (const part of header.split(',')) {
+    const i = part.indexOf('=');
+    if (i < 0) continue;
+    const k = part.slice(0, i).trim(), v = part.slice(i + 1).trim();
+    if (k === 't') t = v; else if (k === 'v1') sigs.push(v);
+  }
+  if (!/^[0-9]{9,12}$/.test(t) || !sigs.length || Math.abs(Date.now() / 1000 - Number(t)) > PY_SIG_TOLERANCE_S) return textError(400, 'bad signature');
+  const expect = await hmacHex(env.STRIPE_WEBHOOK_SECRET, t + '.' + raw);
+  if (!sigs.some((x) => timingSafeEqual(x, expect))) return textError(400, 'bad signature');
+  let ev;
+  try { ev = JSON.parse(raw); } catch (e) { return textError(400, 'bad body'); }
+  const obj = ev && ev.data && ev.data.object;
+  if (!obj || typeof obj !== 'object') return json({ ok: true });
+  await ensurePayments(env);
+  if ((ev.type === 'checkout.session.completed' || ev.type === 'checkout.session.async_payment_succeeded') && obj.object === 'checkout.session' && obj.payment_status === 'paid') {
+    const slug = obj.metadata && obj.metadata.slug, box = obj.metadata && obj.metadata.box;
+    const cur = String(obj.currency || '').toLowerCase();
+    if (validSlug(slug) && typeof box === 'string' && PY_ID_RE.test(box) && Number.isInteger(obj.amount_total) && obj.amount_total > 0 && PY_CURRENCIES.has(cur) && typeof obj.id === 'string' && obj.id.length <= 200 && typeof ev.account === 'string') {
+      // Count it only when it was charged on the connected account of this page's owner, so one account can't add numbers to another's page.
+      const meta = await getMeta(env, slug);
+      const row = meta && meta.ownerSub ? await payAccountRow(env, meta.ownerSub) : null;
+      if (row && row.acct === ev.account) {
+        await env.ADS_DB.prepare('INSERT OR IGNORE INTO pay_payments (id, slug, box_id, amount, currency, created_at, pi) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)').bind(obj.id, slug, box, obj.amount_total, cur, Date.now(), typeof obj.payment_intent === 'string' ? obj.payment_intent : null).run();
+      }
+    }
+  } else if ((ev.type === 'charge.refunded' && obj.object === 'charge') || (ev.type === 'charge.dispute.closed' && obj.object === 'dispute' && obj.status === 'lost')) {
+    // Refund / lost dispute: net the payment out of the author's totals. Only for a payment on this account's own pages.
+    const pi = typeof obj.payment_intent === 'string' ? obj.payment_intent : '';
+    const gone = ev.type === 'charge.refunded' ? obj.amount_refunded : obj.amount;
+    if (pi && typeof ev.account === 'string' && Number.isInteger(gone) && gone > 0) {
+      const pay = await env.ADS_DB.prepare('SELECT slug FROM pay_payments WHERE pi = ?').bind(pi).first();
+      const meta = pay ? await getMeta(env, pay.slug) : null;
+      const row = meta && meta.ownerSub ? await payAccountRow(env, meta.ownerSub) : null;
+      if (row && row.acct === ev.account) {
+        await env.ADS_DB.prepare('UPDATE pay_payments SET refunded = MIN(amount, MAX(refunded, ?2)) WHERE pi = ?1').bind(pi, gone).run();
+      }
+    }
+  } else if (ev.type === 'account.application.deauthorized' && typeof ev.account === 'string') {
+    // The author disconnected us from their Stripe account: drop the link so checkout closes and they can connect again.
+    await env.ADS_DB.prepare('DELETE FROM pay_accounts WHERE acct = ?').bind(ev.account).run();
+  } else if (ev.type === 'account.updated' && typeof ev.account === 'string' && obj.object === 'account') {
+    await env.ADS_DB.prepare('UPDATE pay_accounts SET ready = ? WHERE acct = ?').bind(obj.charges_enabled && obj.details_submitted ? 1 : 0, ev.account).run();
+  }
+  return json({ ok: true });
+}
 
 export default {
   async fetch(request, env, ctx) {
@@ -11563,7 +12478,10 @@ export default {
         return handleUnpublish(env, request, decodeURIComponent(pathname.slice('/publish/'.length)));
       }
       if (method === 'GET' && pathname.startsWith('/@')) {
-        return handleServe(env, decodeURIComponent(pathname.slice('/@'.length)));
+        // /@slug and /@slug/page-name both serve the same note. A multi-page note is one HTML file; the page's own script reads the
+        // page name from the rest of the path (or from #/page-name on older links) and shows that page.
+        const rest = decodeURIComponent(pathname.slice('/@'.length)), cut = rest.indexOf('/');
+        return handleServe(env, cut < 0 ? rest : rest.slice(0, cut));
       }
       if (method === 'POST' && pathname.startsWith('/report/')) {
         return handleReport(env, request, decodeURIComponent(pathname.slice('/report/'.length)), ctx);
@@ -11650,6 +12568,16 @@ export default {
       if (method === 'POST' && pathname === '/poll/state') return handlePollState(env, request);
       if (method === 'POST' && pathname === '/poll/vote') return handlePollVote(env, request);
       if (method === 'POST' && pathname === '/poll/owner') return handlePollOwner(env, request);
+      if (method === 'POST' && pathname === '/textbox/state') return handleTextboxState(env, request);
+      if (method === 'POST' && pathname === '/textbox/send') return handleTextboxSend(env, request);
+      if (method === 'POST' && pathname === '/textbox/owner') return handleTextboxOwner(env, request);
+      if (method === 'POST' && pathname === '/pay/state') return handlePayState(env, request);
+      if (method === 'POST' && pathname === '/pay/checkout') return handlePayCheckout(env, request);
+      if (method === 'POST' && pathname === '/pay/owner') return handlePayOwner(env, request);
+      if (method === 'POST' && pathname === '/pay/connect') return handlePayConnect(env, request);
+      if (method === 'POST' && pathname === '/pay/account') return handlePayAccount(env, request);
+      if (method === 'GET' && pathname === '/pay/return') return handlePayReturn(request);
+      if (method === 'POST' && pathname === '/webhooks/stripe') return handleStripeWebhook(env, request);
       if (method === 'POST' && pathname === '/comments/counts') return handleCommentCounts(env, request);
       if (method === 'POST' && pathname.startsWith('/comments/') && pathname.endsWith('/sync') && pathname.length > '/comments/'.length + '/sync'.length) return handleCommentsSync(env, request, decodeURIComponent(pathname.slice('/comments/'.length, -'/sync'.length)));
       if (method === 'GET' && pathname.startsWith('/comments/')) return handleCommentsList(env, request, decodeURIComponent(pathname.slice('/comments/'.length)));
