@@ -1886,17 +1886,60 @@ async function handleTeamChats(env, sub) {
   }
   return json({ chats, unread: total });
 }
+// SQL for the date/time parts of a chat search (see the ?q= handler); null when none was sent.
+function teamChatDateCond(sp) {
+  const tz = Math.max(-840, Math.min(840, parseInt(sp.get('tz'), 10) || 0)), parts = [], binds = [];
+  const num = (n, lo, hi) => { const v = parseInt(sp.get(n), 10); return Number.isInteger(v) && v >= lo && v <= hi ? v : null; };
+  const col = (fmt) => "CAST(strftime('" + fmt + "', datetime(created_at / 1000 - ?, 'unixepoch')) AS INTEGER)";
+  const add = (fmt, n, lo, hi) => { const v = num(n, lo, hi); if (v === null) return; parts.push(col(fmt) + ' = ?'); binds.push(tz * 60, v); };
+  add('%Y', 'y', 1970, 2100); add('%m', 'mo', 1, 12); add('%d', 'd', 1, 31); add('%w', 'wd', 0, 6);
+  const h = num('h', 0, 23), h2 = num('h2', 0, 23);
+  if (h !== null) { if (h2 !== null) { parts.push(col('%H') + ' IN (?, ?)'); binds.push(tz * 60, h, h2); } else { parts.push(col('%H') + ' = ?'); binds.push(tz * 60, h); } }
+  add('%M', 'mi', 0, 59);
+  return parts.length ? { sql: '(' + parts.join(' AND ') + ')', binds } : null;
+}
 // /teams/note/:slug/chat[/...]: the caller is already known to be the author or an active editor of this note.
 async function handleTeamChat(env, request, sub, method, slug, meta, isOwner, rest) {
   const ownerSub = meta.ownerSub;
   if (rest.length === 0 && method === 'GET') {
     const cm = /^(\d{1,16})\.(\d{1,16})$/.exec(new URL(request.url).searchParams.get('before') || '');
     const cols = 'SELECT rowid AS rid, id, sender_sub, kind, body, reply_to, created_at, version, deleted FROM team_messages WHERE slug = ?';
-    const q = cm
-      ? env.ADS_DB.prepare(cols + ' AND (created_at < ? OR (created_at = ? AND rowid < ?)) ORDER BY created_at DESC, rowid DESC LIMIT ?').bind(slug, +cm[1], +cm[1], +cm[2], TEAM_CHAT_PAGE + 1)
-      : env.ADS_DB.prepare(cols + ' ORDER BY created_at DESC, rowid DESC LIMIT ?').bind(slug, TEAM_CHAT_PAGE + 1);
-    const { results } = await q.all();
-    const all = results || [], page = all.slice(0, TEAM_CHAT_PAGE), oldest = page[page.length - 1];
+    // ?q=: search every kept message of this chat (newest first, paged with the same before cursor). Does not mark anything read.
+    // A date/time typed in the search arrives as y, mo, d, wd (0 = Sunday), h (+ h2 for an am/pm-less hour), mi and tz (the phone's getTimezoneOffset); those match the message's time on the phone's clock.
+    const sq = (new URL(request.url).searchParams.get('q') || '').trim().slice(0, 40).toLowerCase();
+    if (sq) {
+      // ?f= narrows what the term is matched against: text, summary, photo (caption), date (the typed date/time only) or name (the sender); anything else is the old match-everything search
+      const spq = new URL(request.url).searchParams, sfRaw = (spq.get('f') || '').toLowerCase(), sf = ['text', 'summary', 'photo', 'date', 'name'].includes(sfRaw) ? sfRaw : 'all';
+      const dc = (sf === 'all' || sf === 'date') ? teamChatDateCond(spq) : null, dsql = dc ? dc.sql : '0', dbinds = dc ? dc.binds : [];
+      const kindSql = sf === 'text' ? "kind = 'text'" : sf === 'summary' ? "kind = 'summary'" : sf === 'photo' ? "kind = 'image'" : "kind IN ('text', 'summary', 'image', 'voice')";
+      let cond, cbinds;
+      if (sf === 'date') { cond = '(' + dsql + ')'; cbinds = dbinds; }
+      else if (sf === 'name') { // names live on the accounts, so find which senders in this chat match first; every page is then full of their messages
+        const { results: ssr } = await env.ADS_DB.prepare('SELECT DISTINCT sender_sub FROM team_messages WHERE slug = ? AND deleted = 0').bind(slug).all();
+        const matched = [];
+        await Promise.all((ssr || []).map(async (r) => {
+          const x = r.sender_sub; let label;
+          if (x === 'gone') label = 'deleted account';
+          else { const nm = teamShownName(await getUser(env, x)); label = nm ? nm : 'anonymous ' + (await teamChatWho(slug, x)).slice(0, 4); }
+          if (label.toLowerCase().includes(sq) || (x === sub && 'you'.includes(sq))) matched.push(x);
+        }));
+        if (!matched.length) return json({ search: true, messages: [], nextCursor: null });
+        cond = 'sender_sub IN (' + matched.map(() => '?').join(',') + ')'; cbinds = matched;
+      }
+      else if (sf === 'all') { cond = '(instr(lower(body), ?) > 0 OR ' + dsql + ')'; cbinds = [sq, ...dbinds]; }
+      else { cond = 'instr(lower(body), ?) > 0'; cbinds = [sq]; }
+      const scols = cols.replace(' FROM team_messages', ', ' + dsql + ' AS dm FROM team_messages') + ' AND deleted = 0 AND ' + kindSql + ' AND ' + cond;
+      const sQ = cm
+        ? env.ADS_DB.prepare(scols + ' AND (created_at < ? OR (created_at = ? AND rowid < ?)) ORDER BY created_at DESC, rowid DESC LIMIT ?').bind(...dbinds, slug, ...cbinds, +cm[1], +cm[1], +cm[2], TEAM_CHAT_PAGE + 1)
+        : env.ADS_DB.prepare(scols + ' ORDER BY created_at DESC, rowid DESC LIMIT ?').bind(...dbinds, slug, ...cbinds, TEAM_CHAT_PAGE + 1);
+      const { results: sr } = await sQ.all();
+      const sAll = sr || [], sPage = sAll.slice(0, TEAM_CHAT_PAGE), sOldest = sPage[sPage.length - 1];
+      // kept when the time matched, or the text did (an image row's body is its JSON: only its caption counts; a voice row has no text)
+      const textHit = (r) => r.kind !== 'voice' && String(r.kind === 'image' ? teamChatImgMeta(r).caption : r.body || '').toLowerCase().includes(sq);
+      const hits = sPage.filter((r) => sf === 'date' ? !!r.dm : sf === 'name' ? true : sf === 'all' ? (r.dm || textHit(r)) : textHit(r));
+      const shaped = await teamChatShape(env, slug, ownerSub, sub, hits);
+      return json({ search: true, messages: shaped, nextCursor: sAll.length > TEAM_CHAT_PAGE && sOldest ? sOldest.created_at + '.' + sOldest.rid : null });
+    }
     let readAt = 0;
     if (!cm) {
       const rr = await env.ADS_DB.prepare('SELECT read_at FROM team_chat_reads WHERE slug = ? AND member_sub = ?').bind(slug, sub).first();
