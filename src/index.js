@@ -533,6 +533,7 @@ async function handleSetProfileImage(env, request) {
 
   await env.NOTES_BUCKET.delete(profileImageKey(sub));
   const user = (await getUser(env, sub)) || {};
+  user.profileImageAt = Date.now(); // a version stamp, so chats know when to fetch this picture again
 
   if (dataUrl === null || dataUrl === undefined || dataUrl === '') {
     user.hasProfileImage = false;
@@ -1779,15 +1780,25 @@ function cleanChatBody(v, max) {
 }
 // A short code that is the same for one person in one chat and tells nothing else, so people who appear as Anonymous can still be told apart.
 async function teamChatWho(slug, sub) { return sub === 'gone' ? 'gone' : (await sha256Hex('chat:' + slug + ':' + sub)).slice(0, 8); }
-function teamChatReactionSummary(rows, viewerSub) {
+// Each reaction carries who reacted (oldest first), so the app can show the list without another request. `info(sub)` gives a person's name, picture id and chat code.
+function teamChatReactionSummary(rows, viewerSub, info) {
   const by = new Map();
-  for (const r of rows) { const e = by.get(r.emoji) || { emoji: r.emoji, count: 0, mine: false }; e.count++; if (r.member_sub === viewerSub) e.mine = true; by.set(r.emoji, e); }
+  for (const r of rows.slice().sort((a, b) => (a.created_at || 0) - (b.created_at || 0))) {
+    const e = by.get(r.emoji) || { emoji: r.emoji, count: 0, mine: false, users: [] }; e.count++; if (r.member_sub === viewerSub) e.mine = true;
+    e.users.push(info(r.member_sub)); by.set(r.emoji, e);
+  }
   return [...by.values()].sort((a, b) => b.count - a.count);
+}
+async function teamChatReactorInfo(env, slug, ownerSub, viewerSub, subsIn) {
+  const subs = [...new Set(subsIn)].filter((x) => x && x !== 'gone'), names = {}, whoOf = {}, pvOf = {};
+  await Promise.all(subs.map(async (x) => { const u = await getUser(env, x); names[x] = teamShownName(u); pvOf[x] = (u && u.profileImageAt) || 0; }));
+  const [aid] = await Promise.all([authorIdsFor(env, subs.filter((x) => names[x])), Promise.all(subs.map(async (x) => { whoOf[x] = await teamChatWho(slug, x); }))]);
+  return (x) => ({ name: names[x] || null, authorId: names[x] ? (aid[x] || null) : null, author: x === ownerSub, me: x === viewerSub, who: whoOf[x] || 'gone', pv: pvOf[x] || 0 });
 }
 async function teamChatShape(env, slug, ownerSub, viewerSub, rows) {
   if (!rows.length) return [];
   const ids = rows.map((r) => r.id);
-  const rx = await env.ADS_DB.prepare('SELECT message_id, member_sub, emoji FROM team_reactions WHERE message_id IN (' + ids.map(() => '?').join(',') + ')').bind(...ids).all();
+  const rx = await env.ADS_DB.prepare('SELECT message_id, member_sub, emoji, created_at FROM team_reactions WHERE message_id IN (' + ids.map(() => '?').join(',') + ')').bind(...ids).all();
   const rxBy = {};
   for (const r of ((rx && rx.results) || [])) (rxBy[r.message_id] = rxBy[r.message_id] || []).push(r);
   const replyIds = [...new Set(rows.map((r) => r.reply_to).filter(Boolean))];
@@ -1796,13 +1807,14 @@ async function teamChatShape(env, slug, ownerSub, viewerSub, rows) {
     const pr = await env.ADS_DB.prepare('SELECT id, sender_sub, kind, body, deleted FROM team_messages WHERE slug = ? AND id IN (' + replyIds.map(() => '?').join(',') + ')').bind(slug, ...replyIds).all();
     for (const p of ((pr && pr.results) || [])) parents[p.id] = p;
   }
-  const subs = [...new Set(rows.map((r) => r.sender_sub).concat(Object.values(parents).map((p) => p.sender_sub)))].filter((x) => x && x !== 'gone');
-  const names = {}, whoOf = {};
-  await Promise.all(subs.map(async (x) => { names[x] = teamShownName(await getUser(env, x)); })); // everyone at the same time, not one after another
+  const subs = [...new Set(rows.map((r) => r.sender_sub).concat(Object.values(parents).map((p) => p.sender_sub), ((rx && rx.results) || []).map((r) => r.member_sub)))].filter((x) => x && x !== 'gone');
+  const names = {}, whoOf = {}, pvOf = {};
+  await Promise.all(subs.map(async (x) => { const u = await getUser(env, x); names[x] = teamShownName(u); pvOf[x] = (u && u.profileImageAt) || 0; })); // everyone at the same time, not one after another
   const [aid] = await Promise.all([
     authorIdsFor(env, subs.filter((x) => names[x])),
     Promise.all(subs.concat(['gone']).map(async (x) => { whoOf[x] = await teamChatWho(slug, x); }))
   ]);
+  const info = (x) => ({ name: names[x] || null, authorId: names[x] ? (aid[x] || null) : null, author: x === ownerSub, me: x === viewerSub, who: whoOf[x] || 'gone', pv: pvOf[x] || 0 });
   return rows.map((r) => {
     const p = r.reply_to ? parents[r.reply_to] : null;
     return {
@@ -1810,9 +1822,9 @@ async function teamChatShape(env, slug, ownerSub, viewerSub, rows) {
       ...(r.kind === 'image' && !r.deleted ? (() => { const v = teamChatImgMeta(r); return { img: { w: v.w, h: v.h, link: v.link || null } }; })() : {}),
       ...(r.kind === 'voice' && !r.deleted ? (() => { const v = teamChatVoiceMeta(r); return { dur: v.dur, peaks: v.peaks }; })() : {}),
       name: names[r.sender_sub] || null, authorId: names[r.sender_sub] ? (aid[r.sender_sub] || null) : null,
-      author: r.sender_sub === ownerSub, me: r.sender_sub === viewerSub, gone: r.sender_sub === 'gone', who: whoOf[r.sender_sub] || 'gone',
+      author: r.sender_sub === ownerSub, me: r.sender_sub === viewerSub, gone: r.sender_sub === 'gone', who: whoOf[r.sender_sub] || 'gone', pv: pvOf[r.sender_sub] || 0,
       replyTo: r.reply_to ? (p ? { id: p.id, kind: p.kind, deleted: !!p.deleted, body: p.deleted ? '' : (p.kind === 'voice' ? 'Voice message' : String((p.kind === 'image' ? teamChatImgMeta(p).caption : p.body) || '').slice(0, TEAM_CHAT_PREVIEW)), ...(p.kind === 'voice' && !p.deleted ? { dur: teamChatVoiceMeta(p).dur } : {}), name: names[p.sender_sub] || null, author: p.sender_sub === ownerSub, me: p.sender_sub === viewerSub, who: whoOf[p.sender_sub] || 'gone' } : { id: r.reply_to, gone: true }) : null,
-      reactions: r.deleted ? [] : teamChatReactionSummary(rxBy[r.id] || [], viewerSub)
+      reactions: r.deleted ? [] : teamChatReactionSummary(rxBy[r.id] || [], viewerSub, info)
     };
   });
 }
@@ -2103,8 +2115,9 @@ async function handleTeamChat(env, request, sub, method, slug, meta, isOwner, re
       const want = b && typeof b.on === 'boolean' ? b.on : !(have && have.emoji === emoji);
       if (!want) { if (have && have.emoji === emoji) await env.ADS_DB.prepare('DELETE FROM team_reactions WHERE message_id = ? AND member_sub = ?').bind(id, sub).run(); }
       else await env.ADS_DB.prepare('INSERT INTO team_reactions (message_id, member_sub, emoji, created_at) VALUES (?, ?, ?, ?) ON CONFLICT(message_id, member_sub) DO UPDATE SET emoji = excluded.emoji, created_at = excluded.created_at').bind(id, sub, emoji, Date.now()).run();
-      const rx = await env.ADS_DB.prepare('SELECT member_sub, emoji FROM team_reactions WHERE message_id = ?').bind(id).all();
-      return json({ ok: true, reactions: teamChatReactionSummary((rx && rx.results) || [], sub) });
+      const rx = await env.ADS_DB.prepare('SELECT member_sub, emoji, created_at FROM team_reactions WHERE message_id = ?').bind(id).all(), rxRows = (rx && rx.results) || [];
+      const info = await teamChatReactorInfo(env, slug, ownerSub, sub, rxRows.map((r) => r.member_sub));
+      return json({ ok: true, reactions: teamChatReactionSummary(rxRows, sub, info) });
     }
   }
   return textError(404, 'not found');
@@ -2314,10 +2327,10 @@ async function teamPublicList(env, slug, meta, viewerSub) {
   const { results } = await env.ADS_DB.prepare("SELECT member_sub, joined_at FROM team_members WHERE slug = ? AND status = 'active' ORDER BY joined_at, id LIMIT ?").bind(slug, TEAM_MAX_MEMBERS).all();
   const rows = results || [];
   const subs = [meta.ownerSub].concat(rows.map((r) => r.member_sub));
-  const names = [];
-  for (const sb of subs) names.push(teamShownName(await getUser(env, sb)));
+  const names = [], pvs = [];
+  for (const sb of subs) { const u = await getUser(env, sb); names.push(teamShownName(u)); pvs.push((u && u.profileImageAt) || 0); }
   const ids = await authorIdsFor(env, subs.filter((sb, i) => names[i]));
-  return subs.map((sb, i) => ({ author: i === 0, me: sb === viewerSub, name: names[i] || null, authorId: names[i] ? (ids[sb] || null) : null, joinedAt: i === 0 ? null : rows[i - 1].joined_at }));
+  return subs.map((sb, i) => ({ author: i === 0, me: sb === viewerSub, name: names[i] || null, authorId: names[i] ? (ids[sb] || null) : null, pv: pvs[i], joinedAt: i === 0 ? null : rows[i - 1].joined_at }));
 }
 async function handleTeamNote(env, request, sub, method, slug, rest) {
   if (!validSlug(slug)) return textError(400, 'invalid slug');
@@ -2339,7 +2352,8 @@ async function handleTeamNote(env, request, sub, method, slug, rest) {
     const ids = await authorIdsFor(env, (results || []).map((r) => r.member_sub));
     const members = [];
     for (const r of (results || [])) {
-      members.push({ id: r.id, status: teamInviteState(r), name: teamShownName(await getUser(env, r.member_sub)), authorId: ids[r.member_sub] || null, invitedAt: r.invited_at, expiresAt: r.expires_at, joinedAt: r.joined_at, lastEditAt: r.last_edit_at });
+      const mu = await getUser(env, r.member_sub);
+      members.push({ id: r.id, status: teamInviteState(r), name: teamShownName(mu), authorId: ids[r.member_sub] || null, pv: (mu && mu.profileImageAt) || 0, invitedAt: r.invited_at, expiresAt: r.expires_at, joinedAt: r.joined_at, lastEditAt: r.last_edit_at });
     }
     return json({ role: 'owner', members, max: TEAM_MAX_MEMBERS, updatedAt: meta.updatedAt, listShared: await teamListShared(env, slug) });
   }
@@ -2396,12 +2410,12 @@ async function handleTeamNote(env, request, sub, method, slug, rest) {
       const list = await env.NOTES_BUCKET.list({ prefix: 'history/' + slug + '/', include: ['customMetadata'] });
       // Who saved each page (an older snapshot has no record: no name shown) and when, with the name other people see and the id of their profile picture.
       const subs = [...new Set(list.objects.map((o) => o.customMetadata && o.customMetadata.by).filter(Boolean))];
-      const names = {};
-      for (const sb of subs) names[sb] = teamShownName(await getUser(env, sb));
+      const names = {}, pvOf = {};
+      for (const sb of subs) { const u = await getUser(env, sb); names[sb] = teamShownName(u); pvOf[sb] = (u && u.profileImageAt) || 0; }
       const ids = await authorIdsFor(env, subs.filter((sb) => names[sb])); // no picture id for an account that is gone or appears as Anonymous
       return json({ versions: list.objects.map((o) => {
         const cm = o.customMetadata || {}, at = parseInt(cm.at, 10);
-        return { ts: parseInt(o.key.split('/').pop(), 10) || 0, size: o.size, savedAt: at > 0 ? at : null, name: cm.by ? (names[cm.by] || null) : null, authorId: cm.by && names[cm.by] ? (ids[cm.by] || null) : null };
+        return { ts: parseInt(o.key.split('/').pop(), 10) || 0, size: o.size, savedAt: at > 0 ? at : null, name: cm.by ? (names[cm.by] || null) : null, authorId: cm.by && names[cm.by] ? (ids[cm.by] || null) : null, pv: cm.by ? (pvOf[cm.by] || 0) : 0 };
       }).sort((a, b) => b.ts - a.ts) });
     }
     if (rest.length === 2 && method === 'GET') {
@@ -7117,7 +7131,7 @@ async function handleAdminOwnerAction(env, request) {
   if (action === 'suspend') user.suspended = true;
   else if (action === 'unsuspend') delete user.suspended;
   else if (action === 'clear-name') { user.profileName = null; await syncCommentName(env, sub, null); }
-  else if (action === 'clear-picture') { await env.NOTES_BUCKET.delete(profileImageKey(sub)); user.hasProfileImage = false; await syncTextboxPic(env, sub, 0); }
+  else if (action === 'clear-picture') { await env.NOTES_BUCKET.delete(profileImageKey(sub)); user.hasProfileImage = false; user.profileImageAt = Date.now(); await syncTextboxPic(env, sub, 0); }
   else if (action === 'delete') { user.suspended = true; user.adminDeleted = true; user.pendingDeletionAt = Date.now(); }
   else if (action === 'cancel-delete') {
     delete user.pendingDeletionAt;
