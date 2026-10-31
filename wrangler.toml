@@ -2,6 +2,9 @@ name = "note-publish"
 main = "src/index.js"
 compatibility_date = "2026-09-01"
 
+routes = [{ pattern = "my-site.name", custom_domain = true }]
+workers_dev = true
+
 # "1" makes GET /ads/next require an attested ad key. Set to "0" or remove to turn off.
 # PLAY_INTEGRITY_SA is a SECRET: keep it in the dashboard, never in this file.
 [vars]
