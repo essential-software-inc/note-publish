@@ -8647,6 +8647,7 @@ main{position:relative;z-index:1;max-width:720px;margin:0 auto;padding:2px 16px 
 .btn.sm{min-height:38px;padding:0 13px;font-size:13.5px;border-radius:12px}
 .btn:not([hidden]){display:inline-flex}
 .btn.block{width:100%}
+.btn.block+.btn.block{margin-top:10px}
 .field{width:100%;min-height:50px;padding:0 16px;border-radius:14px;border:1px solid var(--line2);background:var(--well);color:var(--text)}
 .field::placeholder{color:var(--faint)}
 .field:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-bg)}
