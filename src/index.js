@@ -10295,7 +10295,7 @@ html:has(.sheet-back){overflow:hidden}
       <div class="fine" id="whoami" style="text-align:center"></div>
       <div class="tools-foot">Authorized Personnel<br>Only</div>
       <div class="tools-copy">&copy; 2026 Essential Software</div>
-      <div class="tools-copy tools-ver">v1.11.2026-release</div>
+      <div class="tools-copy tools-ver">v4.11.2026-release</div>
     </div>
   </main>
   <button type="button" class="fab fo" id="alfab" aria-label="Send a custom alert" hidden><span class="ico" data-i="bell"></span></button>
