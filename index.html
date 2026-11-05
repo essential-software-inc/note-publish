@@ -726,6 +726,10 @@ html:has(.sheet-back){overflow:hidden}
         </div>
       </div>
       <div class="card static">
+        <div class="sec-head"><span class="tile sev-other"><span class="ico" data-i="shield"></span></span><div><div class="card-t">Technical notes</div><div class="card-s">The technical details cut from the public Privacy Policy and Consumer Terms. Admins only, never shown in the app.</div></div></div>
+        <button class="btn primary block" id="tnread">Read</button>
+      </div>
+      <div class="card static">
         <div class="sec-head"><span class="tile sev-ad"><span class="ico" data-i="chart"></span></span><div><div class="card-t">Time zone</div><div class="card-s">Every date and time here, and the Custom alerts date pickers, use this zone.</div></div></div>
         <select class="field" id="tzsel" aria-label="Time zone"></select>
         <div class="card-s" id="tzcur" style="margin:8px 2px 0"></div>
@@ -739,6 +743,13 @@ html:has(.sheet-back){overflow:hidden}
         <div class="sec-head"><span class="tile sev-other"><span class="ico" data-i="unlock"></span></span><div><div class="card-t">Release a slug</div><div class="card-s">Unpublishes without locking, so the slug can be reused right away. Also frees a verified name that is being held after unpublishing.</div></div></div>
         <div class="search"><input class="field" id="relslug" placeholder="Slug or link" autocomplete="off" autocapitalize="off" spellcheck="false"></div>
         <button class="btn block" id="relgo">Release slug</button>
+      </div>
+      <!-- [2026-11-04 19:21 | admin-verify] Verify an account straight from its author ID. -->
+      <div class="card static">
+        <div class="sec-head"><span class="tile sev-other"><span class="ico" data-i="shield"></span></span><div><div class="card-t">Verify an account</div><div class="card-s">Gives an account a verified name and tick right away, with no invite to wait for. You see its display name first, and it stays locked to that name. The account needs a display name and a verified sign-in email. The address must be free, or a live page of that account.</div></div></div>
+        <div class="search"><input class="field" id="veraid" placeholder="Author ID" autocomplete="off" autocapitalize="off" spellcheck="false"></div>
+        <div class="search"><input class="field" id="verslug" placeholder="Slug or link" autocomplete="off" autocapitalize="off" spellcheck="false"></div>
+        <button class="btn primary block" id="vergo">Verify</button>
       </div>
       <div class="card static">
         <div class="sec-head"><span class="tile sev-other"><span class="ico" data-i="shield"></span></span><div><div class="card-t">Reserved addresses</div><div class="card-s">Hold a slug so it shows as taken, even though no page uses it. Separate several with commas. Remove a reservation any time to free it. Invite holds one address for one email: that person signs in with it, publishes to the address and gets a verified tick. An invite nobody claims is cancelled after 90 days.</div></div></div>
@@ -756,7 +767,7 @@ html:has(.sheet-back){overflow:hidden}
       <div class="fine" id="whoami" style="text-align:center"></div>
       <div class="tools-foot">Authorized Personnel<br>Only</div>
       <div class="tools-copy">&copy; 2026 Essential Software</div>
-      <div class="tools-copy tools-ver">v1.11.2026-release</div>
+      <div class="tools-copy tools-ver">v4.11.2026-release</div>
     </div>
   </main>
   <button type="button" class="fab fo" id="alfab" aria-label="Send a custom alert" hidden><span class="ico" data-i="bell"></span></button>
@@ -831,6 +842,7 @@ U('omar.haddad@example.com','Omar Haddad',{joined:300,seen:1100,x:{pendingDeleti
 U('priya.nair@example.com','Priya Nair',{joined:60,subs:15});
 U('tom.becker@example.com','Tom Becker',{joined:450,seen:400,x:{suspended:true}});
 U('alex.rivera@example.com','Alex Rivera',{joined:15,seen:6});
+users['maya.chen@example.com'].space={bal:25,held:[{slug:'sunday-sourdough',mb:25}],credited:{},ledger:[{delta:-25,reason:'hold',slug:'sunday-sourdough',at:N-18*D},{delta:50,reason:'purchase',at:N-20*D}]};
 var RC={'maya.chen@example.com':'K7M2QX4P','lena.fischer@example.com':'H3TR9WNB','dev.patel@example.com':'P5CZ8D2F','priya.nair@example.com':'X4YB6JGA'};Object.keys(RC).forEach(function(e){users[e].referralCode=RC[e]});
 // Every account has an invite code (the worker makes it at sign-in), not only the ones that opened an ad screen.
 (function(){var AL='ABCDEFGHJKMNPQRSTUVWXYZ23456789';Object.keys(users).forEach(function(e){if(users[e].referralCode)return;var h=hash(e),c='';for(var i=0;i<8;i++){h=(h*48271)%2147483647;c+=AL.charAt(h%AL.length)}users[e].referralCode=c})})();
@@ -935,13 +947,14 @@ function adTierOf(u){
   for(var t=0;t<AD_TIERS.length;t++){if(Object.keys(AD_TIERS[t]).every(function(k){return m[k]>=AD_TIERS[t][k]}))earned=t+1;else break}
   return Math.min(earned,strikes>=2?1:strikes===1?2:AD_TIERS.length);
 }
+function spaceOf(u){var x=u.space;if(!x||!(x.ledger.length||x.bal))return null;return{balanceMb:x.bal,heldMb:x.held.reduce(function(a,h){return a+h.mb},0),held:x.held,ledger:x.ledger.slice(0,20)}}
 function owner(slug){
   if(!SLUG_RE.test(slug))return{error:'invalid slug',status:400};var p=pages[slug];if(!p)return{error:'not found',status:404};
   if(!p.owner)return{anonymous:true};
   var u=users[p.owner],mine=Object.keys(pages).filter(function(s){return pages[s].owner===u.email}),rep=reports.filter(function(r){return pages[r.slug]&&pages[r.slug].owner===u.email});
   var by={};rep.forEach(function(r){var k=r.isCsam?'csam':r.reason;by[k]=by[k]||{total:0,open:0};by[k].total++;if(!r.dismissedAt)by[k].open++});
   var open=rep.filter(function(r){return!r.dismissedAt}).length,pgs={};rep.forEach(function(r){pgs[r.slug]=1});
-  return{referral:refInfo(u),email:u.email,authorId:u.authorId,displayName:u.displayName,verifiedSlugs:RESERVED.filter(function(x){return x.claimedBy===u.email}).map(function(x){return x.slug}),suspended:!!u.suspended,pendingDeletionAt:u.pendingDeletionAt||null,hasProfileImage:u.hasProfileImage,subscribers:u.subscribers,adTier:adTierOf(u),following:followingOf(u),adsRunning:adsRunningOf(u),adLimit:AD_MAX_ACTIVE[adTierOf(u)-1],likes:mine.reduce(function(a,s){return a+pages[s].likes},0),comments:mine.reduce(function(a,s){return a+pages[s].comments},0),strikeCount:u.strikes.filter(function(x){return !x.excusedAt}).length,strikes:u.strikes.slice().sort(function(a,c){return a.at-c.at}).map(function(x){if(!x.id)x.id=sid();return{id:x.id,kind:x.kind,message:x.message,at:x.at,dismissedAt:x.dismissedAt||null,excusedAt:x.excusedAt||null,counting:!x.excusedAt&&x.at>Date.now()-60*864e5}}),alertTotal:u.alerts.length,alerts:u.alerts.slice().sort(function(a,c){return c.at-a.at}).slice(0,300).map(function(x){return{kind:x.kind,message:x.message,at:x.at,dismissedAt:x.dismissedAt||null,strike:!!x.strike}}),createdAt:u.createdAt,lastSignInAt:u.lastSignInAt,ads:Object.keys(ads).filter(function(s){return ads[s].ownerEmail===u.email}).length,creditBalance:u.credit,backup:u.backup,ledger:u.ledger.slice().sort(function(a,c){return c.at-a.at}).slice(0,20),reportStats:{total:rep.length,open:open,pages:mine.filter(function(s){return pages[s].status==='live'}).length,byReason:by},pages:mine.filter(function(s){return pages[s].status==='live'}).map(function(s){var q=pages[s];return{slug:s,title:q.title,updatedAt:q.updatedAt,likes:q.likes,comments:q.comments,showInStories:q.showInStories,reports:reports.filter(function(r){return r.slug===s&&!r.dismissedAt}).length,byReason:rstats(reports.filter(function(r){return r.slug===s&&!r.dismissedAt})).byReason}})}
+  return{referral:refInfo(u),space:spaceOf(u),email:u.email,authorId:u.authorId,displayName:u.displayName,verifiedSlugs:RESERVED.filter(function(x){return x.claimedBy===u.email}).map(function(x){return x.slug}),suspended:!!u.suspended,pendingDeletionAt:u.pendingDeletionAt||null,hasProfileImage:u.hasProfileImage,subscribers:u.subscribers,adTier:adTierOf(u),following:followingOf(u),adsRunning:adsRunningOf(u),adLimit:AD_MAX_ACTIVE[adTierOf(u)-1],likes:mine.reduce(function(a,s){return a+pages[s].likes},0),comments:mine.reduce(function(a,s){return a+pages[s].comments},0),strikeCount:u.strikes.filter(function(x){return !x.excusedAt}).length,strikes:u.strikes.slice().sort(function(a,c){return a.at-c.at}).map(function(x){if(!x.id)x.id=sid();return{id:x.id,kind:x.kind,message:x.message,at:x.at,dismissedAt:x.dismissedAt||null,excusedAt:x.excusedAt||null,counting:!x.excusedAt&&x.at>Date.now()-60*864e5}}),alertTotal:u.alerts.length,alerts:u.alerts.slice().sort(function(a,c){return c.at-a.at}).slice(0,300).map(function(x){return{kind:x.kind,message:x.message,at:x.at,dismissedAt:x.dismissedAt||null,strike:!!x.strike}}),createdAt:u.createdAt,lastSignInAt:u.lastSignInAt,ads:Object.keys(ads).filter(function(s){return ads[s].ownerEmail===u.email}).length,creditBalance:u.credit,backup:u.backup,ledger:u.ledger.slice().sort(function(a,c){return c.at-a.at}).slice(0,20),reportStats:{total:rep.length,open:open,pages:mine.filter(function(s){return pages[s].status==='live'}).length,byReason:by},pages:mine.filter(function(s){return pages[s].status==='live'}).map(function(s){var q=pages[s];return{slug:s,title:q.title,updatedAt:q.updatedAt,likes:q.likes,comments:q.comments,showInStories:q.showInStories,reports:reports.filter(function(r){return r.slug===s&&!r.dismissedAt}).length,byReason:rstats(reports.filter(function(r){return r.slug===s&&!r.dismissedAt})).byReason}})}
 }
 var ONLINE_MS=5*60*1000,PAGE=30;
 function isOn(u){return N-u.lastSeen<ONLINE_MS}
@@ -951,7 +964,7 @@ function offsOk(raw){if(!raw)return true;var p=String(raw).split(','),prev=-Infi
 function stats(){
   var us=Object.keys(users).map(function(e){return users[e]}),live=Object.keys(pages).filter(function(s){return pages[s].status==='live'}),av=Object.keys(ads).map(function(s){return ads[s]}),ow=live.filter(function(s){return pages[s].owner});
   function c(st){return av.filter(function(a){return a.status===st}).length}
-  return{stats:{users:us.length,usersOnline:us.filter(isOn).length,guests:1840,usersActive24h:us.filter(function(u){return N-u.lastSeen<D}).length,usersNew1d:us.filter(function(u){return N-u.createdAt<D}).length,usersNew7d:us.filter(function(u){return N-u.createdAt<7*D}).length,usersNew30d:us.filter(function(u){return N-u.createdAt<30*D}).length,usersActive7d:us.filter(function(u){return N-u.lastSeen<7*D}).length,guestsActive24h:420,guestsActive7d:1130,guestsOnline:23,notes:ow.length,notesNew1d:ow.filter(function(s){return N-pages[s].createdAt<D}).length,notesNew7d:ow.filter(function(s){return N-pages[s].createdAt<7*D}).length,publishers:us.filter(function(u){return live.some(function(s){return pages[s].owner===u.email})}).length,stories:live.filter(function(s){return pages[s].showInStories}).length,likes:live.reduce(function(a,s){return a+pages[s].likes},0),comments:live.reduce(function(a,s){return a+pages[s].comments},0),adsActive:c('active'),adsPaused:c('paused'),adViewsUsed:av.reduce(function(a,x){return a+x.viewsUsed},0),adsExhausted:c('exhausted'),adsUnpublished:c('unpublished'),subscriptions:us.reduce(function(a,u){return a+u.subscribers},0)},onlineWindowMin:5,trackingSince:N-120*D,at:N}
+  return{stats:{users:us.length,usersOnline:us.filter(isOn).length,guests:1840,usersActive24h:us.filter(function(u){return N-u.lastSeen<D}).length,usersNew1d:us.filter(function(u){return N-u.createdAt<D}).length,usersNew7d:us.filter(function(u){return N-u.createdAt<7*D}).length,usersNew30d:us.filter(function(u){return N-u.createdAt<30*D}).length,usersActive7d:us.filter(function(u){return N-u.lastSeen<7*D}).length,guestsActive24h:420,guestsActive7d:1130,guestsOnline:23,notes:ow.length,notesNew1d:ow.filter(function(s){return N-pages[s].createdAt<D}).length,notesNew7d:ow.filter(function(s){return N-pages[s].createdAt<7*D}).length,publishers:us.filter(function(u){return live.some(function(s){return pages[s].owner===u.email})}).length,stories:live.filter(function(s){return pages[s].showInStories}).length,likes:live.reduce(function(a,s){return a+pages[s].likes},0),comments:live.reduce(function(a,s){return a+pages[s].comments},0),adsActive:c('active'),adsPaused:c('paused'),adViewsUsed:av.reduce(function(a,x){return a+x.viewsUsed},0),adsExhausted:c('exhausted'),adsUnpublished:c('unpublished'),subscriptions:us.reduce(function(a,u){return a+u.subscribers},0),pageSpaceBought:350,pageSpaceBalance:60,pageSpaceHeld:90,pageSpacePages:4},onlineWindowMin:5,trackingSince:N-120*D,at:N}
 }
 // Timestamps behind each trend series. The demo keeps no time for a like, comment or subscription, so each is placed
 // deterministically between its note's (or account's) creation and now; everything else uses the record's own time.
@@ -1133,12 +1146,48 @@ function route(path,o){
       if(ipg&&ipg.status==='live')return err(409,'a live page already uses it');
       if(RESERVED.some(function(x){return x.slug===is}))return err(409,'already reserved');
       var iex=Date.now()+90*D;RESERVED.push({slug:is,at:Date.now(),by:who.name,note:inote||null,email:ie,invitedAt:Date.now(),expiresAt:iex,claimedBy:null});A('reserve',is,'invite for '+ie+(inote?' - '+inote:''));return ok({ok:true,slug:is,expiresAt:iex})}
+    if(b.action==='verify'){
+      var va=aidQ(b.aid),vs=typeof b.slug==='string'?b.slug.trim().toLowerCase():'',vn=typeof b.note==='string'?b.note.trim().replace(/\s+/g,' ').slice(0,100):'',vpg=pages[vs];
+      if(!va)return err(400,'enter a valid author ID');
+      if(!SLUG_RE.test(vs))return err(400,'not a valid slug (3 to 48 characters: a-z, 0-9, hyphen)');
+      if(RES_SYS.indexOf(vs)>-1)return err(400,'already blocked by the system');
+      var vu=Object.keys(users).map(function(e){return users[e]}).filter(function(x){return x.authorId===va})[0];
+      if(!vu)return err(404,'no account with that author ID');
+      if(!vu.displayName)return err(409,'this account has no display name yet');
+      if(!vu.email)return err(409,'this account has no email');
+      if(vu.emailVerified===false)return err(409,'its email is not verified: ask them to sign in again');
+      if(RESERVED.some(function(x){return x.claimedBy===vu.email}))return err(409,'this account is already verified');
+      if(vpg&&vpg.status==='taken down')return err(409,'locked by a takedown');
+      var vown=!!(vpg&&vpg.status==='live'&&vpg.owner===vu.email);
+      if(vpg&&vpg.status==='live'&&!vown)return err(409,'a live page already uses it');
+      var vh=RESERVED.filter(function(x){return x.slug===vs})[0];
+      if(vh&&vh.claimedBy)return err(409,'already claimed');
+      if(vh&&vh.email&&vh.expiresAt>Date.now())return err(409,'held for an invitation: remove that first');
+      if(!vh&&RESERVED.length>=2000)return err(409,'reservation limit reached (2000)');
+      if(b.preview===true)return ok({ok:true,preview:true,slug:vs,name:vu.displayName,email:vu.email,ownLive:vown});
+      if(vh)RESERVED.splice(RESERVED.indexOf(vh),1);
+      var vnow=Date.now();RESERVED.push({slug:vs,at:vnow,by:who.name,note:vn||null,email:vu.email,invitedAt:vnow,expiresAt:null,claimedBy:vu.email,claimedAt:vnow});
+      if(vown)vpg.verifiedName=true;
+      A('verify',vs,vn||null);
+      note(vu.email,'name_invite','We have verified you. The name /'+vs+' is now yours and a tick shows next to your name. Your display name is now locked. Ask us if you need to change it.');
+      return ok({ok:true,slug:vs,name:vu.displayName,email:vu.email})}
     if(b.action==='unreserve'){
       var us=typeof b.slug==='string'?b.slug.trim().toLowerCase():'',ui=-1;
       RESERVED.forEach(function(x,i){if(x.slug===us)ui=i});
       if(ui<0)return err(404,'not reserved');
       RESERVED.splice(ui,1);A('unreserve',us,'');return ok({ok:true})}
     return err(400,'unknown action')}
+  if(p==='/admin/technical-notes')return ok({ok:true,cut:'4 November 2026',html:'<p>Demo sample. The real technical notes are admins only. This page only shows how they look.</p><h3>Admin: verify an account</h3><p>An admin can give an account a verified name and tick straight from its author ID. They see the display name and sign-in email first.</p><ul><li>The account needs a display name and a verified sign-in email.</li><li>The address must be free, or a live page of that account.</li><li>To undo it, use Remove reservation in Lookup.</li></ul><h3>Page space</h3><p>Page space is bought in packs and held by big pages. Give space adds MB to an owner once for each page.</p>'});
+  if(p==='/admin/space'){
+    var sp=typeof b.slug==='string'?b.slug.toLowerCase():'';if(!SLUG_RE.test(sp))return err(400,'invalid slug');
+    if(!Number.isInteger(b.mb)||b.mb<1||b.mb>100)return err(400,'mb must be a whole number from 1 to 100');
+    var sr=reasonOf(b);if(!sr)return err(400,'reason required');
+    var su=ownerOf(sp);if(!su)return err(404,'no account for this slug');
+    su.space=su.space||{bal:0,held:[],ledger:[],credited:{}};
+    if(su.space.credited[sp])return err(409,'space was already credited for this page');
+    su.space.credited[sp]=1;su.space.bal+=b.mb;su.space.ledger.unshift({delta:b.mb,reason:'credit',slug:sp,at:Date.now()});
+    A('space_credit',sp,sr+' \u00b7 credited '+b.mb);note(su.email,'release','We added '+b.mb+'\u00a0MB of page space to your account. '+aRs(sr));
+    return ok({ok:true,credited:b.mb})}
   if(p==='/admin/reports/reindex')return ok({done:true});
   if(mt=p.match(/^\/publish\/(.+)$/)){var s=decodeURIComponent(mt[1]),pg=pages[s];if(m!=='DELETE')return err(405,'Method not allowed');if(!SLUG_RE.test(s))return err(400,'invalid slug');var hold=RESERVED.filter(function(x){return x.slug===s&&x.claimedBy})[0];if((!pg||pg.status!=='live')&&!hold)return err(404,'not found');if(typeof b.adminToken==='string'&&b.adminToken){var pau=adminAuth(b.adminToken);if(pau.r!=='ok')return authErr(pau);who=pau.who}else{if(typeof b.token!=='string'||!b.token)return err(401,'missing token');return err(403,'invalid token')}if(!b.release&&!reasonOf(b))return err(400,'reason required');if(hold&&(!pg||pg.status!=='live')){RESERVED.splice(RESERVED.indexOf(hold),1);A('release',s,'verified name freed',Date.now());return ok({ok:true})}var now=Date.now();snap(pg,b.release?'release':'takedown',now);var wasSt=pg.showInStories,rad=ads[s],adOn=!!rad&&(rad.status==='active'||rad.status==='paused'),rleft=rad?rad.viewsTotal-rad.viewsUsed:0;pg.deletedAt=now;pg.showInStories=false;pg.story=null;if(ads[s])ads[s].status='unpublished';
     if(b.release){pg.status='unpublished';pg.likes=0;A('release',s,'',now);var rref=0;if(adOn&&rleft>0&&!rad.refunded){rref=rleft;rad.refunded=true;rad.viewsTotal=rad.viewsUsed;var rw=users[rad.ownerEmail];if(rw){rw.credit+=rref;rw.ledger.unshift({delta:rref,reason:'refund',slug:s,at:now})}A('ad_refund',s,'refunded '+rref+' (release)',now)}if(pg.owner&&users[pg.owner])users[pg.owner].alerts.unshift({at:now,kind:'release',strike:false,dismissedAt:null,message:'Your note '+aNm(pg)+' was unpublished by an admin. Its address is free, so you can publish it again. Its likes'+(wasSt?' and story':'')+' were removed'+(adOn?', and its ad was stopped':'')+'.'+(rref?' '+(rref===1?'1 unused ad view was':rref+' unused ad views were')+' refunded to your balance.':'')})}else{pg.status='taken down';pg.likes=0;A('takedown',s,reasonOf(b),now);if(pg.owner)strike(pg.owner,'takedown','Your note '+aNm(pg)+' was taken down. '+aRs(reasonOf(b))+' Its address can\u2019t be reused. '+AR,now)}
@@ -1376,7 +1425,7 @@ function clearable(i){
   b.onclick=function(){VALD.set.call(i,'');sync();i.dispatchEvent(new Event('input',{bubbles:true}));i.focus()};
   sync()
 }
-function clearableAll(){['tok','ovq','fq','adq','auq','lkslug','relslug','resslug','resemail','resnote'].forEach(function(id){clearable($(id))})}
+function clearableAll(){['tok','ovq','fq','adq','auq','lkslug','relslug','veraid','verslug','resslug','resemail','resnote'].forEach(function(id){clearable($(id))})}
 
 /* ---------- Snapshot preview (sandboxed) ---------- */
 function toDataUrl(b){return new Promise(function(res){var r=new FileReader();r.onload=function(){res(r.result)};r.onerror=function(){res(null)};r.readAsDataURL(b)})}
@@ -1937,6 +1986,24 @@ function resInvite(){
     msg('Held /'+slug+' for that email until '+fmtD(o.j.expiresAt),'ok');resLoad()
   }).catch(function(e){netFail(e)})
 }
+// [2026-11-04 19:21 | admin-verify] Verify an account: ask the Worker for a preview (display name and email), show it in a confirm, then verify.
+function verGo(){
+  var aid=$('veraid').value.trim().toLowerCase(),slug=slugFrom($('verslug').value);
+  if(!/^a_[a-f0-9]{32}$/.test(aid)){msg('Enter the author ID');return}
+  if(!slug){msg('Enter a slug or link');return}
+  var body={action:'verify',aid:aid,slug:slug};
+  return api('/admin/reserved',{method:'POST',body:{action:'verify',aid:aid,slug:slug,preview:true}}).then(function(o){
+    if(!o.ok){showErr(o,'Could not verify');return}
+    return ask({title:'Verify '+o.j.name+'?',text:'Display name: '+o.j.name+'. Sign-in email: '+o.j.email+'. They get /'+slug+' as a verified name and a tick, and the display name is locked to this one.',ok:'Verify'}).then(function(ok){
+      if(!ok)return;
+      return api('/admin/reserved',{method:'POST',body:body}).then(function(r){
+        if(!r.ok){showErr(r,'Could not verify');return}
+        $('veraid').value='';$('verslug').value='';
+        msg('Verified '+r.j.name+' on /'+slug,'ok');resLoad()
+      })
+    })
+  }).catch(function(e){netFail(e)})
+}
 function resAdd(){
   var slugs=$('resslug').value.split(',').map(slugFrom).filter(Boolean);
   if(!slugs.length){msg('Enter a slug or link');return}
@@ -2436,6 +2503,15 @@ function strikeAct(slug,x,done){
     return api('/admin/strike',{method:'POST',body:{slug:slug,id:x.id,action:ex?'excuse':'restore',reason:reason}}).then(function(o){if(o.ok){msg(ex?'Strike excused':'Strike counts again');done()}else showErr(o,ex?'Could not excuse the strike':'Could not restore the strike')})
   })
 }
+/* [2026-11-04 18:14 | page-space-balance] Give page space: adds MB to the owner of this page, once for each page. */
+function spaceAct(slug,done){
+  return ask({title:'Give page space?',text:'Adds the space to the owner of /'+slug+' and tells them. This can only be done once for this page.',ok:'Give space',fields:[{label:'Space to give (MB)',ph:'e.g. 5',max:3},REASON_F]}).then(function(v){
+    if(!v)return;var mb=parseInt(String(v[0]||'').trim(),10);
+    if(!(mb>=1)){msg('Enter a whole number of MB');return}
+    var reason=String(v[1]||'').trim();if(!reason){msg('A reason is required');return}
+    return api('/admin/space',{method:'POST',body:{slug:slug,mb:mb,reason:reason}}).then(function(o){if(o.ok){msg(num(mb)+' MB given');done()}else showErr(o,'Could not give the space')})
+  })
+}
 function refAct(slug,aid,restore,done){
   return ask({title:restore?'Count this referral again?':'Void this referral?',text:restore?'It counts toward the referrer ad access again, and any free views taken back are returned. The referrer is told.':'It stops counting toward the referrer ad access, and any free views it gave are taken back. The referrer gets an alert with your reason.',ok:restore?'Restore':'Void',danger:!restore,fields:restore?undefined:[REASON_F]}).then(function(v){
     if(!v)return;var reason='';if(!restore){reason=reasonOf(v);if(!reason)return}
@@ -2513,6 +2589,14 @@ function loadOwner(slug){
       c.appendChild(el('div','sec-t','View ledger'));
       c.appendChild(el('div','fine','Views are bought for a note (straight onto its ad) or added to the balance from Settings ahead of time. Refunds and invite gifts also leave a balance. The owner can put a balance on any of their ads without paying again.'));
       d.ledger.forEach(function(x){var r=el('div','pgrow'),l=el('div');l.appendChild(el('div','slug',(x.delta>0?'+':'')+num(x.delta)+(Math.abs(x.delta)===1?' view':' views')));l.appendChild(el('small',null,({purchase:'Bought',allocate:'Put on ad',refund:'Returned to balance',gift:'Gift for an invite',gift_reversal:'Gift taken back'}[x.reason]||x.reason)+(x.slug?' - /'+x.slug:'')+' - '+ago(x.at)));r.appendChild(l);c.appendChild(r)})
+    }
+    if(d.space&&(d.space.ledger.length||d.space.balanceMb)){
+      c.appendChild(el('div','sec-t','Page space'));
+      c.appendChild(el('div','fine','Page space is bought in packs of 25, 50 or 100 MB, ahead of time or when a page is too big. A page over 5 MB holds 1 MB for every MB over 5 MB, and the space is returned to the balance when the page gets smaller or is unpublished. No page can be over 30 MB. A refund takes a pack back, and if the balance goes below zero the pages that took space most recently are unpublished. If we fail to deliver space someone paid for, Give space adds it to the balance, once for each page.'));
+      var spb=el('div','pgrow'),spl=el('div');spl.appendChild(el('div','slug',num(d.space.balanceMb)+' MB in the balance'));spl.appendChild(el('small',null,num(d.space.heldMb)+' MB held by '+num(d.space.held.length)+(d.space.held.length===1?' page':' pages')));spb.appendChild(spl);c.appendChild(spb);
+      var spt=el('div','tools');spt.appendChild(btn('Give space',null,function(){return spaceAct(slug,function(){loadOwner(slug)})}));c.appendChild(spt); /* [2026-11-04 18:14 | page-space-balance] Give space button */
+      d.space.held.forEach(function(x){var r=el('div','pgrow'),l=el('div');l.appendChild(el('div','slug','/'+x.slug));l.appendChild(el('small',null,num(x.mb)+' MB held'));r.appendChild(l);c.appendChild(r)});
+      d.space.ledger.forEach(function(x){var r=el('div','pgrow'),l=el('div');l.appendChild(el('div','slug',(x.delta>0?'+':'')+num(x.delta)+' MB'));l.appendChild(el('small',null,({purchase:'Bought',hold:'Held by page',release:'Returned to balance',refund:'Refunded, taken back',credit:'Added by us'}[x.reason]||x.reason)+(x.slug?' - /'+x.slug:'')+' - '+ago(x.at)));r.appendChild(l);c.appendChild(r)})
     }
     if(d.alerts&&d.alerts.length){
       c.appendChild(el('div','sec-t','Alerts sent ('+num(d.alertTotal||d.alerts.length)+')'));
@@ -2718,7 +2802,7 @@ function renderAd(a){
 }
 
 /* ---------- Audit ---------- */
-var ACT_LBL={takedown:'Takedown',release:'Release',restore:'Restore',dismiss:'Dismiss',undismiss:'Undismiss',purge:'Purge',ncmec_recorded:'NCMEC recorded',owner_suspend:'Suspend account',owner_unsuspend:'Unsuspend account',owner_delete:'Delete account','owner_cancel-delete':'Cancel deletion','owner_clear-name':'Clear name','owner_clear-picture':'Clear picture',story_remove:'Story removed',story_allow:'Story allowed',strike_excuse:'Strike excused',strike_restore:'Strike reinstated',referral_void:'Referral voided',referral_restore:'Referral restored',ad_pause:'Ad paused',ad_resume:'Ad resumed',ad_takedown:'Ad taken down',ad_refund:'Ad refunded',custom_alert:'Custom alert',legal_update:'Policy update',admin_add:'Admin added',admin_revoke:'Admin revoked',reserve:'Address reserved',unreserve:'Reservation removed'};
+var ACT_LBL={takedown:'Takedown',release:'Release',restore:'Restore',dismiss:'Dismiss',undismiss:'Undismiss',purge:'Purge',ncmec_recorded:'NCMEC recorded',owner_suspend:'Suspend account',owner_unsuspend:'Unsuspend account',owner_delete:'Delete account','owner_cancel-delete':'Cancel deletion','owner_clear-name':'Clear name','owner_clear-picture':'Clear picture',story_remove:'Story removed',story_allow:'Story allowed',strike_excuse:'Strike excused',strike_restore:'Strike reinstated',referral_void:'Referral voided',referral_restore:'Referral restored',ad_pause:'Ad paused',ad_resume:'Ad resumed',ad_takedown:'Ad taken down',ad_refund:'Ad refunded',space_credit:'Page space added',custom_alert:'Custom alert',legal_update:'Policy update',admin_add:'Admin added',admin_revoke:'Admin revoked',reserve:'Address reserved',unreserve:'Reservation removed',verify:'Account verified'};
 function actLbl(a){a=String(a||'');if(ACT_LBL[a])return ACT_LBL[a];a=a.replace(/[_-]+/g,' ').trim();return a.charAt(0).toUpperCase()+a.slice(1)}
 function actTone(a){a=String(a||'');if(/take|purge|suspend|delete|ban|revoke/.test(a)&&!/unsuspend|cancel/.test(a))return'bad';if(/restore|release|unsuspend|cancel|allow|refund|resume/.test(a))return'good';return''}
 var auT=null,auBusy=false;
@@ -4132,6 +4216,8 @@ function lgEdit(kind,d,keep){
 }
 $('lghist').onclick=function(){lgHistory(LG.kind)};
 $('lgprev').onclick=function(){lgLoad().then(function(d){if(d)lgPreview(LG.kind,d)})};
+/* [2026-11-02 21:33 | tech-notes] Technical notes: the same sheet and search as the legal preview. */
+$('tnread').onclick=function(){var b=$('tnread');if(b.getAttribute('aria-disabled')==='true')return;b.setAttribute('aria-disabled','true');api('/admin/technical-notes').then(function(o){b.removeAttribute('aria-disabled');if(!o.ok){showErr(o,'Could not load the technical notes');return}var s=lgSearchFrame(o.j.html);ask({title:'Technical notes',sev:'other',icon:'shield',single:true,ok:'Close',text:'Cut from the public text on '+o.j.cut+'. Not shown in the app.',head:s.head,node:s.node})}).catch(function(e){b.removeAttribute('aria-disabled');netFail(e)})};
 $('lgedit').onclick=function(){lgLoad().then(function(d){if(d)lgEdit(LG.kind,d,null)})};
 lgSel();
 $('alfab').onclick=function(){goTab('alerts')};
@@ -4141,7 +4227,8 @@ alRender();alSync();
 var OV=[
   ['People',[['users','Users'],['usersOnline','Online now'],['guests','Guests'],['usersActive24h','Active 24h'],['usersNew7d','New this week'],['guestsOnline','Guests online']]],
   ['Content',[['notes','Published notes'],['notesNew1d','New today'],['notesNew7d','New this week'],['publishers','Publishers'],['stories','In stories'],['likes','Likes'],['comments','Comments']]],
-  ['Ads and follows',[['adsActive','Active ads'],['adsPaused','Paused ads'],['adViewsUsed','Ad views used'],['adsExhausted','Used up'],['adsUnpublished','Taken down'],['subscriptions','Subscriptions']]]
+  ['Ads and follows',[['adsActive','Active ads'],['adsPaused','Paused ads'],['adViewsUsed','Ad views used'],['adsExhausted','Used up'],['adsUnpublished','Taken down'],['subscriptions','Subscriptions']]],
+  ['Page space',[['pageSpaceBought','MB bought'],['pageSpaceBalance','MB in balances'],['pageSpaceHeld','MB held by pages'],['pageSpacePages','Pages holding space']]]
 ];
 var ovS={view:'users',cur:'',total:0,shown:0,gen:0,loaded:false,fil:'',sort:'new',nsort:'new',q:'',t:null};
 function ovShell(){
@@ -4159,7 +4246,7 @@ function loadOverview(quiet){
   var S=[].slice.call($('ovstats').querySelectorAll('.stat'));
   if(!quiet)S.forEach(function(s){s.classList.add('ld')});
   function fail(){ovS.loaded=false;S.forEach(function(s){s.firstChild.textContent='-';s.classList.remove('ld')})}
-  return api('/admin/stats').then(function(o){
+  return api('/admin/stats?fresh=1').then(function(o){
     if(!o.ok){if(quiet){if(o.s===403)bad(o,'Could not load the overview numbers');else qfail('ov',o);return}fail();bad(o,'Could not load the overview numbers');return}
     var sg=JSON.stringify(o.j);if(quiet&&sg===SIG.ov)return;SIG.ov=sg;
     var st=o.j.stats;
@@ -4616,31 +4703,31 @@ var COC=[
   {h:"Keep it private",key:1,items:[
     ["In public, please never mention email, slug or link.","This covers replies, posts, comments, reviews and chats."],
     ["Use the Author ID.","Describe a note by what happened and when, like the note taken down Monday around 3 pm."],
-    ["Guard what is private.","Never share the admin token or what is inside a note, and tap the lock to sign out when you are done."]
+    ["Guard what is private.","Never share the admin token, an email, a display name or what is inside a note. Tap the lock to sign out when you are done."]
   ],ex:[["ok","Do say","Author ID 7K2F9: the note published on Monday evening was taken down."],["no","Never say","/my-cool-page by jo@mail.com was removed."]]},
   {h:"Be kind",items:[
-    ["Reasons reach the owner exactly as you type them.","Please keep them short, calm and specific, like Spam. No blame or sarcasm."],
+    ["Reasons reach the owner exactly as you type them.","Keep them short, calm and specific, like Spam. No blame or sarcasm."],
     ["Be fair.","The same rules apply to everyone. Look at the page, not the person."],
     ["Protect reporters.","Owners only see the report category, so never say who reported."]
   ]},
   {h:"Use the lightest fix",items:[
-    ["Look first.","Please read the whole snapshot before you act."],
-    ["Match the fix to the problem.","If a report is wrong, dismiss it. If only one part is a problem, fix just that part: remove the story, clear the profile name or pause the ad."],
-    ["Release helps an owner who is stuck.","If an owner cannot edit or unpublish, Release takes the page offline and frees the slug so they can publish again. It is not a penalty and needs no reason. The owner gets a short alert, unused ad views are refunded, and likes, story and ad are removed."],
+    ["Look first.","Read the whole snapshot before you act."],
+    ["Match the fix to the problem.","If a report is wrong, dismiss it. If only one part is a problem, fix just that part, like the story, the profile name or the ad."],
+    ["Release helps an owner who is stuck.","It takes the page offline and frees the slug so they can publish again. It is not a penalty and needs no reason."],
     ["Take down is for real violations.","It locks the slug for good. Suspend an account only as a last resort."]
   ]},
   {h:"Child safety comes first",items:[
     ["Open child safety reports first.","They are marked in red."],
-    ["Please do not dismiss until the page is handled and NCMEC is notified.","Then save the report with Record NCMEC report."],
+    ["Do not dismiss until the page is handled and NCMEC is notified.","Then save it with Record NCMEC report."],
     ["Never delete, copy, screenshot or share.","These pages are kept for 18 months. Keep the image switches in Tools off unless you truly need them."],
-    ["Restore only when you are sure the report was a mistake.",""]
+    ["Restore only when you are sure it was a mistake.",""]
   ]},
   {h:"Take care",items:[
     ["Everything you do is saved in Audit.","That keeps all of us trustworthy."],
-    ["Custom alerts carry approved messages only.","Send the wording exactly as approved. If you are not sure, please check with another admin first."],
-    ["Terms and policy changes need approval first.","Please make only approved changes, and use the wording exactly as approved. Not sure if something is approved? A quick check with another admin keeps us all on the same page."],
-    ["Send to the intended audience.","Before you tap Send alert, check the audience and recipient count so it reaches just the people it was meant for."],
-    ["Reserve addresses with care.","Hold one only for a clear reason, like protecting an official name, and add a short note so the team knows why. The same rules apply to everyone, so please never hold one for a friend. Remove the reservation once it is no longer needed."],
+    ["Send only approved words.","This covers custom alerts and Terms or policy changes. Use the wording exactly as approved, and ask another admin if you are not sure."],
+    ["Check before you send.","Before you tap Send alert, look at the audience and the recipient count."],
+    ["Reserve names with care.","Hold one only for a clear reason, like protecting an official name, and add a short note. Never hold one for a friend, and remove it when it is no longer needed."],
+    ["Verify with care.","Check the display name and email in the box before you tap Verify. It gives a tick and locks that display name. Never verify a friend. To undo it, use Remove reservation in Lookup."],
     ["Slow down for permanent actions.","Take down all and Run purge cannot be undone, and purge already runs every night."],
     ["Ads:","pause first, and take down only if it keeps breaking the rules. Unused views can be refunded."],
     ["Not sure? Wait and ask another admin.","Slipped up? Restore it and tell the team. Honest mistakes are fine."]
@@ -4699,6 +4786,7 @@ $('ext').onchange=function(){
 };
 $('resgo').onclick=function(){return resAdd()};
 $('resinv').onclick=function(){return resInvite()};
+$('vergo').onclick=function(){return verGo()};
 $('resslug').onkeydown=function(e){if(e.key==='Enter'&&!e.isComposing)resAdd()};
 $('admadd').onclick=function(){admAdd()};
 $('purgego').onclick=function(){
