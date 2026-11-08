@@ -1129,6 +1129,7 @@ async function requireSessionInfo(env, request) {
   let session;
   try { session = JSON.parse(raw); } catch (e) { return null; }
   if (!session || !session.sub || session.expiresAt < Date.now()) return null;
+  if (session.sub === REVIEW_SUB && !reviewCodeOn(env)) return null; // [2026-11-07 22:14 | review-access] test account sessions end when the code is removed
   if (!session.idx) {
     // Pre-index session: can't be found by account, so ask the account instead.
     const user = await getUser(env, session.sub);
@@ -1180,6 +1181,57 @@ async function handleGoogleAuth(env, request) {
   await alertInvitedNames(env, identity.sub, user);
   return json({ sessionToken, sub: identity.sub, email: identity.email, authorId: await authorIdFor(env, identity.sub), deletionCancelled, mlOptOut: typeof user.mlOptOut === 'boolean' ? user.mlOptOut : null, storyAvatar: storyAvatarOf(user), commentAs: commentAsOf(user) });
 }
+
+// [2026-11-07 22:14 | review-access] Test account for Google Play's app review. A reviewer types the review code in the invite code box on the sign-in screen; the button then says it signs in to a test account, and POST /auth/review gives a session for one fixed account (REVIEW_SUB) the same way /auth/google does, with page space and ad views topped up so every part can be tried. The code lives only in the Worker (the constant REVIEW_ACCESS_CODE below, 8 or more letters and digits, 12 at most because the box takes 12; never in the app). Set the constant to '' and deploy, or set the Worker variable REVIEW_ACCESS_CODE to empty (Cloudflare > Workers > Settings > Variables), and the feature is off: both routes refuse, and any session the test account already has stops working. Wrong guesses are rate limited per IP and fail closed.
+// [2026-11-07 23:23 | review-access] changed: the review code is the constant below. To turn the test account off set it to '' and deploy; a Worker variable REVIEW_ACCESS_CODE overrides it (a different code, or empty to switch it off at once without a deploy).
+const REVIEW_ACCESS_CODE = 'BLUEBOOK';
+const REVIEW_SUB = 'review-account';
+const REVIEW_EMAIL = 'test-account@my-site.name';
+function reviewCodeOn(env) { const v = env && env.REVIEW_ACCESS_CODE; const c = String(v === undefined || v === null ? REVIEW_ACCESS_CODE : v).trim(); return c.length >= 8 ? c : ''; }
+async function reviewCodeMatches(env, given) {
+  const want = reviewCodeOn(env);
+  if (!want || typeof given !== 'string' || !given.trim()) return false;
+  const a = await sha256Hex(want.toUpperCase()), b = await sha256Hex(given.trim().toUpperCase());
+  let d = a.length ^ b.length;
+  for (let i = 0; i < a.length && i < b.length; i++) d |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return d === 0;
+}
+// Tops the test account up to a fixed amount of page space and ad views each sign-in (never more than the target), so a reviewer can publish and run an ad without buying anything.
+async function reviewTopUp(env) {
+  const now = Date.now();
+  await ensurePageSizeCredits(env);
+  const space = await pageSpaceBalanceMb(env, REVIEW_SUB);
+  if (space < 10) await env.ADS_DB.prepare("INSERT OR IGNORE INTO page_space_ledger (owner_sub, delta, reason, slug, rc_event_id, created_at) VALUES (?, ?, 'review', NULL, ?, ?)").bind(REVIEW_SUB, 20 - space, 'review:space:' + now, now).run();
+  const views = await getCreditBalance(env, REVIEW_SUB);
+  if (views < 1000) await env.ADS_DB.prepare('INSERT OR IGNORE INTO view_credits_ledger (owner_sub, delta, reason, rc_event_id, created_at) VALUES (?, ?, ?, ?, ?)').bind(REVIEW_SUB, 5000 - views, 'review', 'review:views:' + now, now).run();
+}
+// POST /auth/review/check {code} -> {ok}: lets the sign-in screen change its button text. Says nothing else.
+async function handleReviewCheck(env, request) {
+  let body; try { body = await request.json(); } catch (e) { return textError(400, 'invalid JSON body'); }
+  const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
+  if (!(await rlHit(env, 'ratelimit:reviewcheck:' + ip, 20, 600, false)).ok) return textError(429, 'slow down');
+  return json({ ok: await reviewCodeMatches(env, body && body.code) });
+}
+// POST /auth/review {code}: same answer as /auth/google, for the test account, plus reviewer: true.
+async function handleReviewSignIn(env, request) {
+  let body; try { body = await request.json(); } catch (e) { return textError(400, 'invalid JSON body'); }
+  const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
+  if (!(await rlHit(env, 'ratelimit:reviewsignin:' + ip, 10, 600, false)).ok) return textError(429, 'slow down');
+  if (!(await reviewCodeMatches(env, body && body.code))) return textError(401, 'invalid test account code');
+  let user = await getUser(env, REVIEW_SUB);
+  if (user && user.suspended) return textError(403, 'this account is suspended');
+  const now = Date.now();
+  if (!user) user = { sub: REVIEW_SUB, email: REVIEW_EMAIL, createdAt: now };
+  delete user.pendingDeletionAt;
+  user.email = REVIEW_EMAIL; user.lastSignInAt = now; user.emailVerified = false; user.reviewAccess = true;
+  await putUser(env, REVIEW_SUB, user);
+  try { await reviewTopUp(env); } catch (e) { console.log('review top-up failed: ' + (e && e.message)); }
+  const sessionToken = await createSession(env, REVIEW_SUB);
+  await presenceSwitch(env, presenceDeviceId(body), REVIEW_SUB, true);
+  try { await referralCodeFor(env, REVIEW_SUB); } catch (e) { console.log('invite code failed: ' + (e && e.message)); }
+  return json({ sessionToken, sub: REVIEW_SUB, email: REVIEW_EMAIL, authorId: await authorIdFor(env, REVIEW_SUB), deletionCancelled: false, mlOptOut: typeof user.mlOptOut === 'boolean' ? user.mlOptOut : null, storyAvatar: storyAvatarOf(user), commentAs: commentAsOf(user), reviewer: true });
+}
+
 
 // Sign-out is mostly a client-side concern (drop the stored token), but
 // invalidating it here too means a token that already leaked (e.g. left
@@ -14941,7 +14993,8 @@ const LEGAL_PAGE_SCRIPT = "(function(){var f=document.querySelector('.fabs'),t=d
 const LEGAL_PAGE_HEADERS = { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'public, max-age=300', 'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'strict-origin-when-cross-origin', 'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src data:; script-src 'sha256-b9oV+gkxM1lUue6++yz3qOnHCRDpMezXzyfA34xgSTU='; base-uri 'none'; form-action 'none'" };
 const LEGAL_PAGE_CSS = ":root{\n  --blue:#3366cc; --bg:#ffffff; --ink:#14214a; --soft:#56648d; --line:#dbe3f4; --tint:#eef3fd; --link:#3366cc;\n  --font:'Inter',system-ui,-apple-system,'Segoe UI',Roboto,'Helvetica Neue',sans-serif;\n  color-scheme:light; box-sizing:border-box;\n  padding-top:env(safe-area-inset-top,0px); padding-bottom:env(safe-area-inset-bottom,0px);\n}\n@media (prefers-color-scheme:dark){\n  :root{--bg:#0c1224; --ink:#e8edfb; --soft:#9aa8cf; --line:#2a3865; --tint:#18224a; --link:#8fb0ff; color-scheme:dark}\n}\nhtml{height:100%;scroll-padding-top:calc(1rem + env(safe-area-inset-top,0px));scroll-behavior:smooth;-webkit-tap-highlight-color:transparent}\n*,*::before,*::after{box-sizing:inherit}\nbody{margin:0;background:var(--bg);color:var(--ink);font:400 1rem/1.65 var(--font)}\n.hero{background:var(--blue);color:#fff;text-align:center;padding:calc(2.4rem + env(safe-area-inset-top,0px)) 1.5rem 2.8rem;margin-top:calc(-1 * env(safe-area-inset-top,0px))}\n.hero a{color:inherit;text-decoration:none;display:inline-block}\n.logo{width:clamp(4rem,18vw,5rem);height:auto}\n.hero h1{margin:.8rem 0 0;font-weight:800;letter-spacing:-.03em;font-size:clamp(2.2rem,10vw,3.4rem);line-height:1}\n.hero p{margin:.7rem auto 0;max-width:28rem;font-size:1.05rem;font-weight:600;opacity:.92}\n.jump{list-style:none;margin:1.6rem 0 0;padding:0 1.5rem;display:flex;flex-wrap:wrap;justify-content:center;gap:.5rem}\n.jump a{display:block;background:var(--tint);border:1px solid var(--line);border-radius:999px;padding:.35rem .85rem;font-weight:600;font-size:.95rem;color:var(--ink);text-decoration:none}\n.jump a:active{opacity:.7}\n.doc{max-width:46rem;margin:0 auto;padding:3rem 1.5rem 0}\n.doc+.doc{margin-top:3rem;border-top:1px solid var(--line)}\n.doc h2.part{margin:0 0 .4rem;font-size:clamp(1.7rem,6.5vw,2.3rem);font-weight:800;letter-spacing:-.03em;line-height:1.15;text-wrap:balance}\n.doc h3{margin:1.9rem 0 .2rem;font-size:1.1rem;font-weight:800;letter-spacing:-.01em;line-height:1.3}\n.doc p{margin:.6rem 0}\n.doc p em{color:var(--soft);font-style:normal;font-weight:600}\n.doc ul,.doc ol{margin:.6rem 0;padding-left:1.3rem}\n.doc li{margin:.3rem 0}\n.doc a{color:var(--link);text-underline-offset:.15em}\n.doc strong{font-weight:800}\n.close{margin-top:4.5rem;background:var(--blue);color:#fff;text-align:center;padding:2.8rem 1.5rem calc(5.5rem + env(safe-area-inset-bottom,0px))}\n.close nav{display:flex;flex-wrap:wrap;justify-content:center;gap:.4rem 1.2rem;font-weight:600}\n.close a{color:inherit;text-decoration:underline;text-underline-offset:.15em}\n.close small{display:block;margin-top:1.6rem;opacity:.7;font-size:.85rem}\n.fabs{position:fixed;right:calc(1rem + env(safe-area-inset-right,0px));bottom:calc(1rem + env(safe-area-inset-bottom,0px));transform-origin:calc(100% + 1rem + env(safe-area-inset-right,0px)) calc(100% + 1rem + env(safe-area-inset-bottom,0px));transform:translate(var(--zx,0px),var(--zy,0px)) scale(var(--zs,1));z-index:10;display:inline-flex;align-items:stretch;background:#fff;color:var(--blue);border-radius:999px;overflow:hidden;box-shadow:0 .5rem 1.2rem rgba(10,20,60,.3)}\n.fabs a{display:inline-flex;align-items:center;gap:.5rem;color:inherit;text-decoration:none;font-weight:800;font-size:.95rem;line-height:1.15}\n.fabs a:active{background:var(--tint)}\n.fabs a:focus-visible{outline:2px solid var(--blue);outline-offset:-4px}\n#up{padding:.9rem .85rem .9rem 1.1rem;border-right:1px solid var(--line)}\n#up[hidden]{display:none}\n#jump{padding:.9rem 1.2rem}\n.fabs svg{width:1.1rem;height:1.1rem;flex:none}\n@media (prefers-reduced-motion:reduce){html{scroll-behavior:auto}}\n";
 const LEGAL_PAGE_LOGO = "<svg class=\"logo\" viewBox=\"0 0 90 105\" fill=\"none\" aria-hidden=\"true\"><defs><clipPath id=\"front\"><polygon points=\"90,90 90,38 38,90\"/></clipPath></defs><g stroke=\"#fff\" stroke-width=\"13\" fill=\"none\"><rect x=\"30\" y=\"48.5\" width=\"54\" height=\"27\" rx=\"6\" transform=\"rotate(55 57 62)\"/><rect x=\"6\" y=\"28.5\" width=\"54\" height=\"27\" rx=\"6\" transform=\"rotate(55 33 42)\"/><rect x=\"30\" y=\"48.5\" width=\"54\" height=\"27\" rx=\"6\" transform=\"rotate(55 57 62)\" clip-path=\"url(#front)\"/></g></svg>";
-const LEGAL_PAGE_DELETE = "<h2 class=\"part\">Delete Your Account</h2>\n<p>You can delete your Bluebook account at any time. You can do it in the app, or ask us to do it if you don't have the app any more.</p>\n<h3>In the app</h3>\n<p>Open Bluebook, tap the account icon, choose Show more, then tap Delete account. That signs this device out and starts the deletion.</p>\n<h3>If you don't have the app</h3>\n<p>Email us at <a href=\"mailto:essentialsoftware.support@gmail.com\">essentialsoftware.support@gmail.com</a> from the email address of the Google account you signed in with, and say you want your account deleted. We may ask you a question to check it's you. Then we'll start the deletion for you.</p>\n<h3>What happens next</h3>\n<p>Your account is deleted 30 days after you ask. It can take up to a day longer. If you deleted it in the app and change your mind in that time, sign back in with the same Google account and the deletion is cancelled. If you asked us by email, write to us at the same address. Until the 30 days are up, your published pages and stories stay online.</p>\n<p>When it happens, we permanently delete your account and your backup (your synced notes, images, voice notes and playlists), your display name and profile picture, your ads and their statistics, your page space and ad view balances, your invites, your alerts and your team memberships. We also take down every page you published.</p>\n<h3>What we keep</h3>\n<p>In team chats, your text messages stay for the team, with your name taken off. We keep a copy of each page you published for about 30 more days, in case of an abuse report or takedown request. We also keep a simple daily record of which days an account was active, with no name, email or content, for about 26 months. Google and RevenueCat hold your purchase records, and their own policies cover that. The <a href=\"#privacy\">Privacy Policy</a> has the full list.</p>";
+// [2026-11-07 18:57 | legal-page] changed: Delete Your Account now has a Delete some of your data part (what people can remove in the app, and how to ask for the rest by email), for the Play Data safety link Manage app data.
+const LEGAL_PAGE_DELETE = "<h2 class=\"part\">Delete Your Account</h2>\n<p>You can delete your Bluebook account at any time. You can do it in the app, or ask us to do it if you don't have the app any more. You can also delete only some of your data, further down.</p>\n<h3>In the app</h3>\n<p>Open Bluebook, tap the account icon, choose Show more, then tap Delete account. That signs this device out and starts the deletion.</p>\n<h3>If you don't have the app</h3>\n<p>Email us at <a href=\"mailto:essentialsoftware.support@gmail.com\">essentialsoftware.support@gmail.com</a> from the email address of the Google account you signed in with, and say you want your account deleted. We may ask you a question to check it's you. Then we'll start the deletion for you.</p>\n<h3>What happens next</h3>\n<p>Your account is deleted 30 days after you ask. It can take up to a day longer. If you deleted it in the app and change your mind in that time, sign back in with the same Google account and the deletion is cancelled. If you asked us by email, write to us at the same address. Until the 30 days are up, your published pages and stories stay online.</p>\n<p>When it happens, we permanently delete your account and your backup (your synced notes, images, voice notes and playlists), your display name and profile picture, your ads and their statistics, your page space and ad view balances, your invites, your alerts and your team memberships. We also take down every page you published.</p>\n<h3>What we keep</h3>\n<p>In team chats, your text messages stay for the team, with your name taken off. We keep a copy of each page you published for about 30 more days, in case of an abuse report or takedown request. We also keep a simple daily record of which days an account was active, with no name, email or content, for about 26 months. Google and RevenueCat hold your purchase records, and their own policies cover that. The <a href=\"#privacy\">Privacy Policy</a> has the full list.</p>\n<h3>Delete some of your data</h3>\n<p>You don't have to delete your whole account to remove some of your data. In the app you can unpublish a page or a story, delete your own comments, take back your likes and subscriptions, remove an ad, and remove an editor from a page you share. Unpublishing takes the page off its public link.</p>\n<p>For anything else, such as your activity history, purchase records, images or voice notes, email us at <a href=\"mailto:essentialsoftware.support@gmail.com\">essentialsoftware.support@gmail.com</a> from the email address of the Google account you signed in with. Tell us what you want removed and we'll reply to you. We may need to keep a few records, such as the daily record of which days an account was active, where we need them to keep the service safe or to follow the law.</p>";
 function legalPageHtml(privacy, terms) {
   return '<!DOCTYPE html>\n<html lang="en">\n<head>\n<meta charset="utf-8">\n<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">\n<meta name="theme-color" content="#3366cc">\n'
     + '<meta name="description" content="Bluebook Privacy Policy, Consumer Terms and how to delete your account.">\n<title>Privacy &amp; Terms | Bluebook</title>\n'
@@ -15051,6 +15104,8 @@ export default {
       if (method === 'POST' && pathname === '/auth/google') {
         return handleGoogleAuth(env, request);
       }
+      if (method === 'POST' && pathname === '/auth/review/check') return handleReviewCheck(env, request); // [2026-11-07 22:14 | review-access]
+      if (method === 'POST' && pathname === '/auth/review') return handleReviewSignIn(env, request); // [2026-11-07 22:14 | review-access]
       if (method === 'POST' && pathname === '/auth/signout') {
         return handleSignOut(env, request);
       }
