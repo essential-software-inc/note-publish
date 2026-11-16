@@ -4454,15 +4454,17 @@ async function handleLike(env, request, slug) {
   const meta = await getMeta(env, slug);
   if (!meta || meta.deletedAt || meta.adminLocked) return textError(404, 'note isn\u2019t available');
   if (meta.ownerSub && meta.ownerSub === sub) return textError(400, 'can\u2019t like your own note');
-  const t = actionTime(request);
+  const t = actionTime(request), likedAt = Date.now();
   const likeRes = await env.ADS_DB.batch([
     clockUpsert(env, sub, 'like', slug, t),
     env.ADS_DB.prepare('INSERT OR IGNORE INTO likes (liker_sub, slug, author_sub, created_at) SELECT ?, ?, ?, ? WHERE ' + CLOCK_IS)
-      .bind(sub, slug, meta.ownerSub || '', Date.now(), sub, 'like', slug, t)
+      .bind(sub, slug, meta.ownerSub || '', likedAt, sub, 'like', slug, t)
   ]);
   if (meta.ownerSub && likeRes[1] && likeRes[1].meta && likeRes[1].meta.changes > 0) {
-    // One alert per note per half hour, so a run of likes (or like/unlike/like) can't flood the owner's list.
-    await createAlert(env, meta.ownerSub, 'like', 'Someone liked ' + alertNoteName(meta, slug), { ref: 'l:' + slug, dedupeMs: 30 * 60 * 1000 });
+    // Likes within a window fold into one alert ("3 people liked ...") so a run of likes can't flood the owner's list.
+    await ensureLikesAlertIndex(env);
+    await createMergedAlert(env, meta.ownerSub, 'like', 'l:' + slug, likedAt, 'SELECT COUNT(*) AS n FROM likes WHERE slug = ? AND created_at >= ?', [slug],
+      (n) => (n === 1 ? 'Someone' : n + ' people') + ' liked ' + alertNoteName(meta, slug));
   }
   const row = await env.ADS_DB.prepare('SELECT 1 AS x FROM likes WHERE liker_sub = ? AND slug = ?').bind(sub, slug).first();
   if (row) {
@@ -4761,10 +4763,12 @@ async function handleCommentLike(env, request, id, want) {
   if (!row) return textError(404, 'that comment is gone');
   if (want) {
     if (row.author_sub === sub) return textError(400, 'can\u2019t like your own comment');
-    const r = await env.ADS_DB.prepare('INSERT OR IGNORE INTO comment_likes (comment_id, liker_sub, created_at) VALUES (?, ?, ?)').bind(id, sub, Date.now()).run();
+    const likedAt = Date.now();
+    const r = await env.ADS_DB.prepare('INSERT OR IGNORE INTO comment_likes (comment_id, liker_sub, created_at) VALUES (?, ?, ?)').bind(id, sub, likedAt).run();
     if (r && r.meta && r.meta.changes > 0) {
       const meta = await getMeta(env, row.slug);
-      await createAlert(env, row.author_sub, 'comment_like', 'Someone liked your comment on ' + alertNoteName(meta, row.slug), { ref: 'c:' + row.slug + ':' + id, dedupeMs: 60 * 60 * 1000 });
+      await createMergedAlert(env, row.author_sub, 'comment_like', 'c:' + row.slug + ':' + id, likedAt, 'SELECT COUNT(*) AS n FROM comment_likes WHERE comment_id = ? AND created_at >= ?', [id],
+        (n) => (n === 1 ? 'Someone' : n + ' people') + ' liked your comment on ' + alertNoteName(meta, row.slug));
     }
   } else {
     await env.ADS_DB.prepare('DELETE FROM comment_likes WHERE comment_id = ? AND liker_sub = ?').bind(id, sub).run();
@@ -5813,7 +5817,11 @@ async function handleReport(env, request, slug, ctx) {
   }
 
   // Tell the page's owner (anonymous pages have no account to tell).
-  await createAlert(env, reportedMeta.ownerSub, 'report', reportAlertText(reportedMeta, slug, reason), { ref: slug + ':' + reason, dedupeMs: ALERT_REPORT_DEDUPE_MS });
+  // Repeat reports of the same note for the same reason fold into one alert ("was reported 3 times"), counted from the report records since the
+  // group started (a day), instead of dropping the repeats. It moves to the top and is unread again with each one. Not tappable, same as before.
+  await createMergedAlert(env, reportedMeta.ownerSub, 'report', slug + ':' + reason, record.reportedAt,
+    'SELECT COUNT(*) AS n FROM report_index WHERE slug = ? AND reason IS ? AND reported_at >= ?', [slug, reason || null],
+    (n) => reportAlertText(reportedMeta, slug, reason, n), null, ALERT_REPORT_DEDUPE_MS);
 
   if (env.REPORT_WEBHOOK_URL) {
     // Off the reporter's critical path: the response doesn't wait on Slack.
@@ -7101,14 +7109,64 @@ function ensureAlerts(env) {
       // excused_at: set when an admin excuses a strike (e.g. a wrongful takedown). An excused strike stays on the record
       // but no longer counts toward the ad hold. SQLite has no ADD COLUMN IF NOT EXISTS, so a duplicate-column error is expected after the first run.
       await addColumnOnce(env, 'ALTER TABLE alerts ADD COLUMN excused_at INTEGER');
+      // merge_from: for alerts that fold repeats into one ("3 people liked..."), when that group started. NULL = never merges.
+      await addColumnOnce(env, 'ALTER TABLE alerts ADD COLUMN merge_from INTEGER');
+      // merge_key: what a group is matched on when that is finer than the tap ref (one text box among several on a page). NULL = the ref itself.
+      await addColumnOnce(env, 'ALTER TABLE alerts ADD COLUMN merge_key TEXT');
     })().catch((e) => { alertsReady = null; throw e; });
   }
   return alertsReady;
 }
+// Alerts that fold repeats into one: "Someone liked X" becomes "3 people liked X". Only for kinds whose ref is the same tap destination for every
+// repeat (a note's like alerts, one comment's like alerts), so tapping still goes to the right place. A group is fixed-length: it starts at the
+// first like and takes the rest for ALERT_MERGE_MS, then the next like starts a new alert. The count comes from the real like rows since the group
+// started (not a running tally), so like/unlike/like is one person. Each merge moves the alert to the top of the list and makes it unread again (created_at).
+const ALERT_MERGE_MS = 6 * 60 * 60 * 1000;
+// One retry after a short pause, for a brief database hiccup. The attempt is safe to repeat: the plain alert keeps one id across both tries (a repeat of
+// an insert that did land hits the primary key, which counts as done), and a merged alert re-finds its own group and recounts.
+async function alertAttempt(fn) {
+  try { return await fn(); }
+  catch (e) {
+    await new Promise((r) => setTimeout(r, 200));
+    try { return await fn(); }
+    catch (e2) { if (/UNIQUE/i.test(String(e2 && e2.message))) return; throw e2; }
+  }
+}
+let likesAlertIdxReady = null;
+function ensureLikesAlertIndex(env) {
+  if (!likesAlertIdxReady) likesAlertIdxReady = env.ADS_DB.prepare('CREATE INDEX IF NOT EXISTS likes_slug_created ON likes (slug, created_at)').run().catch(() => { likesAlertIdxReady = null; });
+  return likesAlertIdxReady;
+}
+// countSql counts the rows with its LAST parameter being the group start (created_at >= ?); countBind is everything before it.
+async function createMergedAlert(env, sub, kind, ref, since, countSql, countBind, textFor, key, windowMs) {
+  if (!sub) return;
+  const newId = crypto.randomUUID();
+  try {
+    await alertAttempt(async () => {
+    await ensureAlerts(env);
+    const now = Date.now(), gk = key || ref;
+    const ex = await env.ADS_DB.prepare('SELECT id, merge_from FROM alerts WHERE sub = ? AND kind = ? AND COALESCE(merge_key, ref) = ? AND dismissed_at IS NULL AND merge_from > ? ORDER BY merge_from DESC LIMIT 1')
+      .bind(sub, kind, gk, now - (windowMs || ALERT_MERGE_MS)).first();
+    const textAt = async (start) => {
+      const c = await env.ADS_DB.prepare(countSql).bind(...countBind, start).first();
+      return String(textFor(Math.max(1, c && typeof c.n === 'number' ? c.n : 1))).slice(0, ALERT_MAX_LEN);
+    };
+    if (ex) {
+      const u = await env.ADS_DB.prepare('UPDATE alerts SET message = ?, created_at = ? WHERE id = ? AND dismissed_at IS NULL').bind(await textAt(ex.merge_from), now, ex.id).run();
+      if (u && u.meta && u.meta.changes > 0) return;
+      // dismissed a moment ago: fall through and start a new group
+    }
+    await env.ADS_DB.prepare('INSERT INTO alerts (id, sub, kind, message, ref, created_at, merge_from, merge_key) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+      .bind(newId, sub, kind, await textAt(since), ref, now, since, key || null).run();
+    });
+  } catch (e) { console.log('merged alert failed: ' + (e && e.message)); }
+}
 // Best-effort: an alert failing to save must never fail the action that caused it.
 async function createAlert(env, sub, kind, message, opts) {
   if (!sub) return;
+  const newId = crypto.randomUUID();
   try {
+    await alertAttempt(async () => {
     await ensureAlerts(env);
     const now = Date.now();
     const ref = (opts && opts.ref) || null;
@@ -7118,7 +7176,8 @@ async function createAlert(env, sub, kind, message, opts) {
       if (dup) return;
     }
     await env.ADS_DB.prepare('INSERT INTO alerts (id, sub, kind, message, ref, created_at) VALUES (?, ?, ?, ?, ?, ?)')
-      .bind(crypto.randomUUID(), sub, kind, String(message).slice(0, ALERT_MAX_LEN), ref, now).run();
+      .bind(newId, sub, kind, String(message).slice(0, ALERT_MAX_LEN), ref, now).run();
+    });
   } catch (e) { console.log('alert failed: ' + (e && e.message)); }
 }
 function alertNoteName(meta, slug) {
@@ -7131,8 +7190,8 @@ function alertNoteName(meta, slug) {
 const ALERT_REPORT_REASONS = { spam: 'Spam', copyright: 'Copyright', abuse: 'Abuse', csam: 'Child safety concerns', other: 'Other' };
 function alertReason(text) { return 'Reason: ' + String(text).trim().replace(/[.\s]+$/, '') + '.'; }
 function adminReasonOf(body) { return typeof (body && body.reason) === 'string' ? body.reason.trim().slice(0, 200) : ''; }
-function reportAlertText(meta, slug, reason) {
-  return 'Your note ' + alertNoteName(meta, slug) + ' was reported. ' + alertReason(ALERT_REPORT_REASONS[reason] || 'Other') + ' ' + ALERT_SUSPENSION_NOTE;
+function reportAlertText(meta, slug, reason, n) {
+  return 'Your note ' + alertNoteName(meta, slug) + (n > 1 ? ' was reported ' + n + ' times. ' : ' was reported. ') + alertReason(ALERT_REPORT_REASONS[reason] || 'Other') + ' ' + ALERT_SUSPENSION_NOTE;
 }
 async function pruneAlerts(env) {
   try {
@@ -14298,6 +14357,11 @@ function ensureTextboxes(env) {
       // full_at: set while the box is at its message cap, so the page-load check can say 'full' without counting 5,000 rows. SQLite has no
       // ADD COLUMN IF NOT EXISTS, so a duplicate-column error is expected after the first run.
       .then(() => addColumnOnce(env, 'ALTER TABLE textbox_defs ADD COLUMN full_at INTEGER'))
+      // msg_count: how many messages the box holds, kept in step on send (+1), delete (-1) and clear (0), so a send reads one row instead of counting
+      // up to 5,000. NULL means "not counted yet" (boxes from before the counter): the first send or owner look counts once and stores it.
+      // counted_at: when it was last recounted from the real rows; the nightly clean-up recounts the stalest few (see pruneTextboxes) so drift corrects itself.
+      .then(() => addColumnOnce(env, 'ALTER TABLE textbox_defs ADD COLUMN msg_count INTEGER'))
+      .then(() => addColumnOnce(env, 'ALTER TABLE textbox_defs ADD COLUMN counted_at INTEGER'))
       // sender_*: only filled when a signed-in visitor chose "Send as me". sender_id is the opaque author id (never the account itself), sender_name the
       // display name at the time, sender_pic whether they had a profile picture. They follow the account's name changes; going Anonymous or clearing the name hides them (the id stays), and they are unlinked for good when the account is deleted.
       .then(() => addColumnOnce(env, 'ALTER TABLE textbox_msgs ADD COLUMN sender_id TEXT'))
@@ -14401,6 +14465,10 @@ async function pruneTextboxes(env) {
         env.ADS_DB.prepare('DELETE FROM textbox_defs WHERE slug = ? AND box_id = ?').bind(r.slug, r.box_id)
       ]);
     }
+    // Drift check: recount the 25 boxes recounted longest ago from their real rows (never-counted first), so a counter that missed a path corrects itself.
+    // Bounded on purpose: a few boxes a night, not every message every night.
+    const { results: stale } = await env.ADS_DB.prepare('SELECT slug, box_id FROM textbox_defs WHERE deleted_at IS NULL ORDER BY COALESCE(counted_at, 0), slug, box_id LIMIT 25').all();
+    for (const r of (stale || [])) { try { await textboxRecount(env, r.slug, r.box_id); } catch (e) { /* next night */ } }
     return (results || []).length;
   } catch (e) { /* housekeeping only; swallow */ }
   return 0;
@@ -14415,13 +14483,26 @@ async function healTextboxes(env, slug) {
 }
 async function loadTextboxDef(env, slug, boxId) {
   await ensureTextboxes(env);
-  const q = () => env.ADS_DB.prepare('SELECT cfg, closed_at, deleted_at, full_at FROM textbox_defs WHERE slug = ? AND box_id = ?').bind(slug, boxId).first();
+  const q = () => env.ADS_DB.prepare('SELECT cfg, closed_at, deleted_at, full_at, msg_count FROM textbox_defs WHERE slug = ? AND box_id = ?').bind(slug, boxId).first();
   let row = await q();
   if (!row || row.deleted_at) { await healTextboxes(env, slug); row = await q(); }
   if (!row || row.deleted_at) return null;
   let cfg;
   try { cfg = JSON.parse(row.cfg); } catch (e) { return null; }
-  return { cfg, closedAt: row.closed_at || 0, fullAt: row.full_at || 0 };
+  return { cfg, closedAt: row.closed_at || 0, fullAt: row.full_at || 0, msgCount: typeof row.msg_count === 'number' ? row.msg_count : null };
+}
+// Counts a box's real rows once, stores the number, keeps the 'full' flag in line with it, and returns it. Used for boxes with no counter yet
+// and by the nightly clean-up to correct drift.
+async function textboxRecount(env, slug, box) {
+  const now = Date.now();
+  const rs = await env.ADS_DB.batch([ // one transaction: the count and the read-back see the same rows
+    env.ADS_DB.prepare('UPDATE textbox_defs SET msg_count = (SELECT COUNT(*) FROM textbox_msgs WHERE slug = ?1 AND box_id = ?2), counted_at = ?3 WHERE slug = ?1 AND box_id = ?2').bind(slug, box, now),
+    env.ADS_DB.prepare('SELECT msg_count AS n FROM textbox_defs WHERE slug = ? AND box_id = ?').bind(slug, box)
+  ]);
+  const row = rs[1] && rs[1].results && rs[1].results[0];
+  const n = row && typeof row.n === 'number' ? row.n : 0;
+  await env.ADS_DB.prepare('UPDATE textbox_defs SET full_at = CASE WHEN ?1 >= ?2 THEN COALESCE(full_at, ?3) ELSE NULL END WHERE slug = ?4 AND box_id = ?5').bind(n, TB_MAX_MSGS, now, slug, box).run();
+  return n;
 }
 function textboxClosed(def, now) { return !!def.closedAt || (def.cfg.close > 0 && def.cfg.close <= now); }
 // Marks a box as at its cap (on) or open again (off). Only a hint for the page-load check; the send path always counts for real.
@@ -14529,18 +14610,31 @@ async function handleTextboxSend(env, request) {
   }
   if (asSub) { const limited = await accountRateLimitResponse(env, asSub, 'textbox'); if (limited) return limited; }
   await ensureTextboxes(env);
-  const cnt = await env.ADS_DB.prepare('SELECT COUNT(*) AS n FROM textbox_msgs WHERE slug = ? AND box_id = ?').bind(slug, box).first();
-  const had = cnt ? cnt.n : 0;
+  const had0 = typeof def.msgCount === 'number' ? def.msgCount : await textboxRecount(env, slug, box); // the stored counter: no scan on a normal send
   const where = tbWhere(def, meta, slug);
-  if (had >= TB_MAX_MSGS) {
+  const fullReply = async () => {
     // Full: the visitor is told, the author is told that someone was turned away (once a day per box), and the page-load check starts saying 'full'.
     if (!def.fullAt) await textboxSetFull(env, slug, box, true);
     await createAlert(env, meta.ownerSub, 'box_full', 'Someone tried to send a message to your ' + where + ', but it is full (' + tbNum(TB_MAX_MSGS) + ' messages), so it was not saved. Delete some messages in the text box\u2019s Messages tab so it can take new ones.', { ref: 'tbr:' + slug + ':' + box, dedupeMs: TB_FULL_ALERT_GAP_MS });
     return json({ ok: false, full: true, error: 'this box is full and isn\u2019t taking messages right now' }, 409);
+  };
+  if (had0 >= TB_MAX_MSGS) return await fullReply(); // cheap reject off the counter: no write
+  const id = crypto.randomUUID().replace(/-/g, '').slice(0, 20), sentAt = Date.now();
+  // Reserve a slot and save the message in ONE transaction: the counter only moves up while it is under the cap, and the insert only runs if it moved
+  // (changes() sees the UPDATE just before it). So two sends at the same instant can never both take the last slot. The SELECT reads the new count back.
+  const res = await env.ADS_DB.batch([
+    env.ADS_DB.prepare('UPDATE textbox_defs SET msg_count = msg_count + 1 WHERE slug = ? AND box_id = ? AND msg_count IS NOT NULL AND msg_count < ?').bind(slug, box, TB_MAX_MSGS),
+    env.ADS_DB.prepare('INSERT INTO textbox_msgs (id, slug, box_id, body, created_at, sender_id, sender_name, sender_pic) SELECT ?, ?, ?, ?, ?, ?, ?, ? WHERE changes() > 0').bind(id, slug, box, JSON.stringify(vals), sentAt, sender ? sender.id : null, sender ? sender.name : null, sender ? sender.pic : null),
+    env.ADS_DB.prepare('SELECT msg_count AS n FROM textbox_defs WHERE slug = ? AND box_id = ?').bind(slug, box)
+  ]);
+  const reserved = !!(res[0] && res[0].meta && res[0].meta.changes > 0);
+  const stored = res[2] && res[2].results && res[2].results[0];
+  const now = stored && typeof stored.n === 'number' ? stored.n : had0 + 1;
+  if (!reserved) {
+    if (now >= TB_MAX_MSGS) return await fullReply(); // someone else took the last slot a moment ago
+    return textError(503, 'could not save that, please try again');
   }
-  const id = crypto.randomUUID().replace(/-/g, '').slice(0, 20);
-  await env.ADS_DB.prepare('INSERT INTO textbox_msgs (id, slug, box_id, body, created_at, sender_id, sender_name, sender_pic) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').bind(id, slug, box, JSON.stringify(vals), Date.now(), sender ? sender.id : null, sender ? sender.name : null, sender ? sender.pic : null).run();
-  const now = had + 1;
+  const had = now - 1;
   if (now >= TB_MAX_MSGS) {
     await textboxSetFull(env, slug, box, true);
     await createAlert(env, meta.ownerSub, 'box_full', 'Your ' + where + ' just filled up (' + tbNum(TB_MAX_MSGS) + ' messages) and has stopped taking new ones. Delete some messages in the text box\u2019s Messages tab to open it up again.', { ref: 'tbf:' + slug + ':' + box, dedupeMs: TB_ALERT_GAP_MS });
@@ -14548,7 +14642,13 @@ async function handleTextboxSend(env, request) {
     if (def.fullAt) await textboxSetFull(env, slug, box, false); // flag was stale: the box has room again
     if (had < TB_WARN_AT && now >= TB_WARN_AT) await createAlert(env, meta.ownerSub, 'box_nearly_full', 'Your ' + where + ' is almost full: ' + tbNum(now) + ' of ' + tbNum(TB_MAX_MSGS) + ' messages. Delete some in the text box\u2019s Messages tab so it keeps taking new ones.', { ref: 'tbw:' + slug + ':' + box, dedupeMs: TB_ALERT_GAP_MS });
   }
-  await createAlert(env, meta.ownerSub, 'message', (sender ? alertSafe(sender.name, COMMENT_NAME_MAX) || 'Someone' : 'Someone') + ' sent a message to your ' + where + '. Open the note, then the text box\u2019s Messages tab to read it.', { ref: 'l:' + slug, dedupeMs: TB_ALERT_GAP_MS });
+  // Messages to the same box fold into one alert ("5 new messages in your text box ..."), counted from the real rows since the group started.
+  // The tap ref is still the note ('l:'), but groups are per box so two boxes on one page don't merge.
+  await createMergedAlert(env, meta.ownerSub, 'message', 'l:' + slug, sentAt, 'SELECT COUNT(*) AS n FROM textbox_msgs WHERE slug = ? AND box_id = ? AND created_at >= ?', [slug, box],
+    (n) => n === 1
+      ? (sender ? alertSafe(sender.name, COMMENT_NAME_MAX) || 'Someone' : 'Someone') + ' sent a message to your ' + where + '. Open the note, then the text box\u2019s Messages tab to read it.'
+      : n + ' new messages in your ' + where + '. Open the note, then the text box\u2019s Messages tab to read them.',
+    'tbm:' + slug + ':' + box);
   return json({ ok: true });
 }
 // POST /textbox/owner { slug, token, op, box?, id?, cursor? }: ops list (every box on the page with its total, plus one page of the
@@ -14575,19 +14675,34 @@ async function handleTextboxOwner(env, request) {
     if (!live) return textError(404, 'box not found');
     if (op === 'delete') {
       if (typeof body.id !== 'string' || !TB_MSG_ID_RE.test(body.id)) return textError(400, 'invalid message');
-      await env.ADS_DB.prepare('DELETE FROM textbox_msgs WHERE slug = ? AND box_id = ? AND id = ?').bind(slug, box, body.id).run();
+      await env.ADS_DB.batch([ // deleted and counted together; changes() is the number of rows the DELETE just removed (0 or 1)
+        env.ADS_DB.prepare('DELETE FROM textbox_msgs WHERE slug = ? AND box_id = ? AND id = ?').bind(slug, box, body.id),
+        env.ADS_DB.prepare('UPDATE textbox_defs SET msg_count = CASE WHEN msg_count IS NULL THEN NULL ELSE MAX(msg_count - changes(), 0) END WHERE slug = ? AND box_id = ?').bind(slug, box)
+      ]);
       await textboxSetFull(env, slug, box, false); // one fewer than the cap is no longer full
     } else if (op === 'clear') {
-      await env.ADS_DB.prepare('DELETE FROM textbox_msgs WHERE slug = ? AND box_id = ?').bind(slug, box).run();
+      await env.ADS_DB.batch([
+        env.ADS_DB.prepare('DELETE FROM textbox_msgs WHERE slug = ? AND box_id = ?').bind(slug, box),
+        env.ADS_DB.prepare('UPDATE textbox_defs SET msg_count = 0, counted_at = ? WHERE slug = ? AND box_id = ?').bind(Date.now(), slug, box)
+      ]);
       await textboxSetFull(env, slug, box, false);
     } else {
       await env.ADS_DB.prepare('UPDATE textbox_defs SET closed_at = ? WHERE slug = ? AND box_id = ?').bind(op === 'close' ? Date.now() : null, slug, box).run();
     }
   } else if (op !== 'list') return textError(400, 'invalid op');
-  const qDefs = () => env.ADS_DB.prepare('SELECT box_id, cfg, closed_at FROM textbox_defs WHERE slug = ? AND deleted_at IS NULL ORDER BY box_id').bind(slug).all();
+  const qDefs = () => env.ADS_DB.prepare('SELECT box_id, cfg, closed_at, msg_count FROM textbox_defs WHERE slug = ? AND deleted_at IS NULL ORDER BY box_id').bind(slug).all();
   let defs = (await qDefs()).results || [];
   if (!defs.length) { await healTextboxes(env, slug); defs = (await qDefs()).results || []; }
-  const totals = (await env.ADS_DB.prepare('SELECT box_id, COUNT(*) AS n FROM textbox_msgs WHERE slug = ? GROUP BY box_id').bind(slug).all()).results || [];
+  const totals = defs.filter((d) => typeof d.msg_count === 'number').map((d) => ({ box_id: d.box_id, n: d.msg_count })); // stored counters: no GROUP BY
+  if (defs.some((d) => typeof d.msg_count !== 'number')) { // boxes from before the counter: count once, store it
+    const grp = (await env.ADS_DB.prepare('SELECT box_id, COUNT(*) AS n FROM textbox_msgs WHERE slug = ? GROUP BY box_id').bind(slug).all()).results || [];
+    for (const d of defs) {
+      if (typeof d.msg_count === 'number') continue;
+      const g = grp.filter((r) => r.box_id === d.box_id)[0];
+      try { totals.push({ box_id: d.box_id, n: await textboxRecount(env, slug, d.box_id) }); }
+      catch (e) { totals.push({ box_id: d.box_id, n: g ? g.n : 0 }); } // stored next time
+    }
+  }
   const now = Date.now();
   const boxes = [];
   for (const d of defs) {
