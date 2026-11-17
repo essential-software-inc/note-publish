@@ -106,6 +106,7 @@ main{position:relative;z-index:1;max-width:720px;margin:0 auto;padding:2px 16px 
 .field-wrap{position:relative;flex:1;min-width:0}
 .field-wrap .ico{position:absolute;left:15px;top:15px;width:20px;height:20px;color:var(--muted);pointer-events:none}
 .field-wrap .field{padding-left:44px}
+.pyv{margin:0;padding:14px 16px;border-radius:14px;border:1px solid var(--line2);background:var(--well);color:var(--text);font:12.5px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;white-space:pre;overflow:auto;max-height:max(180px,calc(88vh - 230px));max-height:max(180px,calc(88dvh - 230px));-webkit-overflow-scrolling:touch;tab-size:4;user-select:text;-webkit-user-select:text}
 .clr{position:relative;flex:1;min-width:0}
 .clr:has(>.clr-x.on)>.field.has-clr,.field-wrap:has(>.clr-x.on)>.field.has-clr{padding-right:46px}
 .clr-x{position:absolute;right:5.25px;top:50%;width:40px;height:40px;margin:-20px 0 0;padding:0;border:0;background:none;color:var(--muted);display:none;place-items:center;border-radius:50%}
@@ -491,10 +492,10 @@ select.field::-ms-expand{display:none}
 body[data-auth=out] #msg{bottom:calc(24px + env(safe-area-inset-bottom,0px))}
 
 /* sheets */
-.sheet-back{--o:0;--y:36px;position:fixed;inset:0;z-index:60;display:flex;align-items:flex-end;justify-content:center;padding:0 8px calc(8px + env(safe-area-inset-bottom,0px));background:rgba(4,5,20,.64);-webkit-backdrop-filter:blur(6px);backdrop-filter:blur(6px);opacity:var(--o);transition:opacity .22s}
+.sheet-back{--o:0;--y:36px;position:fixed;inset:0;z-index:60;display:flex;align-items:flex-end;justify-content:center;padding:0;background:rgba(4,5,20,.64);-webkit-backdrop-filter:blur(6px);backdrop-filter:blur(6px);opacity:var(--o);transition:opacity .22s}
 .sheet-back.open{--o:1;--y:0px}
 html:has(.sheet-back){overflow:hidden}
-.sheet{display:flex;flex-direction:column;width:100%;max-width:520px;max-height:88vh;max-height:88dvh;padding:10px 22px 22px;border-radius:30px;border:1px solid var(--line2);background:linear-gradient(180deg,rgba(255,255,255,.06),rgba(255,255,255,.02)),var(--s1);box-shadow:0 30px 70px -10px rgba(2,3,18,.9);transform:translateY(var(--y));transition:transform .3s cubic-bezier(.2,.9,.25,1)}
+.sheet{display:flex;flex-direction:column;width:100%;max-width:none;max-height:88vh;max-height:88dvh;padding:10px 22px calc(22px + env(safe-area-inset-bottom,0px));border-radius:30px 30px 0 0;border:1px solid var(--line2);background:linear-gradient(180deg,rgba(255,255,255,.06),rgba(255,255,255,.02)),var(--s1);box-shadow:0 30px 70px -10px rgba(2,3,18,.9);transform:translateY(var(--y));transition:transform .3s cubic-bezier(.2,.9,.25,1)}
 .grab{flex:none;width:38px;height:5px;border-radius:3px;background:var(--s3);margin:0 auto 18px}
 .sheet .tile{margin-bottom:14px}
 .sheet h2{margin:0;font-size:24px;line-height:1.15;font-weight:750;letter-spacing:-.025em;word-break:break-word}
@@ -767,10 +768,24 @@ html:has(.sheet-back){overflow:hidden}
         <div class="sec-head"><span class="tile sev-csam"><span class="ico" data-i="trash"></span></span><div><div class="card-t">Purge</div><div class="card-s">The same jobs the cron runs: deletes expired unpublished pages, accounts past their deletion window, stale like/follow timestamps, unreferenced backup images, and old presence, alert, activity and report-index records.</div></div></div>
         <button class="btn danger block" id="purgego">Run purge now</button>
       </div>
+      <div class="card static fo" id="bkcard" style="display:none">
+        <div class="sec-head"><span class="tile sev-other"><span class="ico" data-i="shield"></span></span><div><div class="card-t">Backup</div><div class="card-s">Downloads the whole database, every account, slug and report stored in KV, and every file in R2 (published pages, saved versions, account backups, images) as .tar files. A big backup comes in parts of about 300 MB, each one downloading as it fills: allow multiple downloads if the browser asks. It can take a long time: keep this screen open and leave enough free space until it finishes. The files hold private data, so keep them somewhere safe. Database and KV only makes one small file without the R2 files, for when those are copied another way.</div></div></div>
+        <button class="btn primary block" id="bkgo">Download backup</button>
+        <button class="btn block" id="bkdata" style="margin-top:8px">Database and KV only</button>
+        <div class="fine" id="bkstat" style="text-align:center"></div>
+      </div>
+      <div class="card static fo" id="rpcard" style="display:none">
+        <div class="sec-head"><span class="tile sev-other"><span class="ico" data-i="shield"></span></span><div><div class="card-t">Restore script</div><div class="card-s">restore.py puts a backup back onto a new Cloudflare account, or unpacks it into plain files and a SQLite database for any other server. It needs Python 3.8 or newer and nothing else.</div></div></div>
+        <div style="display:flex;gap:8px">
+          <button class="btn" id="rpview" style="flex:1;min-width:0">View</button>
+          <button class="btn" id="rpcopy" style="flex:1;min-width:0">Copy</button>
+          <button class="btn primary" id="rpsave" style="flex:1;min-width:0">Save</button>
+        </div>
+      </div>
       <div class="fine" id="whoami" style="text-align:center"></div>
       <div class="tools-foot">Authorized Personnel<br>Only</div>
       <div class="tools-copy">&copy; 2026 Essential Software</div>
-      <div class="tools-copy tools-ver">v4.11.2026-release</div>
+      <div class="tools-copy tools-ver">v17.11.2026-release</div>
     </div>
   </main>
   <button type="button" class="fab fo" id="alfab" aria-label="Send a custom alert" hidden><span class="ico" data-i="bell"></span></button>
@@ -1081,6 +1096,8 @@ function imgTargetOk(u){
 // The demo cannot reach the internet, so these made-up hosts stand in for the worker's upstream failures:
 // /admin/img?u=https://gone.example.com/a.png gives "upstream 404", and so on. Any other valid https URL returns a sample image.
 var IMG_FAIL={'unreachable.example.com':[502,'fetch failed'],'gone.example.com':[502,'upstream 404'],'forbidden.example.com':[502,'upstream 403'],'notimage.example.com':[415,'not a supported image type'],'huge.example.com':[413,'image too large'],'loop.example.com':[502,'too many redirects'],'badredirect.example.com':[502,'bad redirect']};
+var RESTORE_PY="#!/usr/bin/env python3\n\"\"\"Restore a Bluebook admin backup (Tools > Backup) onto a new Cloudflare account, or unpack it for any other server.\n\nA backup is one or more .tar files (a big one is saved in parts: ...-part-001.tar, -part-002.tar and so on; give them ALL).\nEach part holds:\n  r2/<n>             R2 files, byte for byte\n  r2-manifest.json   for those files: key, content type / headers, custom metadata, size\n  part.json          which part it is (the last one also says how many there are)\nand the first part also holds backup.json: the schema, every D1 row and every KV entry (SLUGS, ACCOUNTS, REPORTS).\n\nPython 3.8+, standard library only.\n\nA) New Cloudflare account\n   python3 restore.py bluebook-backup-*.tar --out restore-out --bucket NEW_BUCKET --d1 NEW_DB --kv SLUGS=ID ACCOUNTS=ID REPORTS=ID\n\n   Writes restore-out/d1.sql and restore-out/kv-<NAMESPACE>-<n>.json, uploads every R2 file (content type, headers and custom\n   metadata kept) and prints the wrangler commands for the database and KV. Run it against a NEW, empty database and bucket.\n   Uploading needs an R2 API token (Object Read & Write) in the environment:\n     R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY\n   Without them (or without --bucket) the upload is skipped and the SQL and KV files are still written.\n   --only-missing skips files the bucket already has, so a stopped upload can be run again.\n\nB) Any other server\n   python3 restore.py bluebook-backup-*.tar --to-dir restore-dir\n\n   Writes restore-dir/files/<key> (every R2 file under its own key), restore-dir/files.json (each file's type and custom\n   metadata), restore-dir/bluebook.sqlite (the whole database) and restore-dir/kv/<NAMESPACE>.json (key -> value, expiration,\n   metadata). Plain files, SQLite and JSON: load them into whatever the new server uses.\n\nThe Worker secrets (ADMIN_TOKEN and the payment/service keys) are not in a backup: set them on the new server yourself.\nKeep the same Google client IDs: publishers are tied to their pages by their Google account id.\n--allow-missing carries on even if a part is missing (the files in it are then not restored).\n\"\"\"\nimport argparse, datetime, hashlib, hmac, json, os, re, sqlite3, sys, tarfile, time, urllib.error, urllib.parse, urllib.request\n\nKV_CHUNK = 10000  # wrangler kv bulk put accepts up to 10,000 pairs per file\n\n\ndef sqlv(v):\n    if v is None:\n        return 'NULL'\n    if isinstance(v, bool):\n        return '1' if v else '0'\n    if isinstance(v, (int, float)):\n        return repr(v)\n    if isinstance(v, list):  # D1 returns blobs as arrays of byte values\n        return \"X'\" + bytes(v).hex() + \"'\"\n    return \"'\" + str(v).replace(\"'\", \"''\") + \"'\"\n\n\ndef qid(name):\n    return '\"' + str(name).replace('\"', '\"\"') + '\"'\n\n\ndef split_schema(parts):\n    schema = []\n    for p in parts:\n        if p.get('k') == 'meta':\n            schema = p.get('schema') or []\n    return [x for x in schema if x['type'] == 'table'], [x for x in schema if x['type'] != 'table']\n\n\ndef write_d1(parts, out):\n    tables, others = split_schema(parts)\n    n = 0\n    with open(os.path.join(out, 'd1.sql'), 'w', encoding='utf-8') as f:\n        for t in tables:\n            f.write(t['sql'].rstrip().rstrip(';') + ';\\n')\n        for p in parts:\n            if p.get('k') != 'd1':\n                continue\n            for row in p['rows']:\n                cols = [c for c in row if c != '__rid']\n                names = (['rowid'] if '__rid' in row else []) + cols\n                vals = ([row['__rid']] if '__rid' in row else []) + [row[c] for c in cols]\n                f.write('INSERT INTO %s (%s) VALUES (%s);\\n' % (qid(p['table']), ', '.join(x if x == 'rowid' else qid(x) for x in names), ', '.join(sqlv(v) for v in vals)))\n                n += 1\n        for o in others:  # indexes, triggers, views after the data\n            f.write(o['sql'].rstrip().rstrip(';') + ';\\n')\n    return len(tables), n\n\n\ndef write_sqlite(parts, path):\n    tables, others = split_schema(parts)\n    if os.path.exists(path):\n        os.remove(path)\n    db = sqlite3.connect(path)\n    n = 0\n    for t in tables:\n        db.execute(t['sql'])\n    for p in parts:\n        if p.get('k') != 'd1':\n            continue\n        for row in p['rows']:\n            cols = [c for c in row if c != '__rid']\n            names = (['rowid'] if '__rid' in row else []) + cols\n            vals = ([row['__rid']] if '__rid' in row else []) + [row[c] for c in cols]\n            vals = [bytes(v) if isinstance(v, list) else v for v in vals]\n            db.execute('INSERT INTO %s (%s) VALUES (%s)' % (qid(p['table']), ', '.join(x if x == 'rowid' else qid(x) for x in names), ', '.join('?' * len(vals))), vals)\n            n += 1\n    for o in others:\n        db.execute(o['sql'])\n    db.commit()\n    db.close()\n    return len(tables), n\n\n\ndef kv_by_ns(parts):\n    now = time.time()\n    by = {}\n    for p in parts:\n        if p.get('k') == 'kv':\n            for it in p['items']:\n                if it.get('expiration') and it['expiration'] < now:\n                    continue  # already expired\n                by.setdefault(p['ns'], []).append(it)\n    return by\n\n\ndef write_kv(parts, out):\n    files = {}\n    for ns, items in kv_by_ns(parts).items():\n        pairs = []\n        for it in items:\n            e = {'key': it['key'], 'value': it['value']}\n            if it.get('expiration'):\n                e['expiration'] = it['expiration']\n            if it.get('metadata'):\n                e['metadata'] = it['metadata']\n            pairs.append(e)\n        names = []\n        for i in range(0, max(1, len(pairs)), KV_CHUNK):\n            name = 'kv-%s-%d.json' % (ns, i // KV_CHUNK + 1)\n            with open(os.path.join(out, name), 'w', encoding='utf-8') as f:\n                json.dump(pairs[i:i + KV_CHUNK], f, ensure_ascii=False)\n            names.append(name)\n        files[ns] = (names, len(pairs))\n    return files\n\n\ndef write_kv_dir(parts, outdir):\n    os.makedirs(outdir, exist_ok=True)\n    res = {}\n    for ns, items in kv_by_ns(parts).items():\n        d = {}\n        for it in items:\n            e = {'value': it['value']}\n            if it.get('expiration'):\n                e['expiration'] = it['expiration']\n            if it.get('metadata'):\n                e['metadata'] = it['metadata']\n            d[it['key']] = e\n        with open(os.path.join(outdir, '%s.json' % ns), 'w', encoding='utf-8') as f:\n            json.dump(d, f, ensure_ascii=False)\n        res[ns] = len(d)\n    return res\n\n\ndef safe_rel(key):\n    \"\"\"A relative path for an R2 key, or None if the key cannot be a plain path (then it goes to _raw/<hash>).\"\"\"\n    segs = key.split('/')\n    if not key or key.startswith('/') or any(s in ('', '.', '..') or '\\0' in s or len(s) > 200 for s in segs):\n        return None\n    return os.path.join(*segs)\n\n\ndef write_file(root, key, data):\n    rel = safe_rel(key)\n    if rel is not None:\n        p = os.path.join(root, rel)\n        try:\n            os.makedirs(os.path.dirname(p), exist_ok=True)\n            with open(p, 'wb') as f:\n                f.write(data)\n            return rel.replace(os.sep, '/')\n        except OSError:\n            pass  # e.g. a key that is also a folder name\n    rel = '_raw/' + hashlib.sha1(key.encode('utf-8')).hexdigest()\n    p = os.path.join(root, rel)\n    os.makedirs(os.path.dirname(p), exist_ok=True)\n    with open(p, 'wb') as f:\n        f.write(data)\n    return rel\n\n\ndef _hmac(k, m):\n    return hmac.new(k, m.encode(), hashlib.sha256).digest()\n\n\ndef r2_request(method, acct, ak, sk, bucket, key, data=None, ctype=None, extra=None):\n    \"\"\"One SigV4-signed request to R2's S3 endpoint (UNSIGNED-PAYLOAD over https).\"\"\"\n    host = '%s.r2.cloudflarestorage.com' % acct\n    path = '/' + bucket + '/' + urllib.parse.quote(key, safe='/')\n    now = datetime.datetime.now(datetime.timezone.utc)\n    amz, ds = now.strftime('%Y%m%dT%H%M%SZ'), now.strftime('%Y%m%d')\n    h = {'host': host, 'x-amz-content-sha256': 'UNSIGNED-PAYLOAD', 'x-amz-date': amz}\n    if ctype:\n        h['content-type'] = ctype\n    for k, v in (extra or {}).items():\n        h[k.lower()] = str(v).strip()\n    signed = ';'.join(sorted(h))\n    canon = '\\n'.join([method, path, '', ''.join('%s:%s\\n' % (k, h[k]) for k in sorted(h)), signed, 'UNSIGNED-PAYLOAD'])\n    scope = '%s/auto/s3/aws4_request' % ds\n    sts = '\\n'.join(['AWS4-HMAC-SHA256', amz, scope, hashlib.sha256(canon.encode()).hexdigest()])\n    kk = _hmac(_hmac(_hmac(_hmac(('AWS4' + sk).encode(), ds), 'auto'), 's3'), 'aws4_request')\n    sig = hmac.new(kk, sts.encode(), hashlib.sha256).hexdigest()\n    h['authorization'] = 'AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s' % (ak, scope, signed, sig)\n    req = urllib.request.Request('https://' + host + path, data=data, method=method, headers={k: v for k, v in h.items() if k != 'host'})\n    return urllib.request.urlopen(req, timeout=300)\n\n\ndef put_headers(http, custom):\n    extra = {}\n    http = http or {}\n    for src, dst in (('cacheControl', 'cache-control'), ('contentDisposition', 'content-disposition'), ('contentEncoding', 'content-encoding'), ('contentLanguage', 'content-language')):\n        if http.get(src):\n            extra[dst] = http[src]\n    for k, v in (custom or {}).items():\n        extra['x-amz-meta-' + k] = v\n    return extra\n\n\ndef read_json(t, name):\n    try:\n        f = t.extractfile(name)\n    except KeyError:\n        return None\n    return json.load(f) if f else None\n\n\ndef main():\n    ap = argparse.ArgumentParser(description='Restore a Bluebook admin backup (all its .tar parts).')\n    ap.add_argument('tars', nargs='+', help='the .tar file, or every part of it')\n    ap.add_argument('--out', default='restore-out', help='Cloudflare mode: where d1.sql and the kv-*.json files go')\n    ap.add_argument('--to-dir', metavar='DIR', help='plain-server mode: unpack to files, a SQLite database and KV JSON in DIR')\n    ap.add_argument('--bucket')\n    ap.add_argument('--d1')\n    ap.add_argument('--kv', nargs='*', default=[], metavar='NAME=ID')\n    ap.add_argument('--skip-r2', action='store_true')\n    ap.add_argument('--only-missing', action='store_true')\n    ap.add_argument('--allow-missing', action='store_true')\n    a = ap.parse_args()\n\n    tars = [tarfile.open(p) for p in sorted(a.tars)]\n    seen, total, parts = set(), None, None\n    for i, t in enumerate(tars):\n        pj = read_json(t, 'part.json') or {'part': i + 1}\n        seen.add(pj.get('part'))\n        if pj.get('of'):\n            total = pj['of']\n        bj = read_json(t, 'backup.json')\n        if bj is not None:\n            parts = bj\n    if parts is None:\n        sys.exit('No backup.json in these files: part 1 is missing (it holds the database and KV).')\n    miss = sorted(set(range(1, (total or max(seen)) + 1)) - seen)\n    if total is None:\n        print('Warning: the last part was not given, so there is no way to tell if every part is here.')\n    if miss:\n        msg = 'Parts missing: %s%s.' % (', '.join(str(x) for x in miss), (' of %d' % total) if total else '')\n        if not a.allow_missing:\n            sys.exit(msg + ' Give all the parts, or add --allow-missing to carry on without them.')\n        print('Warning: ' + msg)\n    meta = next((p for p in parts if p.get('k') == 'meta'), {})\n    print('Backup made %s (format v%s), %d file(s) given' % (meta.get('at', '?'), meta.get('version', '?'), len(tars)))\n\n    entries = []  # (tar, manifest entry)\n    for t in tars:\n        for m in (read_json(t, 'r2-manifest.json') or []):\n            entries.append((t, m))\n    todo = [(t, m) for t, m in entries if m.get('file')]\n    failed = [m for _, m in entries if m.get('error')]\n    gone = [m for _, m in entries if m.get('gone')]\n    if meta.get('scope') == 'data':\n        print('This backup holds the database and KV only; the R2 files are not in it (copy them another way, for example with rclone).')\n    else:\n        print('R2: %d files in the backup%s%s' % (len(todo), (', %d could not be saved at backup time (marked in the manifest)' % len(failed)) if failed else '', (', %d were deleted while it ran' % len(gone)) if gone else ''))\n\n    if a.to_dir:\n        root = a.to_dir\n        os.makedirs(root, exist_ok=True)\n        nt, nr = write_sqlite(parts, os.path.join(root, 'bluebook.sqlite'))\n        print('Database: %d tables, %d rows -> %s' % (nt, nr, os.path.join(root, 'bluebook.sqlite')))\n        for ns, n in write_kv_dir(parts, os.path.join(root, 'kv')).items():\n            print('KV %s: %d entries -> %s' % (ns, n, os.path.join(root, 'kv', ns + '.json')))\n        files = []\n        for i, (t, m) in enumerate(todo, 1):\n            rel = write_file(os.path.join(root, 'files'), m['key'], t.extractfile(m['file']).read())\n            files.append({'key': m['key'], 'path': 'files/' + rel, 'size': m.get('size'), 'etag': m.get('etag'), 'uploaded': m.get('uploaded'), 'http': m.get('http'), 'custom': m.get('custom')})\n            if i % 200 == 0 or i == len(todo):\n                print('  unpacked %d / %d' % (i, len(todo)))\n        with open(os.path.join(root, 'files.json'), 'w', encoding='utf-8') as f:\n            json.dump(files, f, ensure_ascii=False)\n        print('Done: %s/files, files.json, bluebook.sqlite, kv/' % root)\n        return\n\n    os.makedirs(a.out, exist_ok=True)\n    nt, nr = write_d1(parts, a.out)\n    print('D1: %d tables, %d rows -> %s/d1.sql' % (nt, nr, a.out))\n    kv = write_kv(parts, a.out)\n    for ns, (names, n) in kv.items():\n        print('KV %s: %d entries -> %s' % (ns, n, ', '.join(names)))\n    acct, ak, sk = os.environ.get('R2_ACCOUNT_ID'), os.environ.get('R2_ACCESS_KEY_ID'), os.environ.get('R2_SECRET_ACCESS_KEY')\n    if a.skip_r2 or not todo:\n        pass\n    elif not (a.bucket and acct and ak and sk):\n        print('R2 upload skipped: pass --bucket and set R2_ACCOUNT_ID, R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY to upload the files.')\n    else:\n        bad = 0\n        for i, (t, m) in enumerate(todo, 1):\n            try:\n                if a.only_missing:\n                    try:\n                        r2_request('HEAD', acct, ak, sk, a.bucket, m['key']).close()\n                        continue\n                    except urllib.error.HTTPError as e:\n                        if e.code != 404:\n                            raise\n                data = t.extractfile(m['file']).read()\n                ctype = (m.get('http') or {}).get('contentType') or 'application/octet-stream'\n                for attempt in range(3):\n                    try:\n                        r2_request('PUT', acct, ak, sk, a.bucket, m['key'], data, ctype, put_headers(m.get('http'), m.get('custom'))).close()\n                        break\n                    except urllib.error.URLError:\n                        if attempt == 2:\n                            raise\n                        time.sleep(1 + attempt)\n            except Exception as e:\n                bad += 1\n                print('  FAILED %s: %s' % (m['key'], e))\n            if i % 50 == 0 or i == len(todo):\n                print('  uploaded %d / %d' % (i, len(todo)))\n        print('R2 upload done%s' % ((', %d failed (run again with --only-missing)' % bad) if bad else ''))\n\n    print('\\nNow run (from your new Worker project, with wrangler logged in):')\n    print('  npx wrangler d1 execute %s --remote --file %s/d1.sql' % (a.d1 or '<D1_NAME>', a.out))\n    ids = dict(x.split('=', 1) for x in a.kv if '=' in x)\n    for ns, (names, n) in kv.items():\n        for name in names:\n            print('  npx wrangler kv bulk put %s/%s --namespace-id %s --remote' % (a.out, name, ids.get(ns, '<%s_NAMESPACE_ID>' % ns)))\n    print('Then set the Worker secrets (ADMIN_TOKEN and the rest) and deploy.')\n\n\nif __name__ == '__main__':\n    sys.exit(main())\n";
+function bkObjs(){var e=new TextEncoder(),h={contentType:'text/html; charset=utf-8'},o=Object.keys(pages).map(function(sl){return{key:sl+'.html',bytes:e.encode(pubHtml(pages[sl])),http:h,custom:null,uploaded:new Date(pages[sl].createdAt).toISOString()}}),f=Object.keys(pages)[0];if(f)o.push({key:'history/'+f+'/'+N+'.html',bytes:e.encode(pubHtml(pages[f])),http:h,custom:{by:'demo-sub',at:String(N)},uploaded:new Date(N).toISOString()});return o}
 function route(path,o){
   o=o||{};var u=new URL(path,'https://demo.local/'),p=u.pathname,q=u.searchParams,m=(o.method||'GET').toUpperCase(),b=body(o),mt;
   if(p.indexOf('/admin/')===0){var hd=o.headers||{},tk=hd['X-Admin-Token']!=null?hd['X-Admin-Token']:hd['x-admin-token'];var au=adminAuth(tk);if(au.r!=='ok')return authErr(au);who=au.who}
@@ -1109,6 +1126,18 @@ function route(path,o){
     return ok(rpO)}
   if(p==='/admin/dismiss'||p==='/admin/undismiss'){var dis=p==='/admin/dismiss';if(dis&&o.body&&typeof o.body==='string'){try{JSON.parse(o.body)}catch(e){return err(400,'invalid JSON body')}}var dk=typeof b.key==='string'?b.key:'';if(!RKEY_RE.test(dk))return err(400,'invalid report key');var r=reports.filter(function(x){return x.key===dk})[0];if(!r)return dis?ok({ok:true}):err(404,'report not found');if(dis){if(r.isCsam)r.dismissedAt=Date.now();else reports=reports.filter(function(x){return x!==r})}else{if(!r.dismissedAt)return ok({ok:true});r.dismissedAt=null}A(dis?'dismiss':'undismiss',r.slug,'');return ok({ok:true})}
   if(p==='/admin/me')return ok({ok:true,role:who.role,name:who.name});
+  if(p==='/admin/restore.py'){if(who.role!=='super')return err(403,'super admin only');return new Response(RESTORE_PY,{headers:{'Content-Type':'text/plain; charset=utf-8'}})}
+  if(p==='/admin/backup/file'){if(who.role!=='super')return err(403,'super admin only');var fk=q.get('key')||'',fo=Number(q.get('o')||0),fobj=bkObjs().filter(function(x){return x.key===fk})[0];if(!fobj)return err(404,'not found');return new Response(fobj.bytes.slice(fo,fo+4194304),{headers:{'Content-Type':'application/octet-stream','X-Size':String(fobj.bytes.length),'X-Etag':'demo'+fobj.bytes.length}})}
+  if(p==='/admin/backup'){if(who.role!=='super')return err(403,'super admin only');var bk=null,bkr=q.get('c');if(bkr){try{bk=JSON.parse(bkr)}catch(e){return err(400,'bad cursor')}}var bkd=q.get('m')==='data';if(!bk)A('backup',null,bkd?'started (database and KV only)':'started');
+    var bks=bk&&bk.s||'start',bkp=null,bkn=null,bkl='';
+    if(bks==='start'){bkp={k:'meta',app:'Bluebook worker',version:2,format:'tar',scope:bkd?'data':'all',at:new Date().toISOString(),schema:[{type:'table',name:'audit',table:'audit',sql:'CREATE TABLE audit (action TEXT, slug TEXT, detail TEXT, at INTEGER, by TEXT)'}]};bkn={s:'d1',t:0,a:null};bkl='Starting'}
+    else if(bks==='d1'){if((bk.t|0)>=1){bkn={s:'kv',n:0,c:null};bkl='Database done'}else{bkp={k:'d1',table:'audit',rows:audit.map(function(x,i){return{__rid:i+1,action:x.action,slug:x.slug,detail:x.detail,at:x.at,by:x.by}})};bkn={s:'d1',t:1,a:null};bkl='Database: audit'}}
+    else if(bks==='kv'){var bsp=[['SLUGS',Object.keys(pages).map(function(sl){return{key:'slug:'+sl,value:JSON.stringify({status:pstatus(sl)}),expiration:null,metadata:null}})],['ACCOUNTS',Object.keys(users).map(function(em){return{key:'account:'+em,value:JSON.stringify({email:em}),expiration:null,metadata:null}})],['REPORTS',reports.map(function(x,i){return{key:'report:'+(x.key||x.slug+':'+i),value:JSON.stringify({slug:x.slug,reason:x.reason}),expiration:null,metadata:null}})]],bkk=bk.n|0;
+      if(bkk>=bsp.length){bkn=bkd?null:{s:'r2',c:null};bkl='Accounts and settings done'}else{bkp=bsp[bkk][1].length?{k:'kv',ns:bsp[bkk][0],items:bsp[bkk][1]}:null;bkn={s:'kv',n:bkk+1,c:null};bkl='Accounts and settings: '+bsp[bkk][0]}}
+    else if(bks==='r2'){bkp={k:'r2',objects:bkObjs().map(function(x){return{key:x.key,size:x.bytes.length,etag:'demo'+x.bytes.length,uploaded:x.uploaded,http:x.http,custom:x.custom}})};bkn=null;bkl='File list'}
+    else return err(500,'backup step failed: unknown step');
+    if(!bkn)A('backup',null,bkd?'finished (database and KV only)':'finished');
+    return ok({ok:true,done:!bkn,next:bkn,part:bkp,label:bkl})}
   if(p==='/admin/admins'){
     if(who.role!=='super')return err(403,'super admin only');
     if(m==='GET')return ok({ok:true,max:20,admins:ADMINS.slice().sort(function(a,c){return(a.revokedAt?1:0)-(c.revokedAt?1:0)||c.createdAt-a.createdAt})});
@@ -1799,7 +1828,7 @@ function showTab(t){
   if(t==='overview'){if(!ovS.loaded){ovS.loaded=true;loadOverview();ovList(true)}else if(fresh('ov')){loadOverview(true);trLoad(true);ovList(true,true)}}
   if(t==='ads'){if(!$('adlist').firstChild)loadAds(true);else if(fresh('ads'))loadAds(true,true)}
   if(t==='audit'){if(!auAll.length&&!$('aulist').firstChild)loadAudit(true);else if(fresh('audit'))loadAudit(true,true)}
-  if(t==='tools'){lgLoad();if(fresh('lg'))lgWarm(true);resLoad();if(ME.role==='super')admLoad()}
+  if(t==='tools'){$('bkcard').style.display=ME.role==='super'?'':'none';$('rpcard').style.display=ME.role==='super'?'':'none';lgLoad();if(fresh('lg'))lgWarm(true);resLoad();if(ME.role==='super')admLoad()}
   requestAnimationFrame(xHintAll)
 }
 function goTab(t){showTab(t);navPush();window.scrollTo(0,0)}
@@ -2805,6 +2834,7 @@ function renderAd(a){
 }
 
 /* ---------- Audit ---------- */
+// [2026-11-07 11:55 | verify-label] changed: the audit list names the verify action (Account verified), same as the demo.
 var ACT_LBL={takedown:'Takedown',release:'Release',restore:'Restore',dismiss:'Dismiss',undismiss:'Undismiss',purge:'Purge',ncmec_recorded:'NCMEC recorded',owner_suspend:'Suspend account',owner_unsuspend:'Unsuspend account',owner_delete:'Delete account','owner_cancel-delete':'Cancel deletion','owner_clear-name':'Clear name','owner_clear-picture':'Clear picture',story_remove:'Story removed',story_allow:'Story allowed',strike_excuse:'Strike excused',strike_restore:'Strike reinstated',referral_void:'Referral voided',referral_restore:'Referral restored',ad_pause:'Ad paused',ad_resume:'Ad resumed',ad_takedown:'Ad taken down',ad_refund:'Ad refunded',space_credit:'Page space added',custom_alert:'Custom alert',legal_update:'Policy update',admin_add:'Admin added',admin_revoke:'Admin revoked',reserve:'Address reserved',unreserve:'Reservation removed',verify:'Account verified'};
 function actLbl(a){a=String(a||'');if(ACT_LBL[a])return ACT_LBL[a];a=a.replace(/[_-]+/g,' ').trim();return a.charAt(0).toUpperCase()+a.slice(1)}
 function actTone(a){a=String(a||'');if(/take|purge|suspend|delete|ban|revoke/.test(a)&&!/unsuspend|cancel/.test(a))return'bad';if(/restore|release|unsuspend|cancel|allow|refund|resume/.test(a))return'good';return''}
@@ -4799,11 +4829,128 @@ $('purgego').onclick=function(){
     api('/admin/purge',{method:'POST'}).then(function(o){if(o.ok)msg('Purge done, '+o.j.purged+(o.j.purged===1?' item':' items')+' removed','ok');else showErr(o,'Purge failed')}).catch(function(e){netFail(e)})
   })
 };
+/* Backup: pulls the slices from /admin/backup, then every R2 file from /admin/backup/file in ranges, and saves it all as .tar files. Part 1 holds backup.json (database + KV); every part holds r2-manifest.json (its files' type and metadata), part.json and r2/<n> (the files). A part is downloaded and dropped from memory once it passes BK_PART. Nothing is stored on the server. */
+var bkBusy=false,BK_Z=String.fromCharCode(0),BK_PART=300*1048576;
+function bkFmt(n){return n>=1073741824?(n/1073741824).toFixed(2)+' GB':n>=1048576?(n/1048576).toFixed(1)+' MB':Math.max(1,Math.round(n/1024))+' KB'}
+function bkOct(n,w){var t=n.toString(8);while(t.length<w)t='0'+t;return t}
+function bkHead(name,size){
+  var h=new Uint8Array(512),e=new TextEncoder(),i,sum=0;
+  function put(t,o){h.set(e.encode(t),o)}
+  put(name,0);put(bkOct(420,7)+BK_Z,100);put(bkOct(0,7)+BK_Z,108);put(bkOct(0,7)+BK_Z,116);
+  put(bkOct(size,11)+BK_Z,124);put(bkOct(Math.floor(Date.now()/1000),11)+BK_Z,136);
+  put('        ',148);h[156]=48;put('ustar'+BK_Z+'00',257);
+  for(i=0;i<512;i++)sum+=h[i];
+  put(bkOct(sum,6)+BK_Z+' ',148);return h
+}
+function bkFile(key,size){
+  var tries=0;
+  function once(){
+    var chunks=[],got=0,total=size,etag=null;
+    function more(){
+      return fetch('/admin/backup/file?key='+encodeURIComponent(key)+'&o='+got,{headers:{'X-Admin-Token':tok}}).then(function(r){
+        if(r.status===404)return 'gone';
+        if(r.status===403||r.status===429){var x=new Error('auth');x.auth=r.status;throw x}
+        if(!r.ok)throw new Error('file '+r.status);
+        var e=r.headers.get('X-Etag');
+        if(etag===null){etag=e;total=Number(r.headers.get('X-Size'))||0}else if(e!==etag)throw new Error('changed while saving');
+        return r.arrayBuffer().then(function(b){chunks.push(b);got+=b.byteLength;return got<total&&b.byteLength>0?more():null})
+      })
+    }
+    return more().then(function(g){
+      if(g==='gone')return null;
+      if(got!==total)throw new Error('short read');
+      return{blob:new Blob(chunks),etag:etag,size:got}
+    })
+  }
+  function go(){return once().catch(function(e){if(e&&e.auth)throw e;if(++tries>=3)throw e;return go()})}
+  return go()
+}
+function bkStart(dataOnly){
+  if(bkBusy)return;
+  ask({title:dataOnly?'Download the database and KV?':'Download a backup?',text:dataOnly?'Makes one small .tar file with the whole database and every KV entry (accounts, slugs, reports), without the R2 files. Use it when the files are copied another way. Keep this screen open until it finishes. The file holds private data, so keep it somewhere safe.':'Makes .tar files with the whole database, every KV entry (accounts, slugs, reports) and every file in R2 (published pages, saved versions, account backups, images). A big backup comes in parts of about 300 MB, each one downloading as it fills: allow multiple downloads if the browser asks. It can take a long time: keep this screen open and leave enough free space until it finishes. The files hold private data, so keep them somewhere safe.',ok:'Start backup'}).then(function(ok){
+    if(!ok)return;
+    bkBusy=true;var b=$('bkgo'),b2=$('bkdata'),st=$('bkstat'),parts=[],tp=[],pm=[],partN=1,partBytes=0,sent=0,mainDone=false,bytes=0,cur=null,nFiles=0,nFail=0;
+    b.setAttribute('aria-disabled','true');b2.setAttribute('aria-disabled','true');
+    function end(t,k){bkBusy=false;b.removeAttribute('aria-disabled');b2.removeAttribute('aria-disabled');st.textContent=t||'';if(t&&k)msg(t,k)}
+    function add(name,blob){tp.push(bkHead(name,blob.size),blob);var pad=(512-blob.size%512)%512;if(pad)tp.push(new Uint8Array(pad));partBytes+=512+blob.size+pad}
+    function main(){if(!mainDone){mainDone=true;add('backup.json',new Blob(['['].concat(parts,['\n]'])))}}
+    function flush(last){
+      main();
+      add('r2-manifest.json',new Blob([JSON.stringify(pm)]));
+      add('part.json',new Blob([JSON.stringify({part:partN,of:last?partN:null,at:new Date().toISOString()})]));
+      tp.push(new Uint8Array(1024));
+      var blob=new Blob(tp,{type:'application/x-tar'}),a=document.createElement('a');
+      a.href=URL.createObjectURL(blob);
+      a.download=(dataOnly?'bluebook-data-':'bluebook-backup-')+new Date().toISOString().slice(0,10)+(last&&partN===1?'':'-part-'+('00'+partN).slice(-3))+'.tar';
+      document.body.appendChild(a);a.click();
+      (function(u,x){setTimeout(function(){URL.revokeObjectURL(u);x.remove()},120000)})(a.href,a);
+      sent+=blob.size;partN++;tp=[];pm=[];partBytes=0
+    }
+    function files(objs){
+      var i=0;
+      function group(){
+        if(i>=objs.length)return Promise.resolve();
+        var g=objs.slice(i,i+4);i+=4;
+        return Promise.all(g.map(function(o){
+          if(!(o.size>0))return Promise.resolve({o:o,r:{blob:new Blob([]),etag:o.etag,size:0}});
+          return bkFile(o.key,o.size).then(function(r){return{o:o,r:r}},function(e){if(e&&e.auth)throw e;return{o:o,err:String(e&&e.message||e)}})
+        })).then(function(res){
+          main();
+          res.forEach(function(x){
+            var m={key:x.o.key,size:x.o.size,etag:x.o.etag,uploaded:x.o.uploaded,http:x.o.http,custom:x.o.custom};
+            if(x.err){m.error=x.err;nFail++}
+            else if(!x.r){m.gone=true}
+            else{nFiles++;m.file='r2/'+('000000'+nFiles).slice(-7);m.size=x.r.size;m.etag=x.r.etag;add(m.file,x.r.blob);bytes+=x.r.size}
+            pm.push(m)
+          });
+          if(partBytes>=BK_PART)flush(false);
+          st.textContent='Files: '+nFiles+' \u2022 '+bkFmt(bytes)+(partN>1?' \u2022 part '+partN:'');
+          return group()
+        })
+      }
+      return group()
+    }
+    function finish(){
+      flush(true);
+      end('Backup downloaded ('+bkFmt(sent)+(partN>2?', '+(partN-1)+' parts, keep them all together':'')+')'+(nFail?'. '+nFail+' files could not be saved, they are marked in r2-manifest.json':''),nFail?'err':'ok')
+    }
+    function run(){
+      return api('/admin/backup'+(cur||dataOnly?'?':'')+(cur?'c='+encodeURIComponent(JSON.stringify(cur)):'')+(cur&&dataOnly?'&':'')+(dataOnly?'m=data':'')).then(function(o){
+        if(!o.ok){end('');bad(o,'Backup stopped');return}
+        var j=o.j,p=Promise.resolve();
+        st.textContent=(j.label||'Working')+' \u2022 '+bkFmt(bytes);
+        if(j.part&&j.part.k==='r2')p=files(j.part.objects);
+        else if(j.part){var piece=(parts.length?',\n':'\n')+JSON.stringify(j.part);parts.push(piece)}
+        return p.then(function(){
+          if(j.done){finish();return}
+          cur=j.next;return run()
+        })
+      })
+    }
+    run().catch(function(e){end('');if(e&&e.auth)bad({s:e.auth,j:{}},'Backup stopped');else netFail(e)})
+  })
+}
+$('bkgo').onclick=function(){bkStart(false)};
+$('bkdata').onclick=function(){bkStart(true)};
+/* Restore script: restore.py as served by /admin/restore.py, to read, copy or save from here. */
+var rpText=null;
+function rpGet(){
+  if(rpText!==null)return Promise.resolve(rpText);
+  spin(1);
+  return fetch('/admin/restore.py',{headers:{'X-Admin-Token':tok}}).then(function(r){
+    if(!r.ok)return r.json().catch(function(){return{}}).then(function(j){spin(-1);bad({s:r.status,j:j},'Could not load the restore script');return null});
+    return r.text().then(function(t){spin(-1);rpText=t;return t})
+  },function(e){spin(-1);netFail(e);return null})
+}
+function rpCopy(t){var f=function(){msg('Could not copy the script. Open it with View and select the text.','err')};try{navigator.clipboard.writeText(t).then(function(){msg('Restore script copied','ok')},f)}catch(e){f()}}
+$('rpview').onclick=function(){rpGet().then(function(t){if(t===null)return;var w=el('div');w.appendChild(el('pre','pyv',t));ask({title:'Restore script',sev:'other',icon:'shield',single:true,ok:'Close',text:'restore.py. Run it with Python 3.8 or newer. Its first lines explain both ways to use it.',node:w})})};
+$('rpcopy').onclick=function(){rpGet().then(function(t){if(t!==null)rpCopy(t)})};
+$('rpsave').onclick=function(){rpGet().then(function(t){if(t===null)return;var a=document.createElement('a');a.href=URL.createObjectURL(new Blob([t],{type:'text/x-python'}));a.download='restore.py';document.body.appendChild(a);a.click();setTimeout(function(){URL.revokeObjectURL(a.href);a.remove()},60000)})};
 $('msg').onclick=function(){msg('')};
 lookupHint();
 /* Lock: the token lives in memory only, so a refresh always lands on the token screen. Being away for 30 seconds or more does too: hide the app first, then reload. */
 var awayAt=0;
-function lockCheck(){if(!awayAt)return;var d=Date.now()-awayAt;awayAt=0;if(d>=30000&&tok){document.body.dataset.auth='out';location.reload()}}
+function lockCheck(){if(!awayAt)return;var d=Date.now()-awayAt;awayAt=0;if(d>=30000&&tok&&!bkBusy){document.body.dataset.auth='out';location.reload()}}
 document.addEventListener('visibilitychange',function(){if(document.visibilityState==='hidden')awayAt=Date.now();else lockCheck()});
 window.addEventListener('pagehide',function(){awayAt=Date.now()});
 window.addEventListener('pageshow',function(e){if(e.persisted)lockCheck()});
