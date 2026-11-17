@@ -9918,6 +9918,13 @@ button{cursor:pointer}
 .sev-spam{--sev:#97A3F0;--sev-bg:rgba(151,163,240,.16)}
 .sev-other{--sev:#46D6C8;--sev-bg:rgba(70,214,200,.15)}
 .sev-ad{--sev:var(--accent);--sev-bg:var(--accent-bg)}
+/* [2026-11-17 06:11 | admin-tools-icons] extra tile colours so each Tools card reads differently */
+.sev-violet{--sev:#C58CFF;--sev-bg:rgba(197,140,255,.16)}
+.sev-sky{--sev:#5CC8FF;--sev-bg:rgba(92,200,255,.15)}
+.sev-rose{--sev:#FF7AB8;--sev-bg:rgba(255,122,184,.16)}
+.sev-green{--sev:#5BE08A;--sev-bg:rgba(91,224,138,.15)}
+.sev-lime{--sev:#C6E85B;--sev-bg:rgba(198,232,91,.15)}
+.sev-sand{--sev:#D9B99B;--sev-bg:rgba(217,185,155,.16)}
 
 /* sign in */
 .login-in{position:relative;z-index:1;min-height:100vh;min-height:100dvh;display:flex;align-items:center;justify-content:center;padding:28px 24px}
@@ -10375,6 +10382,8 @@ body[data-auth=out] #msg{bottom:calc(24px + env(safe-area-inset-bottom,0px))}
 html:has(.sheet-back){overflow:hidden}
 .sheet{display:flex;flex-direction:column;width:100%;max-width:none;max-height:88vh;max-height:88dvh;padding:10px 22px calc(22px + env(safe-area-inset-bottom,0px));border-radius:30px 30px 0 0;border:1px solid var(--line2);background:linear-gradient(180deg,rgba(255,255,255,.06),rgba(255,255,255,.02)),var(--s1);box-shadow:0 30px 70px -10px rgba(2,3,18,.9);transform:translateY(var(--y));transition:transform .3s cubic-bezier(.2,.9,.25,1)}
 .grab{flex:none;width:38px;height:5px;border-radius:3px;background:var(--s3);margin:0 auto 18px}
+/* [2026-11-17 06:14 | sheet-drag] bigger touch area for the grab bar */
+.grab{position:relative;touch-action:none}.grab::before{content:"";position:absolute;inset:-10px -44px -8px}
 .sheet .tile{margin-bottom:14px}
 .sheet h2{margin:0;font-size:24px;line-height:1.15;font-weight:750;letter-spacing:-.025em;word-break:break-word}
 .sheet-text{margin:8px 0 20px;color:var(--muted);white-space:pre-wrap;overflow-wrap:anywhere;font-size:15px}
@@ -10598,7 +10607,7 @@ html:has(.sheet-back){overflow:hidden}
         <button class="btn primary block" id="admadd" style="margin-top:12px">Add admin</button>
       </div>
       <div class="card static fo">
-        <div class="sec-head"><span class="tile sev-other"><span class="ico" data-i="shield"></span></span><div><div class="card-t">Terms &amp; Privacy Policy</div><div class="card-s">Preview what the app shows, edit it here, and alert everyone when it changes.</div></div></div>
+        <div class="sec-head"><span class="tile sev-violet"><span class="ico" data-i="doc"></span></span><div><div class="card-t">Terms &amp; Privacy Policy</div><div class="card-s">Preview what the app shows, edit it here, and alert everyone when it changes.</div></div></div>
         <div class="alrow sev-ad" id="lgsel"></div>
         <div class="card-s" id="lgmeta" style="margin:10px 2px 12px">Loading...</div>
         <div style="display:flex;gap:8px">
@@ -10608,16 +10617,16 @@ html:has(.sheet-back){overflow:hidden}
         </div>
       </div>
       <div class="card static">
-        <div class="sec-head"><span class="tile sev-other"><span class="ico" data-i="shield"></span></span><div><div class="card-t">Technical notes</div><div class="card-s">The technical details cut from the public Privacy Policy and Consumer Terms. Admins only, never shown in the app.</div></div></div>
+        <div class="sec-head"><span class="tile sev-sky"><span class="ico" data-i="code"></span></span><div><div class="card-t">Technical notes</div><div class="card-s">The technical details cut from the public Privacy Policy and Consumer Terms. Admins only, never shown in the app.</div></div></div>
         <button class="btn primary block" id="tnread">Read</button>
       </div>
       <div class="card static">
-        <div class="sec-head"><span class="tile sev-ad"><span class="ico" data-i="chart"></span></span><div><div class="card-t">Time zone</div><div class="card-s">Every date and time here, and the Custom alerts date pickers, use this zone.</div></div></div>
+        <div class="sec-head"><span class="tile sev-copyright"><span class="ico" data-i="globe"></span></span><div><div class="card-t">Time zone</div><div class="card-s">Every date and time here, and the Custom alerts date pickers, use this zone.</div></div></div>
         <select class="field" id="tzsel" aria-label="Time zone"></select>
         <div class="card-s" id="tzcur" style="margin:8px 2px 0"></div>
       </div>
       <div class="card static">
-        <div class="sec-head"><span class="tile sev-ad"><span class="ico" data-i="image"></span></span><div><div class="card-t">Snapshot previews</div><div class="card-s">Choose which images load when you view a snapshot.</div></div></div>
+        <div class="sec-head"><span class="tile sev-rose"><span class="ico" data-i="image"></span></span><div><div class="card-t">Snapshot previews</div><div class="card-s">Choose which images load when you view a snapshot.</div></div></div>
         <label class="tog"><span class="tog-text"><b>Embedded images</b><small>Load embedded (data:) images in snapshot previews. Off by default.</small></span><input type="checkbox" id="imgs"></label>
         <label class="tog"><span class="tog-text"><b>External images</b><small>Load external (https) images, fetched through the worker so the image hosts see the worker, not your IP. Off by default.</small></span><input type="checkbox" id="ext"></label>
       </div>
@@ -10628,13 +10637,13 @@ html:has(.sheet-back){overflow:hidden}
       </div>
       <!-- [2026-11-04 19:21 | admin-verify] Verify an account straight from its author ID. -->
       <div class="card static">
-        <div class="sec-head"><span class="tile sev-other"><span class="ico" data-i="shield"></span></span><div><div class="card-t">Verify an account</div><div class="card-s">Gives an account a verified name and tick right away, with no invite to wait for. You see its display name first, and it stays locked to that name. The account needs a display name and a verified sign-in email. The address must be free, or a live page of that account.</div></div></div>
+        <div class="sec-head"><span class="tile sev-green"><span class="ico" data-i="userCheck"></span></span><div><div class="card-t">Verify an account</div><div class="card-s">Gives an account a verified name and tick right away, with no invite to wait for. You see its display name first, and it stays locked to that name. The account needs a display name and a verified sign-in email. The address must be free, or a live page of that account.</div></div></div>
         <div class="search"><input class="field" id="veraid" placeholder="Author ID" autocomplete="off" autocapitalize="off" spellcheck="false"></div>
         <div class="search"><input class="field" id="verslug" placeholder="Slug or link" autocomplete="off" autocapitalize="off" spellcheck="false"></div>
         <button class="btn primary block" id="vergo">Verify</button>
       </div>
       <div class="card static">
-        <div class="sec-head"><span class="tile sev-other"><span class="ico" data-i="shield"></span></span><div><div class="card-t">Reserved addresses</div><div class="card-s">Hold a slug so it shows as taken, even though no page uses it. Separate several with commas. Remove a reservation any time to free it. Invite holds one address for one email: that person signs in with it, publishes to the address and gets a verified tick. An invite nobody claims is cancelled after 90 days.</div></div></div>
+        <div class="sec-head"><span class="tile sev-abuse"><span class="ico" data-i="bookmark"></span></span><div><div class="card-t">Reserved addresses</div><div class="card-s">Hold a slug so it shows as taken, even though no page uses it. Separate several with commas. Remove a reservation any time to free it. Invite holds one address for one email: that person signs in with it, publishes to the address and gets a verified tick. An invite nobody claims is cancelled after 90 days.</div></div></div>
         <div class="search"><input class="field" id="resslug" placeholder="Slug or link" autocomplete="off" autocapitalize="off" spellcheck="false"></div>
         <div class="search"><input class="field" id="resemail" type="email" placeholder="Email to invite (for Invite only)" maxlength="254" autocomplete="off" autocapitalize="off" spellcheck="false"></div>
         <div class="search"><input class="field" id="resnote" placeholder="Note (optional)" maxlength="100" autocomplete="off"></div>
@@ -10647,13 +10656,13 @@ html:has(.sheet-back){overflow:hidden}
         <button class="btn danger block" id="purgego">Run purge now</button>
       </div>
       <div class="card static fo" id="bkcard" style="display:none">
-        <div class="sec-head"><span class="tile sev-other"><span class="ico" data-i="shield"></span></span><div><div class="card-t">Backup</div><div class="card-s">Downloads the whole database, every account, slug and report stored in KV, and every file in R2 (published pages, saved versions, account backups, images) as .tar files. A big backup comes in parts of about 300 MB, each one downloading as it fills: allow multiple downloads if the browser asks. It can take a long time: keep this screen open and leave enough free space until it finishes. The files hold private data, so keep them somewhere safe. Database and KV only makes one small file without the R2 files, for when those are copied another way.</div></div></div>
+        <div class="sec-head"><span class="tile sev-lime"><span class="ico" data-i="download"></span></span><div><div class="card-t">Backup</div><div class="card-s">Downloads the whole database, every account, slug and report stored in KV, and every file in R2 (published pages, saved versions, account backups, images) as .tar files. A big backup comes in parts of about 300 MB, each one downloading as it fills: allow multiple downloads if the browser asks. It can take a long time: keep this screen open and leave enough free space until it finishes. The files hold private data, so keep them somewhere safe. Database and KV only makes one small file without the R2 files, for when those are copied another way.</div></div></div>
         <button class="btn primary block" id="bkgo">Download backup</button>
         <button class="btn block" id="bkdata" style="margin-top:8px">Database and KV only</button>
         <div class="fine" id="bkstat" style="text-align:center"></div>
       </div>
       <div class="card static fo" id="rpcard" style="display:none">
-        <div class="sec-head"><span class="tile sev-other"><span class="ico" data-i="shield"></span></span><div><div class="card-t">Restore script</div><div class="card-s">restore.py puts a backup back onto a new Cloudflare account, or unpacks it into plain files and a SQLite database for any other server. It needs Python 3.8 or newer and nothing else.</div></div></div>
+        <div class="sec-head"><span class="tile sev-sand"><span class="ico" data-i="terminal"></span></span><div><div class="card-t">Restore script</div><div class="card-s">restore.py puts a backup back onto a new Cloudflare account, or unpacks it into plain files and a SQLite database for any other server. It needs Python 3.8 or newer and nothing else.</div></div></div>
         <div style="display:flex;gap:8px">
           <button class="btn" id="rpview" style="flex:1;min-width:0">View</button>
           <button class="btn" id="rpcopy" style="flex:1;min-width:0">Copy</button>
@@ -10696,6 +10705,15 @@ var ICON={
   bluebook:'<svg viewBox="0 0 90 105" fill="none" stroke="currentColor" stroke-width="13" aria-hidden="true"><rect x="6" y="28.5" width="54" height="27" rx="6" transform="rotate(55 33 42)"/><rect x="30" y="48.5" width="54" height="27" rx="6" transform="rotate(55 57 62)"/></svg>',
   shield:svg('<path d="M12 3.5 5 6v5.5c0 4.2 2.8 7.8 7 9 4.2-1.2 7-4.8 7-9V6l-7-2.5Z"/><path d="m9 12 2 2 4-4"/>'),
   shieldAlert:svg('<path d="M12 3.5 5 6v5.5c0 4.2 2.8 7.8 7 9 4.2-1.2 7-4.8 7-9V6l-7-2.5Z"/><path d="M12 8.5v4"/><path d="M12 15.4v.1"/>'),
+  // [2026-11-17 06:11 | admin-tools-icons] one icon per Tools card (shield stays for real safety use only)
+  doc:svg('<path d="M6.5 3.5H14l4 4v13H6.5z"/><path d="M14 3.5v4h4"/><path d="M9.5 12h5"/><path d="M9.5 15.5h5"/>'),
+  code:svg('<path d="m8.5 8-4 4 4 4"/><path d="m15.5 8 4 4-4 4"/><path d="m13.2 6-2.4 12"/>'),
+  globe:svg('<circle cx="12" cy="12" r="8.5"/><path d="M3.5 12h17"/><path d="M12 3.5c2.5 2.4 3.6 5.2 3.6 8.5s-1.1 6.1-3.6 8.5c-2.5-2.4-3.6-5.2-3.6-8.5S9.5 5.9 12 3.5Z"/>'),
+  userCheck:svg('<circle cx="10" cy="8.5" r="3.3"/><path d="M3.8 19.5c.5-3.3 3-5.2 6.2-5.2 1.3 0 2.4.3 3.4.8"/><path d="m14.5 17.3 2 2 3.8-4"/>'),
+  bookmark:svg('<path d="M7 4.5h10v15.5l-5-3.6-5 3.6Z"/>'),
+  download:svg('<path d="M12 4v11"/><path d="m7.5 11 4.5 4.5 4.5-4.5"/><path d="M5 19.5h14"/>'),
+  terminal:svg('<rect x="3.5" y="5" width="17" height="14" rx="3"/><path d="m7.5 10 3 2.2-3 2.2"/><path d="M13 14.8h3.5"/>'),
+  edit:svg('<path d="m5 19 .9-3.6L16 5.3a1.9 1.9 0 0 1 2.7 0 1.9 1.9 0 0 1 0 2.7L8.6 18.1 5 19Z"/><path d="m14.5 6.8 2.7 2.7"/>'),
   alert:svg('<path d="M12 4.5 3.8 18.5h16.4L12 4.5Z"/><path d="M12 10v4"/><path d="M12 16.6v.1"/>'),
   ban:svg('<circle cx="12" cy="12" r="8.5"/><path d="m6 6 12 12"/>'),
   dots:svg('<circle cx="6.5" cy="12" r="1.3"/><circle cx="12" cy="12" r="1.3"/><circle cx="17.5" cy="12" r="1.3"/>'),
@@ -10917,6 +10935,46 @@ function topSev(g){var best='spam',bi=99;g.items.forEach(function(x){var s=sevOf
 function stChip(s){var m={'live':'good','taken down':'bad','unpublished':'','missing':'','active':'good','paused':'warn','exhausted':''};return chip(s,'st '+(m[s]||''))}
 function reasonChip(r,isCsam){var s=isCsam?'csam':sevOf(r);return chip(r,'by-sev sev-'+s)}
 
+/* [2026-11-17 06:14 | sheet-drag] Drag a bottom sheet down to close it. From the grab bar or header any time; from the body only while it is scrolled to the top. A third of the height, or a quick flick, closes it; otherwise it springs back. */
+function sheetDrag(back,sh,close){
+  var st=0,x0=0,y0=0,dy=0,t0=0,h=1;
+  function scrolled(t){for(var n=t;n&&n!==sh;n=n.parentNode){if(n.scrollTop>0)return true}return false}
+  function down(x,y,t){
+    st=0;if(!t||!t.closest||!sh.contains(t)||scrolled(t)||t.closest('input,textarea,select'))return;
+    x0=x;y0=y;dy=0;t0=Date.now();h=sh.offsetHeight||1;st=1
+  }
+  function move(x,y,e){
+    if(!st)return;
+    dy=y-y0;
+    if(st===1){
+      if(Math.abs(x-x0)>4&&Math.abs(x-x0)>Math.abs(dy)){st=0;return}
+      if(dy<-4){st=0;return}
+      if(dy<3)return;
+      st=2
+    }
+    if(e.cancelable)e.preventDefault();
+    var d=Math.max(dy,0);
+    back.style.transition='none';sh.style.transition='none';
+    back.style.setProperty('--y',d+'px');back.style.setProperty('--o',String(1-Math.min(d/h,1)*.6))
+  }
+  function up(){
+    if(st!==2){st=0;return}
+    st=0;var v=dy/Math.max(Date.now()-t0,1);
+    back.style.transition='';sh.style.transition='';back.style.removeProperty('--o');
+    if(dy>h*.3||(v>.6&&dy>40)){back.style.setProperty('--y','100%');close()}
+    else back.style.removeProperty('--y')
+  }
+  sh.addEventListener('touchstart',function(e){if(e.touches.length===1)down(e.touches[0].clientX,e.touches[0].clientY,e.target);else st=0},{passive:true});
+  sh.addEventListener('touchmove',function(e){if(e.touches.length===1)move(e.touches[0].clientX,e.touches[0].clientY,e)},{passive:false});
+  sh.addEventListener('touchend',up);sh.addEventListener('touchcancel',up);
+  sh.addEventListener('pointerdown',function(e){
+    if(e.pointerType!=='mouse'||e.button||!e.target.closest||!e.target.closest('.grab,.sheet-top,.sheet-head')||e.target.closest('input,button,a,textarea,select'))return;
+    down(e.clientX,e.clientY,e.target);
+    if(st){e.preventDefault();try{sh.setPointerCapture(e.pointerId)}catch(_){}}
+  });
+  sh.addEventListener('pointermove',function(e){if(e.pointerType==='mouse')move(e.clientX,e.clientY,e)});
+  sh.addEventListener('pointerup',function(e){if(e.pointerType==='mouse')up()})
+}
 /* ---------- Sheets (replace native confirm/prompt) ---------- */
 function ask(o){
   return new Promise(function(res){
@@ -10952,7 +11010,7 @@ function ask(o){
       sheetClose(keep);
       res(v)
     }
-    var api2={done:fin};curSheet=api2;sheetOpen();
+    var api2={done:fin};curSheet=api2;sheetOpen(); sheetDrag(back,sh,function(){fin(false)});
     back.onclick=function(e){if(e.target===back)fin(false)};
     document.addEventListener('keydown',kd);
     requestAnimationFrame(function(){back.classList.add('open');(inputs[0]||(o.single?okb:cb)).focus()})
@@ -10997,7 +11055,7 @@ function pick(id,fn){
     try{b.focus()}catch(e){}
     sheetClose(keep)
   }
-  var me={done:fin};curSheet=me;sheetOpen();
+  var me={done:fin};curSheet=me;sheetOpen(); sheetDrag(back,sh,function(){fin()});
   back.onclick=function(e){if(e.target===back)fin()};
   document.addEventListener('keydown',kd);
   requestAnimationFrame(function(){back.classList.add('open')})
@@ -12979,7 +13037,7 @@ function listSheet(o){
     try{trig.focus()}catch(e){}
     sheetClose(keep)
   }
-  var me={done:fin};curSheet=me;sheetOpen();
+  var me={done:fin};curSheet=me;sheetOpen(); sheetDrag(back,sh,function(){fin()});
   back.onclick=function(e){if(e.target===back)fin()};
   document.addEventListener('keydown',kd);
   requestAnimationFrame(function(){back.classList.add('open')});
@@ -13247,7 +13305,7 @@ function lgSearchFrame(html){
 }
 function lgPreview(kind,d){
   var s=lgSearchFrame(d.html);
-  return ask({title:LG_LBL[kind]+' preview',sev:'other',icon:'shield',single:true,ok:'Close',text:d.builtin?'This is the copy built into the app.':'Version '+d.version+', as the app shows it.',head:s.head,node:s.node})
+  return ask({title:LG_LBL[kind]+' preview',sev:'violet',icon:'doc',single:true,ok:'Close',text:d.builtin?'This is the copy built into the app.':'Version '+d.version+', as the app shows it.',head:s.head,node:s.node})
 }
 /* Compare two texts: lines first, then the words inside each changed line. */
 var NL=String.fromCharCode(10);
@@ -13360,7 +13418,7 @@ function lgVerNode(kind,v,cur,back,bar,txt){
   return n
 }
 function lgVerSheet(kind,v){
-  var w=el('div'),pr=ask({title:LG_LBL[kind]+' version '+v,sev:'other',icon:'shield',single:true,ok:'Close',text:v?'Version '+v:'Copy built into the app',node:w});
+  var w=el('div'),pr=ask({title:LG_LBL[kind]+' version '+v,sev:'violet',icon:'doc',single:true,ok:'Close',text:v?'Version '+v:'Copy built into the app',node:w});
   var sh=w.closest('.sheet');w.appendChild(lgVerNode(kind,v,null,null,null,sh?sh.querySelector('.sheet-text'):null));
   return pr
 }
@@ -13387,7 +13445,7 @@ function lgHistory(kind){
     }
     list();
     LG.openEdit=false;
-    var pr=ask({title:LG_LBL[kind]+' history',sev:'other',icon:'shield',single:true,ok:'Close',text:hint,head:hd,node:box});
+    var pr=ask({title:LG_LBL[kind]+' history',sev:'violet',icon:'audit',single:true,ok:'Close',text:hint,head:hd,node:box});
     var sh0=box.closest('.sheet');tx=sh0?sh0.querySelector('.sheet-text'):null;
     return pr.then(function(){
       if(LG.openEdit){LG.openEdit=false;return lgLoad().then(function(d){if(d)lgEdit(kind,d,null)})}
@@ -13494,7 +13552,7 @@ function lgEdit(kind,d,keep){
   cb.onchange=sync;sync();pick(keep&&keep.tab||'text');
   // The markup note sits in the pinned header with the tabs, so it never scrolls out of view while the Text tab is open.
   var hdr=el('div');hdr.appendChild(tabs);hdr.appendChild(hint);
-  var pr=ask({title:'Edit '+LG_LBL[kind],sev:'other',icon:'shield',ok:'Publish',text:d.builtin?'Starting from the copy built into the app.':'Starting from version '+d.version+'.',head:hdr,node:wrap});
+  var pr=ask({title:'Edit '+LG_LBL[kind],sev:'violet',icon:'edit',ok:'Publish',text:d.builtin?'Starting from the copy built into the app.':'Starting from version '+d.version+'.',head:hdr,node:wrap});
   fit();applyPos(cur);window.addEventListener('resize',fit);
   return pr.then(function(ok){
     window.removeEventListener('resize',fit);if(ro)ro.disconnect();
@@ -13519,14 +13577,14 @@ function lgEdit(kind,d,keep){
       })
     };
     var cs=lgDiffNode(d.html,st.text)._st,sum=' ('+cs.add+(cs.add===1?' line':' lines')+' added, '+cs.del+' removed, version '+d.version+' to '+(d.version+1)+')';
-    if(!st.notify)return ask({title:'Publish without an alert?',sev:'ad',icon:'shield',text:'This puts the new '+LG_LBL[kind]+' live for everyone'+sum+' with no alert. People see it the next time the app shows it.',ok:'Publish'}).then(function(y){return y?go():lgEdit(kind,d,st)});
+    if(!st.notify)return ask({title:'Publish without an alert?',sev:'ad',icon:'bell',text:'This puts the new '+LG_LBL[kind]+' live for everyone'+sum+' with no alert. People see it the next time the app shows it.',ok:'Publish'}).then(function(y){return y?go():lgEdit(kind,d,st)});
     return ask({title:'Alert signed-in accounts?',sev:'ad',icon:'bell',text:'This publishes the new '+LG_LBL[kind]+sum+' and sends every signed-in account this alert: '+st.message,ok:'Publish and alert'}).then(function(y){return y?go():lgEdit(kind,d,st)})
   })
 }
 $('lghist').onclick=function(){lgHistory(LG.kind)};
 $('lgprev').onclick=function(){lgLoad().then(function(d){if(d)lgPreview(LG.kind,d)})};
 /* [2026-11-02 21:33 | tech-notes] Technical notes: the same sheet and search as the legal preview. */
-$('tnread').onclick=function(){var b=$('tnread');if(b.getAttribute('aria-disabled')==='true')return;b.setAttribute('aria-disabled','true');api('/admin/technical-notes').then(function(o){b.removeAttribute('aria-disabled');if(!o.ok){showErr(o,'Could not load the technical notes');return}var s=lgSearchFrame(o.j.html);ask({title:'Technical notes',sev:'other',icon:'shield',single:true,ok:'Close',text:'Cut from the public text on '+o.j.cut+'. Not shown in the app.',head:s.head,node:s.node})}).catch(function(e){b.removeAttribute('aria-disabled');netFail(e)})};
+$('tnread').onclick=function(){var b=$('tnread');if(b.getAttribute('aria-disabled')==='true')return;b.setAttribute('aria-disabled','true');api('/admin/technical-notes').then(function(o){b.removeAttribute('aria-disabled');if(!o.ok){showErr(o,'Could not load the technical notes');return}var s=lgSearchFrame(o.j.html);ask({title:'Technical notes',sev:'sky',icon:'code',single:true,ok:'Close',text:'Cut from the public text on '+o.j.cut+'. Not shown in the app.',head:s.head,node:s.node})}).catch(function(e){b.removeAttribute('aria-disabled');netFail(e)})};
 $('lgedit').onclick=function(){lgLoad().then(function(d){if(d)lgEdit(LG.kind,d,null)})};
 lgSel();
 $('alfab').onclick=function(){goTab('alerts')};
@@ -14219,7 +14277,7 @@ function rpGet(){
   },function(e){spin(-1);netFail(e);return null})
 }
 function rpCopy(t){var f=function(){msg('Could not copy the script. Open it with View and select the text.','err')};try{navigator.clipboard.writeText(t).then(function(){msg('Restore script copied','ok')},f)}catch(e){f()}}
-$('rpview').onclick=function(){rpGet().then(function(t){if(t===null)return;var w=el('div');w.appendChild(el('pre','pyv',t));ask({title:'Restore script',sev:'other',icon:'shield',single:true,ok:'Close',text:'restore.py. Run it with Python 3.8 or newer. Its first lines explain both ways to use it.',node:w})})};
+$('rpview').onclick=function(){rpGet().then(function(t){if(t===null)return;var w=el('div');w.appendChild(el('pre','pyv',t));ask({title:'Restore script',sev:'sand',icon:'terminal',single:true,ok:'Close',text:'restore.py. Run it with Python 3.8 or newer. Its first lines explain both ways to use it.',node:w})})};
 $('rpcopy').onclick=function(){rpGet().then(function(t){if(t!==null)rpCopy(t)})};
 $('rpsave').onclick=function(){rpGet().then(function(t){if(t===null)return;var a=document.createElement('a');a.href=URL.createObjectURL(new Blob([t],{type:'text/x-python'}));a.download='restore.py';document.body.appendChild(a);a.click();setTimeout(function(){URL.revokeObjectURL(a.href);a.remove()},60000)})};
 $('msg').onclick=function(){msg('')};
