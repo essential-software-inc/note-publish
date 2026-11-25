@@ -631,7 +631,14 @@ async function authorIdsFor(env, subs) {
     ).bind(...chunk).all();
     results.forEach(r => { out[r.sub] = r.author_id; });
   }
-  for (const sub of uniq) if (!out[sub]) out[sub] = await authorIdFor(env, sub);
+  // [2026-11-25] missing ones are created in batches and read back in chunks, not one account at a time (INSERT OR IGNORE keeps it safe if another request creates the same row first)
+  const missing = uniq.filter((s) => !out[s]);
+  for (let i = 0; i < missing.length; i += 50) {
+    const part = missing.slice(i, i + 50);
+    await env.ADS_DB.batch(part.map((s) => env.ADS_DB.prepare('INSERT OR IGNORE INTO authors (sub, author_id, created_at) VALUES (?, ?, ?)').bind(s, newAuthorId(), Date.now())));
+    const { results } = await env.ADS_DB.prepare('SELECT sub, author_id FROM authors WHERE sub IN (' + part.map(() => '?').join(',') + ')').bind(...part).all();
+    (results || []).forEach((r) => { out[r.sub] = r.author_id; });
+  }
   return out;
 }
 // A path/param from a client -> the real sub, or null if it names nobody.
@@ -2050,6 +2057,36 @@ const TEAM_HISTORY_KEEP_BIG = 5; // a note holding a version over 25MB keeps few
 const TEAM_UNAVAILABLE = 'That person can\u2019t be invited to edit right now.';
 const TEAM_EXPIRED_KEEP_MS = 30 * 24 * 60 * 60 * 1000; // an unanswered invitation is deleted this long after it expires
 const DUP_PREF_PREFIX = 'pagedup-on:';                // [2026-11-25 | page-duplicate] KV (ACCOUNTS): 'on' = the author lets viewers duplicate their published pages (a + button beside the list button)
+// [2026-11-25 | page-dup-d1] D1 mirror of the KV choice above, so the Templates list and count can filter by author in SQL instead of one KV read per author. A row = the author lets viewers duplicate their pages.
+// D1 is the source of truth and every reader goes through authorAllowsDup; handlePageDupPref writes D1 first, then a best-effort KV copy that only matters for a rollback to the older worker. The first call after deploy copies every existing KV 'on' into the table (one pass, then PAGEDUP_BACKFILL_KEY is set).
+const PAGEDUP_BACKFILL_KEY = 'pagedup-backfilled';
+// Every reader asks this: D1 is the one place the app reads the choice from, so the list, the count, the + button and the setting itself cannot disagree. KV is only a fallback if D1 errors, and a rollback copy.
+async function authorAllowsDup(env, sub) {
+  if (!sub) return false;
+  try { await ensurePageDup(env); return !!(await env.ADS_DB.prepare('SELECT 1 AS x FROM page_dup_authors WHERE sub = ?').bind(sub).first()); }
+  catch (e) { try { return (await env.ACCOUNTS.get(DUP_PREF_PREFIX + sub)) === 'on'; } catch (e2) { return false; } }
+}
+let pageDupReady = null;
+function ensurePageDup(env) {
+  if (!pageDupReady) {
+    pageDupReady = (async () => {
+      await env.ADS_DB.prepare('CREATE TABLE IF NOT EXISTS page_dup_authors (sub TEXT PRIMARY KEY, on_at INTEGER NOT NULL) WITHOUT ROWID').run();
+      if (await env.ACCOUNTS.get(PAGEDUP_BACKFILL_KEY)) return;
+      let cursor;
+      do {
+        const l = await env.ACCOUNTS.list({ prefix: DUP_PREF_PREFIX, cursor });
+        const subs = [];
+        for (const k of (l.keys || [])) { const s = k.name.slice(DUP_PREF_PREFIX.length); if (s && (await env.ACCOUNTS.get(k.name)) === 'on') subs.push(s); } // re-checked, so a choice switched off meanwhile is not copied
+        for (let i = 0; i < subs.length; i += 50) {
+          await env.ADS_DB.batch(subs.slice(i, i + 50).map(s => env.ADS_DB.prepare('INSERT OR IGNORE INTO page_dup_authors (sub, on_at) VALUES (?, ?)').bind(s, Date.now())));
+        }
+        cursor = l.list_complete ? undefined : l.cursor;
+      } while (cursor);
+      await env.ACCOUNTS.put(PAGEDUP_BACKFILL_KEY, '1');
+    })().catch((e) => { pageDupReady = null; throw e; });
+  }
+  return pageDupReady;
+}
 const NAV_PREF_PREFIX = 'pagenav-off:';              // [2026-11-03 | page-list] KV (ACCOUNTS): 'off' = the author hides the arrows and list button under their pages
 const TEAM_PREF_PREFIX = 'teaminv:';                 // KV (ACCOUNTS): 'off' = not accepting invitations to edit
 const TEAM_EDIT_ALERT_DEDUPE_MS = 6 * 60 * 60 * 1000;
@@ -2408,6 +2445,8 @@ async function teamsPurgeMember(env, sub) {
     await env.ACCOUNTS.delete(TEAM_PREF_PREFIX + sub);
     await env.ACCOUNTS.delete(NAV_PREF_PREFIX + sub); // [2026-11-03 04:24 | page-list] the choice to hide the arrows and list goes with the account
     await env.ACCOUNTS.delete(DUP_PREF_PREFIX + sub); // [2026-11-25 | page-duplicate] so does the choice to let others duplicate pages
+    try { await env.ADS_DB.prepare('DELETE FROM page_dup_authors WHERE sub = ?').bind(sub).run(); } catch (e) { /* no table yet: nothing to drop */ }
+    try { await env.ADS_DB.prepare('DELETE FROM hidden_pages WHERE owner_sub = ?').bind(sub).run(); } catch (e) { /* no table yet: nothing to drop */ } // [2026-11-25] the account's switched-off pages leave with it
   } catch (e) { console.log('team member purge failed: ' + (e && e.message)); }
 }
 
@@ -3713,7 +3752,7 @@ async function handleAuthorNav(env, request, slug) {
       return null;
     };
     // [2026-11-25 | page-duplicate] dup: the author lets viewers duplicate their pages, so the page shows a + beside the list button (the app asks again before copying anything)
-    const dup = (await env.ACCOUNTS.get(DUP_PREF_PREFIX + meta.ownerSub)) === 'on';
+    const dup = await authorAllowsDup(env, meta.ownerSub);
     return json({ prev: await pick(at - 1, -1), next: await pick(at + 1, 1), dup }, 200, { 'Cache-Control': 'no-store' });
   } catch (e) { console.log('author nav failed: ' + (e && e.message)); return empty(); }
 }
@@ -3819,12 +3858,15 @@ async function handlePageNavPref(env, request) {
 async function handlePageDupPref(env, request) {
   const sub = await requireSession(env, request);
   if (!sub) return textError(401, 'sign-in required');
-  if (request.method === 'GET') return json({ on: (await env.ACCOUNTS.get(DUP_PREF_PREFIX + sub)) === 'on' }, 200, { 'Cache-Control': 'no-store' });
+  if (request.method === 'GET') return json({ on: await authorAllowsDup(env, sub) }, 200, { 'Cache-Control': 'no-store' });
   const lim = await accountRateLimitResponse(env, sub, 'displayPrefs');
   if (lim) return lim;
   let b; try { b = await request.json(); } catch (e) { return textError(400, 'invalid JSON body'); }
   if (!b || typeof b.on !== 'boolean') return textError(400, 'on must be true or false');
-  if (b.on) await env.ACCOUNTS.put(DUP_PREF_PREFIX + sub, 'on'); else await env.ACCOUNTS.delete(DUP_PREF_PREFIX + sub);
+  await ensurePageDup(env); // table exists and the one-time backfill is done before this write
+  if (b.on) await env.ADS_DB.prepare('INSERT OR REPLACE INTO page_dup_authors (sub, on_at) VALUES (?, ?)').bind(sub, Date.now()).run();
+  else await env.ADS_DB.prepare('DELETE FROM page_dup_authors WHERE sub = ?').bind(sub).run();
+  try { if (b.on) await env.ACCOUNTS.put(DUP_PREF_PREFIX + sub, 'on'); else await env.ACCOUNTS.delete(DUP_PREF_PREFIX + sub); } catch (e) { console.log('page-dup kv copy failed: ' + (e && e.message)); }
   return json({ ok: true, on: b.on });
 }
 
@@ -5236,7 +5278,7 @@ async function handleLikedNotes(env, request) {
 // everything in the Subscribed feed (handleSubscriptionsFeed's rows: stories of followed accounts since the follow, inside the feed's age window, not switched off in Teams) plus everything in the Liked list
 // (handleLikedNotes's rows, same Teams rule), each page once, narrowed to those whose author lets viewers duplicate their pages (Settings > "Let others duplicate my pages", KV pagedup-on:<sub> = 'on').
 // Own pages, taken-down and deleted pages are left out. Newest first (a page's story time in the feed, or the time it was liked, whichever is later), 20 at a time. The first page also sends `total`
-// (templatesTotal) for the tab's count. The author's choice is checked here, per author, so the list never offers a page the + button would not. Scans up to TEMPLATES_MAX_SCAN rows to fill a page.
+// (templatesTotal) for the tab's count. The author's choice is filtered in SQL (page_dup_authors, the D1 mirror of the KV setting), so the list never offers a page the + button would not. Scans up to TEMPLATES_MAX_SCAN rows to fill a page.
 const TEMPLATES_SCAN_BATCH = 40;
 const TEMPLATES_MAX_SCAN = 200;
 // [2026-11-25 | templates-source] One row per (page, author, time it entered a list) for everything the Subscribed feed or the Liked list holds. The feed half is handleSubscriptionsFeed's own join and filters;
@@ -5249,8 +5291,8 @@ const TEMPLATES_SOURCE_SQL =
   "SELECT l.slug AS slug, COALESCE(NULLIF(s.author_sub, ''), NULLIF(l.author_sub, ''), NULLIF(p.author_sub, '')) AS author_sub, l.created_at AS at FROM likes l " +
   'LEFT JOIN stories s ON s.slug = l.slug LEFT JOIN published_notes p ON p.slug = l.slug WHERE l.liker_sub = ? ' +
   "AND (NOT EXISTS (SELECT 1 FROM hidden_pages h WHERE h.slug = l.slug AND h.owner_sub = COALESCE(NULLIF(s.author_sub, ''), NULLIF(l.author_sub, ''), NULLIF(p.author_sub, ''))) OR l.slug IN (SELECT slug FROM team_members WHERE member_sub = ? AND status = 'active'))";
-// Outer filter: a known author who is not this account. Placeholders in order: subscriber, feed cutoff, feed Teams member, liker, liked Teams member, own sub.
-const TEMPLATES_FROM_SQL = 'FROM (' + TEMPLATES_SOURCE_SQL + ') u WHERE u.author_sub IS NOT NULL AND u.author_sub <> ?';
+// Outer filter: a known author who is not this account and lets viewers duplicate their pages (page_dup_authors). Placeholders in order: subscriber, feed cutoff, feed Teams member, liker, liked Teams member, own sub.
+const TEMPLATES_FROM_SQL = 'FROM (' + TEMPLATES_SOURCE_SQL + ') u WHERE u.author_sub IS NOT NULL AND u.author_sub <> ? AND u.author_sub IN (SELECT sub FROM page_dup_authors)';
 function templatesSourceParams(sub) { return [sub, Date.now() - SUBSCRIPTIONS_FEED_MAX_AGE_MS, sub, sub, sub, sub]; }
 async function handleTemplates(env, request) {
   const sub = await requireSession(env, request);
@@ -5266,12 +5308,7 @@ async function handleTemplates(env, request) {
     }
   }
   try {
-    await Promise.all([ensureHiddenPages(env), ensureTeams(env)]);
-    const dupByAuthor = new Map();
-    const allows = async (a) => {
-      if (!dupByAuthor.has(a)) dupByAuthor.set(a, (await env.ACCOUNTS.get(DUP_PREF_PREFIX + a)) === 'on');
-      return dupByAuthor.get(a);
-    };
+    await Promise.all([ensureHiddenPages(env), ensureTeams(env), ensurePageDup(env)]);
     const rows = [];
     let curAt = cursorAt, curSlug = cursorSlug, scanned = 0, lastScanned = null, exhausted = false;
     while (rows.length < SUBSCRIPTIONS_FEED_PAGE_SIZE && scanned < TEMPLATES_MAX_SCAN) {
@@ -5284,7 +5321,6 @@ async function handleTemplates(env, request) {
       const batch = results || [];
       for (const r of batch) {
         scanned++; lastScanned = r; curAt = r.created_at; curSlug = r.slug;
-        if (!(await allows(r.author_sub))) continue;
         const m = await getMeta(env, r.slug);
         if (!m || m.deletedAt || m.adminLocked) continue;
         rows.push({ slug: r.slug, at: r.created_at, authorSub: r.author_sub, meta: m });
@@ -5350,21 +5386,13 @@ async function handleTemplates(env, request) {
 }
 
 // [2026-11-25 | templates-tab] How many pages the Templates list holds: the Subscribed feed's rows plus the Liked list's rows (each page once, as handleTemplates reads them), kept to the authors who let viewers
-// duplicate their pages. Counted like the Subscribed and Liked totals (plain row counts, no per-page KV read), so a taken-down page can still be in the number. One query groups the pages by author, then each
-// author's setting is read once. GET /account/counts sends it as `templates` and the Templates list sends it as `total`; the app hides the tab at 0. Returns a number, or null when it could not be worked out
-// (more than TEMPLATES_EXIST_MAX_AUTHORS distinct authors, or an error: the app then keeps what it had).
-const TEMPLATES_EXIST_MAX_AUTHORS = 100;
+// duplicate their pages (page_dup_authors). One COUNT query, no per-author KV reads and no author cap. Counted like the Subscribed and Liked totals (plain row counts), so a taken-down page can still be in the number.
+// GET /account/counts sends it as `templates` and the Templates list sends it as `total`; the app hides the tab at 0. Returns a number, or null on an error (the app then keeps what it had).
 async function templatesTotal(env, sub) {
   try {
-    await Promise.all([ensureHiddenPages(env), ensureTeams(env)]);
-    const { results } = await env.ADS_DB.prepare(
-      'SELECT a.author_sub AS author_sub, COUNT(*) AS c FROM (SELECT u.slug AS slug, MAX(u.author_sub) AS author_sub ' + TEMPLATES_FROM_SQL + ' GROUP BY u.slug) a GROUP BY a.author_sub LIMIT ?'
-    ).bind(...templatesSourceParams(sub), TEMPLATES_EXIST_MAX_AUTHORS + 1).all();
-    const rows = results || [];
-    if (rows.length > TEMPLATES_EXIST_MAX_AUTHORS) return null;
-    let n = 0;
-    for (const r of rows) { if ((await env.ACCOUNTS.get(DUP_PREF_PREFIX + r.author_sub)) === 'on') n += Number(r.c) || 0; }
-    return n;
+    await Promise.all([ensureHiddenPages(env), ensureTeams(env), ensurePageDup(env)]);
+    const row = await env.ADS_DB.prepare('SELECT COUNT(DISTINCT u.slug) AS c ' + TEMPLATES_FROM_SQL).bind(...templatesSourceParams(sub)).first();
+    return row ? Number(row.c) || 0 : 0;
   } catch (e) { return null; }
 }
 
