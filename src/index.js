@@ -4228,8 +4228,11 @@ async function handleServeStoryImage(env, slug, request) {
 //    the viewer hasn't opened ahead of ones they have.
 // Both reshuffle every STORIES_STRIP_ROTATE_MS. Anonymous callers have no identity to vary
 // by, so they get the newest-first list of the same pool.
+// [2026-11-25 21:55 | story-swipe] changed: GET /stories?exclude=slug,slug,... returns the NEXT set of up to STORIES_STRIP_LIMIT stories (same ordering as the first page, minus the slugs the app already showed, and without the viewer's own) plus more: true while any are left in the pool. Without exclude the answer is the same as before (plus the more flag). The app uses it when a swipe runs past the end of the strip. Slugs are capped at 200.
 async function handleStoriesStrip(env, request) {
   const sub = await requireSession(env, request);
+  const exclude = new Set((new URL(request.url).searchParams.get('exclude') || '').split(',').map(x => x.trim()).filter(Boolean).slice(0, 200));
+  const paged = exclude.size > 0;
   const now = Date.now();
   const cutoff = now - STORIES_LOOKBACK_MS;
 
@@ -4244,7 +4247,7 @@ async function handleStoriesStrip(env, request) {
       ).bind(sub, cutoff, STORIES_STRIP_OWN_LIMIT).all()
     ]);
     followedSince = new Map(followRows.results.map(r => [r.author_sub, r.created_at]));
-    ownStories = ownRows.results;
+    ownStories = paged ? [] : ownRows.results; // a later set never repeats the viewer's own stories (they led the first one)
   }
 
   // Global pool, identical for every viewer (so the shared picks can be): newest first, capped per author.
@@ -4281,9 +4284,11 @@ async function handleStoriesStrip(env, request) {
     }
   }
 
-  let others;
+  let others, more = false;
   if (!sub) {
-    others = eligible.slice(0, STORIES_STRIP_LIMIT);
+    const left = eligible.filter(r => !exclude.has(r.slug));
+    more = left.length > STORIES_STRIP_LIMIT;
+    others = left.slice(0, STORIES_STRIP_LIMIT);
   } else {
     const bucket = Math.floor(now / STORIES_STRIP_ROTATE_MS);
     // Shared picks: same shuffle for everyone, first eligible ones win.
@@ -4297,8 +4302,10 @@ async function handleStoriesStrip(env, request) {
     const personal = [
       ..._storiesSeededOrder(rest.filter(r => !seenSlugs.has(r.slug)), seed),
       ..._storiesSeededOrder(rest.filter(r => seenSlugs.has(r.slug)), seed)
-    ].slice(0, STORIES_STRIP_LIMIT - shared.length);
-    others = [...shared, ...personal];
+    ];
+    const left = [...shared, ...personal].filter(r => !exclude.has(r.slug)); // the first STORIES_STRIP_LIMIT of this list are exactly what the strip always showed
+    more = left.length > STORIES_STRIP_LIMIT;
+    others = left.slice(0, STORIES_STRIP_LIMIT);
   }
   const ranked = [...ownStories, ...others]; // yours first, then up to 12 from others
 
@@ -4323,6 +4330,7 @@ async function handleStoriesStrip(env, request) {
   const origin = new URL(request.url).origin;
   const hk = await hiddenImgKeys(env, sub, ranked.map(r => r.slug)); // [2026-11-08 18:34 | discoverable-setting]
   return json({
+    more, // [2026-11-25 21:55 | story-swipe]
     stories: ranked.map(r => ({
       slug: r.slug,
       title: r.title,
@@ -5757,7 +5765,23 @@ const HOLD_HEAD = '<style id="nb-hold">html.nb-hold .cv-canvas{visibility:hidden
 // and passes taps up (nb-nav-go prev/next, nb-verified-tap). Only a message from the parent window is believed. Outside a frame it does nothing, so a browser never sees the chevrons.
 // [2026-11-03 01:17 | discoverable-setting] changed: also listens for nb-view-token from the app (a fresh view token for a page that was opened with one) and swaps it into the page's own address with history.replaceState, so the page's later calls (likes, comments, polls) carry the new token in the Referer. A page opened without ?t= ignores it.
 // [2026-11-03 08:38 | floating-nav] changed: the nb-nav message may carry float: true (the reader's Floating arrows setting), see floatBar below.
-const FOOT_SCRIPT = '<script>(function(){var d=document,W=window;if(W.parent===W)return;W.addEventListener("message",function(e){var m=e.data;if(e.source!==W.parent||!m||m.type!=="nb-view-token"||typeof m.t!=="string"||!/^[A-Za-z0-9_-]{16,80}$/.test(m.t))return;try{var u=new URL(W.location.href);if(!u.searchParams.has("t"))return;u.searchParams.set("t",m.t);W.history.replaceState(W.history.state,"",u.pathname+u.search+u.hash)}catch(x){}});var row=d.getElementById("nb-foot-row");if(!row)return;'
+// [2026-11-25 21:55 | story-swipe] Sideways swipe in the app's story viewer. The page watches one-finger drags and tells the app (nb-sw: r ready, s start, m move with dx, e end with dx and speed, c cancel). Only a message from the parent window is believed, and nothing happens until the app answers nb-sw-cfg with on: true (it does so only when the story was opened from a list). A drag that starts on something that uses sideways movement itself (an input, video, canvas, embed, data-nb-noswipe, or any scroller that can still scroll that way, the carousel included) is left to it; a mostly vertical drag is left to normal scrolling. Outside a frame it does nothing.
+const SWIPE_SCRIPT = '<script>(function(){var d=document,W=window;if(W.parent===W)return;var on=false,st=null,mode=0;'
+  + 'function tell(p,x,v){try{W.parent.postMessage({type:"nb-sw",p:p,x:x||0,v:v||0},"*")}catch(e){}}'
+  + 'W.addEventListener("message",function(e){var m=e.data;if(e.source===W.parent&&m&&m.type==="nb-sw-cfg")on=m.on===true});'
+  + 'function owned(el,dx){for(;el&&el!==d.documentElement;el=el.parentElement){var n=el.nodeName;if(n==="INPUT"||n==="TEXTAREA"||n==="SELECT"||n==="VIDEO"||n==="AUDIO"||n==="CANVAS"||n==="IFRAME"||el.isContentEditable||(el.hasAttribute&&el.hasAttribute("data-nb-noswipe")))return true;var ox=W.getComputedStyle(el).overflowX;if((ox==="auto"||ox==="scroll")&&el.scrollWidth>el.clientWidth+1){var mx=el.scrollWidth-el.clientWidth;if(dx<0?el.scrollLeft<mx-1:el.scrollLeft>1)return true}}return false}'
+  + 'function flush(){if(st){st.raf=0;tell("m",st.dx-st.bx)}}'
+  + 'd.addEventListener("touchstart",function(e){st=null;mode=0;if(!on||e.touches.length!==1)return;var t=e.touches[0];st={x:t.clientX,y:t.clientY,el:e.target,lx:t.clientX,lt:Date.now(),v:0,dx:0,bx:0,raf:0}},{passive:true,capture:true});'
+  + 'd.addEventListener("touchmove",function(e){if(!st||mode===2)return;if(e.touches.length!==1){if(mode===1)tell("c");mode=2;return}var t=e.touches[0],dx=t.clientX-st.x,dy=t.clientY-st.y;if(mode===0){var ax=Math.abs(dx),ay=Math.abs(dy);if(ax<10&&ay<10)return;if(ay>=ax||owned(st.el,dx)){mode=2;return}mode=1;st.bx=dx;tell("s")}if(e.cancelable)e.preventDefault();var n=Date.now();if(n>st.lt)st.v=(t.clientX-st.lx)/(n-st.lt);st.lx=t.clientX;st.lt=n;st.dx=dx;if(!st.raf)st.raf=W.requestAnimationFrame(flush)},{passive:false,capture:true});'
+  + 'd.addEventListener("touchend",function(){if(st&&mode===1)tell("e",st.dx-st.bx,Date.now()-st.lt>80?0:st.v);st=null;mode=0},{passive:true,capture:true});'
+  + 'd.addEventListener("touchcancel",function(){if(st&&mode===1)tell("c");st=null;mode=0},{passive:true,capture:true});'
+  + 'tell("r")})()</script>';
+// [2026-11-25 22:12 | embed-autoplay] The reader setting "Autoplay first media". The page tells the app it is ready (nb-autoplay); only when the setting is on and this is the viewer's own frame does the app answer nb-autoplay-cfg on: true (never in the editor, never for a hidden neighbour frame). The page then starts the first video or audio in it: a video or audio tag is played, a YouTube, Streamable or Vimeo embed is reloaded with autoplay=1. Spotify, Instagram and others cannot be started this way and are skipped. Outside a frame it does nothing.
+const PLAY_SCRIPT = '<script>(function(){var d=document,W=window;if(W.parent===W)return;'
+  + 'function go(){var els=d.querySelectorAll("iframe,video,audio");for(var i=0;i<els.length;i++){var el=els[i],n=el.nodeName;if(n==="VIDEO"||n==="AUDIO"){try{var pr=el.play();if(pr&&pr.catch)pr.catch(function(){})}catch(x){}return}var u;try{u=new URL(el.getAttribute("src")||"",W.location.href)}catch(x){continue}var h=u.hostname;if(h.indexOf("www.")===0)h=h.slice(4);if(h==="youtube.com"||h==="youtube-nocookie.com"||h==="streamable.com"||h==="player.vimeo.com"){if(u.searchParams.get("autoplay")==="1")return;u.searchParams.set("autoplay","1");if(h.indexOf("youtube")===0)u.searchParams.set("playsinline","1");el.setAttribute("src",u.toString());return}}}'
+  + 'W.addEventListener("message",function(e){var m=e.data;if(e.source!==W.parent||!m||m.type!=="nb-autoplay-cfg"||m.on!==true)return;if(d.readyState==="complete")go();else W.addEventListener("load",go)});'
+  + 'try{W.parent.postMessage({type:"nb-autoplay"},"*")}catch(e){}})()</script>';
+const FOOT_SCRIPT = SWIPE_SCRIPT + PLAY_SCRIPT + '<script>(function(){var d=document,W=window;if(W.parent===W)return;W.addEventListener("message",function(e){var m=e.data;if(e.source!==W.parent||!m||m.type!=="nb-view-token"||typeof m.t!=="string"||!/^[A-Za-z0-9_-]{16,80}$/.test(m.t))return;try{var u=new URL(W.location.href);if(!u.searchParams.has("t"))return;u.searchParams.set("t",m.t);W.history.replaceState(W.history.state,"",u.pathname+u.search+u.hash)}catch(x){}});var row=d.getElementById("nb-foot-row");if(!row)return;'
   + 'var pv=d.getElementById("nb-nav-prev"),nx=d.getElementById("nb-nav-next"),ls=d.getElementById("nb-nav-list"),du=d.getElementById("nb-nav-dup"),tk=d.getElementById("nb-verified"),nv=d.getElementById("nb-nav");'
   + 'function tell(t,x){try{var m={type:t};if(x)m.dir=x;W.parent.postMessage(m,"*")}catch(e){}}'
   // [2026-11-03 08:38 | floating-nav] The app's Floating arrows setting: the arrows and list leave the footer and become a see-through bar at the bottom centre, level with the comments button, that fades in on scroll or touch and out again after a moment (same timings as the comments button).
