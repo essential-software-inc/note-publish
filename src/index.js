@@ -5232,12 +5232,26 @@ async function handleLikedNotes(env, request) {
   });
 }
 
-// [2026-11-25 | templates] GET /account/templates?cursor= — the app's Templates category: published pages from the accounts this one subscribes to, plus pages it liked,
-// whose author lets viewers duplicate their pages (Settings > "Let others duplicate my pages", KV pagedup-on:<sub> = 'on'). Same card shape as the Liked list, newest page first,
-// 20 at a time. Own pages, pages switched off in Teams (unless the viewer is on that page's team), taken-down and deleted pages are left out. The author's choice is checked here, per author,
-// so the list never offers a page the + button would not (the page's own HTML is public either way; this only decides what the app lists). Scans up to TEMPLATES_MAX_SCAN rows to fill a page.
+// [2026-11-25 | templates] GET /account/templates?cursor= — the app's Templates category. It takes its pages from the two lists the Subscribed | Liked tabs already show, and builds no list of its own:
+// everything in the Subscribed feed (handleSubscriptionsFeed's rows: stories of followed accounts since the follow, inside the feed's age window, not switched off in Teams) plus everything in the Liked list
+// (handleLikedNotes's rows, same Teams rule), each page once, narrowed to those whose author lets viewers duplicate their pages (Settings > "Let others duplicate my pages", KV pagedup-on:<sub> = 'on').
+// Own pages, taken-down and deleted pages are left out. Newest first (a page's story time in the feed, or the time it was liked, whichever is later), 20 at a time. The first page also sends `total`
+// (templatesTotal) for the tab's count. The author's choice is checked here, per author, so the list never offers a page the + button would not. Scans up to TEMPLATES_MAX_SCAN rows to fill a page.
 const TEMPLATES_SCAN_BATCH = 40;
 const TEMPLATES_MAX_SCAN = 200;
+// [2026-11-25 | templates-source] One row per (page, author, time it entered a list) for everything the Subscribed feed or the Liked list holds. The feed half is handleSubscriptionsFeed's own join and filters;
+// the liked half is the likes rows (author as handleLikedNotes picks it: story author, else the like's author, else the page's), with the same Teams switch-off rule the feed uses.
+const TEMPLATES_SOURCE_SQL =
+  'SELECT s.slug AS slug, s.author_sub AS author_sub, s.created_at AS at FROM stories s ' +
+  'JOIN subscriptions sub ON sub.author_sub = s.author_sub AND sub.subscriber_sub = ? AND s.created_at >= sub.created_at AND s.created_at >= ? ' +
+  'WHERE ' + HIDDEN_FEED_SQL +
+  ' UNION ALL ' +
+  "SELECT l.slug AS slug, COALESCE(NULLIF(s.author_sub, ''), NULLIF(l.author_sub, ''), NULLIF(p.author_sub, '')) AS author_sub, l.created_at AS at FROM likes l " +
+  'LEFT JOIN stories s ON s.slug = l.slug LEFT JOIN published_notes p ON p.slug = l.slug WHERE l.liker_sub = ? ' +
+  "AND (NOT EXISTS (SELECT 1 FROM hidden_pages h WHERE h.slug = l.slug AND h.owner_sub = COALESCE(NULLIF(s.author_sub, ''), NULLIF(l.author_sub, ''), NULLIF(p.author_sub, ''))) OR l.slug IN (SELECT slug FROM team_members WHERE member_sub = ? AND status = 'active'))";
+// Outer filter: a known author who is not this account. Placeholders in order: subscriber, feed cutoff, feed Teams member, liker, liked Teams member, own sub.
+const TEMPLATES_FROM_SQL = 'FROM (' + TEMPLATES_SOURCE_SQL + ') u WHERE u.author_sub IS NOT NULL AND u.author_sub <> ?';
+function templatesSourceParams(sub) { return [sub, Date.now() - SUBSCRIPTIONS_FEED_MAX_AGE_MS, sub, sub, sub, sub]; }
 async function handleTemplates(env, request) {
   const sub = await requireSession(env, request);
   if (!sub) return textError(401, 'sign-in required');
@@ -5261,12 +5275,10 @@ async function handleTemplates(env, request) {
     const rows = [];
     let curAt = cursorAt, curSlug = cursorSlug, scanned = 0, lastScanned = null, exhausted = false;
     while (rows.length < SUBSCRIPTIONS_FEED_PAGE_SIZE && scanned < TEMPLATES_MAX_SCAN) {
-      let query = 'SELECT p.slug AS slug, p.author_sub AS author_sub, p.created_at AS created_at FROM published_notes p ' +
-        'WHERE p.author_sub <> ? AND (p.author_sub IN (SELECT author_sub FROM subscriptions WHERE subscriber_sub = ?) OR p.slug IN (SELECT slug FROM likes WHERE liker_sub = ?)) ' +
-        "AND (NOT EXISTS (SELECT 1 FROM hidden_pages h WHERE h.slug = p.slug AND h.owner_sub = p.author_sub) OR p.slug IN (SELECT slug FROM team_members WHERE member_sub = ? AND status = 'active'))";
-      const params = [sub, sub, sub, sub];
-      if (curAt !== null) { query += ' AND (p.created_at < ? OR (p.created_at = ? AND p.slug < ?))'; params.push(curAt, curAt, curSlug); }
-      query += ' ORDER BY p.created_at DESC, p.slug DESC LIMIT ?';
+      let query = 'SELECT u.slug AS slug, MAX(u.author_sub) AS author_sub, MAX(u.at) AS created_at ' + TEMPLATES_FROM_SQL + ' GROUP BY u.slug';
+      const params = templatesSourceParams(sub);
+      if (curAt !== null) { query += ' HAVING (MAX(u.at) < ? OR (MAX(u.at) = ? AND u.slug < ?))'; params.push(curAt, curAt, curSlug); }
+      query += ' ORDER BY created_at DESC, u.slug DESC LIMIT ?';
       params.push(TEMPLATES_SCAN_BATCH);
       const { results } = await env.ADS_DB.prepare(query).bind(...params).all();
       const batch = results || [];
@@ -5288,6 +5300,13 @@ async function handleTemplates(env, request) {
       ).bind(...slugs).all();
       (storyRows || []).forEach(r => { storyBySlug[r.slug] = r; });
     }
+    const pubAtBySlug = {};
+    if (slugs.length) {
+      const { results: pubRows } = await env.ADS_DB.prepare(
+        'SELECT slug, created_at FROM published_notes WHERE slug IN (' + slugs.map(() => '?').join(',') + ')'
+      ).bind(...slugs).all();
+      (pubRows || []).forEach(r => { pubAtBySlug[r.slug] = r.created_at; });
+    }
     const authorSubs = [...new Set(rows.map(x => x.authorSub).filter(Boolean))];
     const nameBySub = {};
     for (const a of authorSubs) { const user = await getUser(env, a); nameBySub[a] = (user && user.profileName) || null; }
@@ -5298,6 +5317,7 @@ async function handleTemplates(env, request) {
     const verifiedAuth = await verifiedAuthors(env, authorSubs);
     const hk = await hiddenImgKeys(env, sub, slugs);
     const origin = url.origin;
+    const total = cursorParam ? undefined : ((await templatesTotal(env, sub)) ?? undefined); // first page only: the Templates tab's count
     const out = [];
     for (const { slug: sl, at, authorSub, meta: m } of rows) {
       const st = storyBySlug[sl];
@@ -5310,7 +5330,7 @@ async function handleTemplates(env, request) {
         authorProfileName: nameBySub[authorSub] || null,
         verified: verifiedBy.get(sl) === authorSub ? true : undefined,
         verifiedProfile: (verifiedAuth.has(authorSub) && verifiedBy.get(sl) !== authorSub) ? true : undefined,
-        publishedAt: at,
+        publishedAt: pubAtBySlug[sl] || at,
         noteCreatedAt: (st ? st.note_created_at : m.noteCreatedAt) || null,
         desc: ((st && st.description) || m.desc) || '',
         tags: parseStoryTags(st && st.tags ? st.tags : m.tags),
@@ -5322,52 +5342,29 @@ async function handleTemplates(env, request) {
     }
     // More to scan unless the last query came back short; the cursor is the last row looked at (kept or not), so pages never repeat or skip.
     const more = !exhausted && lastScanned;
-    return json({ stories: out, nextCursor: more ? `${lastScanned.created_at}:${lastScanned.slug}` : null }, 200, { 'Cache-Control': 'no-store' });
+    return json({ total, stories: out, nextCursor: more ? `${lastScanned.created_at}:${lastScanned.slug}` : null }, 200, { 'Cache-Control': 'no-store' });
   } catch (e) {
     console.log('templates failed: ' + (e && e.message));
     return json({ stories: [], nextCursor: null, error: true }, 500, { 'Cache-Control': 'no-store' });
   }
 }
 
-// [2026-11-25 | templates-tab] Is there at least one page handleTemplates would list? Drives whether the app shows its Templates tab at all (GET /account/counts sends `templates`: 1 or 0).
-// Cheap on purpose, since the app polls the counts: the candidate authors (subscribed-to, plus authors of liked pages) are checked against the duplicate setting first, and only pages of
-// authors who allow copies are looked at, stopping at the first one that is still live. Returns true / false, or null when it could not be worked out (the app then keeps what it had).
+// [2026-11-25 | templates-tab] How many pages the Templates list holds: the Subscribed feed's rows plus the Liked list's rows (each page once, as handleTemplates reads them), kept to the authors who let viewers
+// duplicate their pages. Counted like the Subscribed and Liked totals (plain row counts, no per-page KV read), so a taken-down page can still be in the number. One query groups the pages by author, then each
+// author's setting is read once. GET /account/counts sends it as `templates` and the Templates list sends it as `total`; the app hides the tab at 0. Returns a number, or null when it could not be worked out
+// (more than TEMPLATES_EXIST_MAX_AUTHORS distinct authors, or an error: the app then keeps what it had).
 const TEMPLATES_EXIST_MAX_AUTHORS = 100;
-const TEMPLATES_EXIST_MAX_PAGES = 60;
-async function templatesExist(env, sub) {
+async function templatesTotal(env, sub) {
   try {
     await Promise.all([ensureHiddenPages(env), ensureTeams(env)]);
-    const { results: authorRows } = await env.ADS_DB.prepare(
-      'SELECT author_sub FROM subscriptions WHERE subscriber_sub = ? ' +
-      'UNION SELECT p.author_sub FROM published_notes p WHERE p.slug IN (SELECT slug FROM likes WHERE liker_sub = ?) LIMIT ?'
-    ).bind(sub, sub, TEMPLATES_EXIST_MAX_AUTHORS).all();
-    const allowed = [];
-    for (const r of (authorRows || [])) {
-      if (!r.author_sub || r.author_sub === sub) continue;
-      if ((await env.ACCOUNTS.get(DUP_PREF_PREFIX + r.author_sub)) === 'on') allowed.push(r.author_sub);
-    }
-    if (!allowed.length) return false;
-    const ph = allowed.map(() => '?').join(',');
-    let curAt = null, curSlug = null, checked = 0;
-    while (checked < TEMPLATES_EXIST_MAX_PAGES) {
-      let query = 'SELECT p.slug AS slug, p.created_at AS created_at FROM published_notes p ' +
-        'WHERE p.author_sub IN (' + ph + ') AND (p.author_sub IN (SELECT author_sub FROM subscriptions WHERE subscriber_sub = ?) OR p.slug IN (SELECT slug FROM likes WHERE liker_sub = ?)) ' +
-        "AND (NOT EXISTS (SELECT 1 FROM hidden_pages h WHERE h.slug = p.slug AND h.owner_sub = p.author_sub) OR p.slug IN (SELECT slug FROM team_members WHERE member_sub = ? AND status = 'active'))";
-      const params = [...allowed, sub, sub, sub];
-      if (curAt !== null) { query += ' AND (p.created_at < ? OR (p.created_at = ? AND p.slug < ?))'; params.push(curAt, curAt, curSlug); }
-      query += ' ORDER BY p.created_at DESC, p.slug DESC LIMIT ?';
-      params.push(TEMPLATES_SCAN_BATCH);
-      const { results } = await env.ADS_DB.prepare(query).bind(...params).all();
-      const batch = results || [];
-      for (const r of batch) {
-        checked++; curAt = r.created_at; curSlug = r.slug;
-        const m = await getMeta(env, r.slug);
-        if (m && !m.deletedAt && !m.adminLocked) return true;
-        if (checked >= TEMPLATES_EXIST_MAX_PAGES) return null; // too many dead rows to settle it cheaply: unknown
-      }
-      if (batch.length < TEMPLATES_SCAN_BATCH) return false;
-    }
-    return null;
+    const { results } = await env.ADS_DB.prepare(
+      'SELECT a.author_sub AS author_sub, COUNT(*) AS c FROM (SELECT u.slug AS slug, MAX(u.author_sub) AS author_sub ' + TEMPLATES_FROM_SQL + ' GROUP BY u.slug) a GROUP BY a.author_sub LIMIT ?'
+    ).bind(...templatesSourceParams(sub), TEMPLATES_EXIST_MAX_AUTHORS + 1).all();
+    const rows = results || [];
+    if (rows.length > TEMPLATES_EXIST_MAX_AUTHORS) return null;
+    let n = 0;
+    for (const r of rows) { if ((await env.ACCOUNTS.get(DUP_PREF_PREFIX + r.author_sub)) === 'on') n += Number(r.c) || 0; }
+    return n;
   } catch (e) { return null; }
 }
 
@@ -5402,10 +5399,10 @@ async function handleAccountCounts(env, request) {
     listTotal(env, 'SELECT COUNT(*) AS c FROM stories WHERE author_sub = ? AND created_at >= ?', [sub, cutoff]),
     listTotal(env, 'SELECT COUNT(*) AS c FROM likes WHERE liker_sub = ?', [sub]),
     subscriptionsFeedCounts(env, sub),
-    templatesExist(env, sub)
+    templatesTotal(env, sub)
   ]);
-  // templates: 1 / 0 = whether the Templates tab has anything to list (left out when unknown); the app hides that tab at 0.
-  return json({ published, stories, liked, unread: feed ? feed.unread : undefined, templates: hasTemplates === null ? undefined : (hasTemplates ? 1 : 0) });
+  // templates: the Templates tab's count (left out when unknown); the app hides that tab at 0.
+  return json({ published, stories, liked, unread: feed ? feed.unread : undefined, templates: hasTemplates === null ? undefined : hasTemplates });
 }
 // GET /subscriptions/unread — drives the count on the app's Subscribed tab: how many notes in the feed are still
 // unopened, plus how many the feed holds. Light enough to poll, like /alerts/unread.
