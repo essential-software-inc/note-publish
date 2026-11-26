@@ -1497,6 +1497,7 @@ async function handleMeta(env, slug, request) {
     slug,
     title: meta.title || 'Untitled note',
     authorSub: meta.ownerSub ? await authorIdFor(env, meta.ownerSub) : null, // opaque ID, never the Google sub
+    updatedAt: meta.updatedAt || undefined, // [2026-11-26 01:14 | keep-fresh] the app compares it to find kept and preloaded pages whose note has changed
     verified: meta.verifiedName ? true : undefined, // [2026-11-01 02:24 | verified-names]
     verifiedProfile: (!meta.verifiedName && meta.ownerSub && await holdsVerifiedNameCached(env, meta.ownerSub)) ? true : undefined // [2026-11-02 22:03 | verified-cards] the viewer header shows the ring tick
   });
