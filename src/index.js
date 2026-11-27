@@ -16336,6 +16336,15 @@ export default {
       if (method === 'POST' && pathname.startsWith('/admin/restore/')) {
         return handleAdminRestore(env, request, decodeURIComponent(pathname.slice('/admin/restore/'.length)));
       }
+      // [2026-11-27 | bare-slug] my-site.name/<slug> (and /<slug>/<page-name>) with no "@": a browser is sent to the same address with the "@", where the note is served. A redirect, not a rewrite, because a published page works out its own page links from the "@" in the path. Only browsers (Accept: text/html); the app and other API callers keep the 404 below.
+      if ((method === 'GET' || method === 'HEAD') && /text\/html/i.test(request.headers.get('Accept') || '')) {
+        const bareParts = pathname.split('/').filter(Boolean);
+        let bareSlug = '';
+        try { bareSlug = decodeURIComponent(bareParts[0] || '').toLowerCase(); } catch (e) {}
+        if (bareParts.length >= 1 && bareParts.length <= 2 && validSlug(bareSlug)) {
+          return new Response(null, { status: 302, headers: { 'Location': '/@' + bareSlug + (bareParts[1] ? '/' + bareParts[1] : '') + url.search, 'Cache-Control': 'no-store' } });
+        }
+      }
       // [2026-11-03 | not-found-page] An address no route matches. A browser asking for a page (Accept: text/html, as on a typed or followed link) gets the same Not found screen as a missing note; the app and other API callers keep the JSON error.
       if ((method === 'GET' || method === 'HEAD') && /text\/html/i.test(request.headers.get('Accept') || '')) return notFoundPage(request);
       return textError(404, 'not found');
