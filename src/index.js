@@ -16025,6 +16025,20 @@ export default {
     if ((method === 'GET' || method === 'HEAD') && pathname === '/') return new Response(WELCOME_HTML, { headers: WELCOME_HEADERS }); // [2026-11-03 09:20 | welcome-page]
     if ((method === 'GET' || method === 'HEAD') && pathname === '/legal') return handleLegalPage(env, method); // [2026-11-07 17:04 | legal-page]
 
+    // [2026-11-27 | tiktok-inapp] /tt-embed/<id>: a tiny page that frames TikTok's player. The Android app (origin https://localhost) cannot load the player directly; framed from here it has a real https origin, like a published page.
+    if ((method === 'GET' || method === 'HEAD') && pathname.startsWith('/tt-embed/')) {
+      const ttId = pathname.slice('/tt-embed/'.length);
+      if (!/^[0-9]{15,25}$/.test(ttId)) return new Response('Not found', { status: 404 });
+      const ttHtml = '<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="referrer" content="strict-origin-when-cross-origin"><style>html,body{margin:0;height:100%;background:transparent}iframe{border:0;width:100%;height:100%;display:block}</style></head><body><iframe src="https://www.tiktok.com/embed/v2/' + ttId + '" allow="fullscreen; autoplay; encrypted-media" allowfullscreen></iframe></body></html>';
+      return new Response(method === 'HEAD' ? null : ttHtml, { headers: {
+        'Content-Type': 'text/html; charset=utf-8',
+        'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'; frame-src https://www.tiktok.com; base-uri 'none'; form-action 'none'",
+        'Cache-Control': 'public, max-age=86400',
+        'Referrer-Policy': 'strict-origin-when-cross-origin',
+        'X-Content-Type-Options': 'nosniff'
+      } });
+    }
+
     try {
       if (method === 'GET' && pathname.startsWith('/check-slug/')) {
         return handleCheckSlug(env, decodeURIComponent(pathname.slice('/check-slug/'.length)), request);
